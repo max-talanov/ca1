@@ -93,21 +93,42 @@ def _events_to_spike_dict(*spike_recorders):
     return spikes
 
 
+def _as_nodecollection(x):
+    """Coerce x into a flat NEST NodeCollection of gids.
+    Accepts: NodeCollection, iterable of gids, or iterable of NodeCollections/gids mixed.
+    """
+    if x is None:
+        return None
+
+    # Already a NodeCollection? (duck-typed, avoids fragile isinstance across versions)
+    if type(x).__name__ == "NodeCollection":
+        return x
+
+    # Otherwise flatten
+    flat_gids = []
+    for item in x:
+        if type(item).__name__ == "NodeCollection":
+            # Convert NodeCollection -> list of ints
+            try:
+                flat_gids.extend(item.tolist())
+            except Exception:
+                flat_gids.extend(list(item))
+        else:
+            # int / numpy int etc.
+            flat_gids.append(int(item))
+
+    return nest.NodeCollection(flat_gids)
+
 def _get_conn_arrays(target_gids):
-    # NEST requires NodeCollection for GetConnections(target=...)
     if target_gids is None:
         return np.array([], dtype=int), np.array([], dtype=float), np.array([], dtype=float)
 
-    # Accept either NodeCollection or a Python iterable of gids
-    if not isinstance(target_gids, nest.NodeCollection):
-        target_gids = nest.NodeCollection(list(target_gids))
+    target_nc = _as_nodecollection(target_gids)
 
-    if len(target_gids) == 0:
+    if len(target_nc) == 0:
         return np.array([], dtype=int), np.array([], dtype=float), np.array([], dtype=float)
 
-    conns = nest.GetConnections(source=None, target=target_gids)
-
-    # GetStatus returns a list aligned with conns
+    conns = nest.GetConnections(source=None, target=target_nc)
     sources = np.array(nest.GetStatus(conns, "source"), dtype=int)
     weights = np.array(nest.GetStatus(conns, "weight"), dtype=float)
     delays  = np.array(nest.GetStatus(conns, "delay"),  dtype=float)
@@ -134,7 +155,7 @@ def compute_lfp_proxy(
     Returns:
       t (ms), lfp (arbitrary units ~ mV jump / neuron after normalization)
     """
-    target_gids = list(target_gids)
+    target_gids = nest.NodeCollection(list(target_gids))
     n_targets = len(target_gids)
     nbins = int(np.floor(sim_ms / dt)) + 1
     lfp = np.zeros(nbins, dtype=float)

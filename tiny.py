@@ -187,6 +187,209 @@ def build_ca1_izh(
     )
 
 
+# -------------------------
+# Build CA1 + CA3 microcircuit (CA3 recurrent + Schaffer collaterals)
+# -------------------------
+
+def build_ca1_ca3_izh(
+    # --- CA1 sizes
+    N_ca1_pyr=200,
+    N_ca1_basket=40,
+    N_ca1_olm=30,
+    # --- CA3 sizes
+    N_ca3_pyr=300,
+    N_ca3_int=60,
+    # --- CA1 recurrent probabilities
+    p_ca1_EE=0.02,
+    p_ca1_EI=0.10,
+    p_ca1_IE=0.15,
+    p_ca1_OE=0.10,
+    # --- CA3 recurrent probabilities (stronger recurrence than CA1)
+    p_ca3_EE=0.04,
+    p_ca3_EI=0.12,
+    p_ca3_IE=0.20,
+    p_ca3_II=0.10,
+    # --- CA3 -> CA1 (Schaffer collateral) probabilities
+    p_schaffer_pyr=0.10,
+    p_schaffer_basket=0.12,
+    # --- External drive rates (Hz, independent poisson per neuron)
+    rate_ec_ca1_pyr=900.0,
+    rate_ca3_drive_pyr=600.0,
+    rate_ec_ca3_pyr=800.0,
+    rate_dg_ca3_pyr=1000.0,
+    rate_drive_ca1_basket=1200.0,
+    rate_drive_ca3_int=1200.0,
+    # --- RNG seed
+    seed_connect=42,
+):
+    """A compact CA1+CA3 toy network in the same style as build_ca1_izh.
+
+    CA3 is modeled as a recurrent excitatory (pyramidal) + inhibitory (basket-like) network.
+    CA3 exc projects to CA1 PYR and CA1 BASKET via Schaffer-collateral-like connections.
+
+    Notes:
+      - Uses NEST 'izhikevich' only; synaptic weights are direct V_m jumps in mV.
+      - This is *not* a full CA3 microanatomy (mossy fibers, multiple interneuron classes, etc.).
+        It's the minimal recurrent E/I core you can later refine.
+    """
+
+    nest.ResetKernel()
+    nest.SetKernelStatus(
+        {
+            "resolution": 0.1,
+            "local_num_threads": 4,
+            "print_time": True,
+            "overwrite_files": True,
+        }
+    )
+    safe_set_seeds()
+
+    if "izhikevich" not in nest.Models("nodes"):
+        raise RuntimeError("NEST model 'izhikevich' not found in this installation.")
+
+    # --- Izhikevich parameter sets
+    pyr_params = dict(a=0.02, b=0.2, c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=0.0)
+    basket_params = dict(a=0.1, b=0.2, c=-65.0, d=2.0, V_m=-65.0, U_m=-13.0, I_e=0.0)
+    olm_params = dict(a=0.02, b=0.25, c=-65.0, d=2.0, V_m=-65.0, U_m=-16.25, I_e=0.0)
+
+    # --- Populations
+    CA1_PYR = nest.Create("izhikevich", int(N_ca1_pyr), params=pyr_params)
+    CA1_BASKET = nest.Create("izhikevich", int(N_ca1_basket), params=basket_params)
+    CA1_OLM = nest.Create("izhikevich", int(N_ca1_olm), params=olm_params)
+
+    CA3_PYR = nest.Create("izhikevich", int(N_ca3_pyr), params=pyr_params)
+    CA3_INT = nest.Create("izhikevich", int(N_ca3_int), params=basket_params)
+
+    # --- External inputs (independent poisson per neuron)
+    # CA1 receives ECIII-like context drive + some unspecific drive to basket cells
+    ECIII_to_CA1 = nest.Create("poisson_generator", len(CA1_PYR), params={"rate": float(rate_ec_ca1_pyr)})
+    DRIVE_to_CA1_BA = nest.Create(
+        "poisson_generator", len(CA1_BASKET), params={"rate": float(rate_drive_ca1_basket)}
+    )
+
+    # CA3 receives ECII/EC input + DG-like drive + a moderate background drive
+    EC_to_CA3 = nest.Create("poisson_generator", len(CA3_PYR), params={"rate": float(rate_ec_ca3_pyr)})
+    DG_to_CA3 = nest.Create("poisson_generator", len(CA3_PYR), params={"rate": float(rate_dg_ca3_pyr)})
+    DRIVE_to_CA3 = nest.Create("poisson_generator", len(CA3_PYR), params={"rate": float(rate_ca3_drive_pyr)})
+    DRIVE_to_CA3_INT = nest.Create(
+        "poisson_generator", len(CA3_INT), params={"rate": float(rate_drive_ca3_int)}
+    )
+
+    # --- Synapse weights (mV jumps)
+    # external -> excitatory
+    w_ec = 2.0
+    w_dg = 3.0
+    w_drive = 2.0
+
+    # CA3 recurrent
+    w_ca3_EE = 0.9
+    w_ca3_EI = 1.6
+    w_ca3_IE = -5.5
+    w_ca3_II = -4.5
+
+    # CA1 local (as in build_ca1_izh)
+    w_ca1_EE = 0.8
+    w_ca1_EI = 1.5
+    w_ca1_EO = 1.2
+    w_ca1_IE = -5.0
+    w_ca1_II = -4.0
+    w_ca1_OE = -3.0
+
+    # Schaffer collateral CA3 -> CA1
+    w_schaffer_pyr = 2.4
+    w_schaffer_ba = 2.8
+
+    d_fast = 1.5
+    d_slow = 3.0
+
+    # --- Wire inputs one-to-one
+    nest.Connect(ECIII_to_CA1, CA1_PYR, conn_spec="one_to_one", syn_spec={"weight": w_ec, "delay": d_slow})
+    nest.Connect(
+        DRIVE_to_CA1_BA, CA1_BASKET, conn_spec="one_to_one", syn_spec={"weight": w_drive, "delay": d_fast}
+    )
+
+    nest.Connect(EC_to_CA3, CA3_PYR, conn_spec="one_to_one", syn_spec={"weight": w_ec, "delay": d_slow})
+    nest.Connect(DG_to_CA3, CA3_PYR, conn_spec="one_to_one", syn_spec={"weight": w_dg, "delay": d_fast})
+    nest.Connect(DRIVE_to_CA3, CA3_PYR, conn_spec="one_to_one", syn_spec={"weight": w_drive, "delay": d_fast})
+    nest.Connect(
+        DRIVE_to_CA3_INT, CA3_INT, conn_spec="one_to_one", syn_spec={"weight": w_drive, "delay": d_fast}
+    )
+
+    # --- Recurrent connectivity (explicit Bernoulli)
+    rng = np.random.default_rng(int(seed_connect))
+
+    # CA3 recurrent core
+    bernoulli_connect(CA3_PYR, CA3_PYR, p_ca3_EE, w_ca3_EE, d_fast, rng)       # CA3 E->E
+    bernoulli_connect(CA3_PYR, CA3_INT, p_ca3_EI, w_ca3_EI, d_fast, rng)       # CA3 E->I
+    bernoulli_connect(CA3_INT, CA3_PYR, p_ca3_IE, w_ca3_IE, d_fast, rng)       # CA3 I->E
+    bernoulli_connect(CA3_INT, CA3_INT, p_ca3_II, w_ca3_II, d_fast, rng)       # CA3 I->I
+
+    # CA1 local microcircuit (same motifs as original)
+    bernoulli_connect(CA1_PYR, CA1_PYR, p_ca1_EE, w_ca1_EE, d_fast, rng)
+    bernoulli_connect(CA1_PYR, CA1_BASKET, p_ca1_EI, w_ca1_EI, d_fast, rng)
+    bernoulli_connect(CA1_PYR, CA1_OLM, 0.08, w_ca1_EO, d_slow, rng)
+    bernoulli_connect(CA1_BASKET, CA1_PYR, p_ca1_IE, w_ca1_IE, d_fast, rng)
+    bernoulli_connect(CA1_BASKET, CA1_BASKET, 0.10, w_ca1_II, d_fast, rng)
+    bernoulli_connect(CA1_OLM, CA1_PYR, p_ca1_OE, w_ca1_OE, d_slow, rng)
+
+    # --- CA3 -> CA1 (Schaffer collaterals): excitatory to CA1 pyramidal and basket
+    bernoulli_connect(CA3_PYR, CA1_PYR, p_schaffer_pyr, w_schaffer_pyr, d_slow, rng)
+    bernoulli_connect(CA3_PYR, CA1_BASKET, p_schaffer_basket, w_schaffer_ba, d_fast, rng)
+
+    # --- Recorders
+    spk_ca1_pyr = nest.Create("spike_recorder")
+    spk_ca1_ba = nest.Create("spike_recorder")
+    spk_ca1_olm = nest.Create("spike_recorder")
+    nest.Connect(CA1_PYR, spk_ca1_pyr)
+    nest.Connect(CA1_BASKET, spk_ca1_ba)
+    nest.Connect(CA1_OLM, spk_ca1_olm)
+
+    spk_ca3_pyr = nest.Create("spike_recorder")
+    spk_ca3_int = nest.Create("spike_recorder")
+    nest.Connect(CA3_PYR, spk_ca3_pyr)
+    nest.Connect(CA3_INT, spk_ca3_int)
+
+    # Vm probes (few neurons in CA1 + CA3)
+    try:
+        vm = nest.Create("multimeter", params={"record_from": ["V_m", "U_m"], "interval": 0.2})
+    except Exception:
+        vm = nest.Create("multimeter", params={"record_from": ["V_m"], "interval": 0.2})
+
+    ca1_probe = CA1_PYR[:5]
+    ca3_probe = CA3_PYR[:5]
+    nest.Connect(vm, ca1_probe)
+    nest.Connect(vm, ca3_probe)
+
+    # Connectivity stats
+    print("\nConnectivity stats:")
+    conn_stats("CA3E->CA3E", CA3_PYR, CA3_PYR)
+    conn_stats("CA3E->CA3I", CA3_PYR, CA3_INT)
+    conn_stats("CA3I->CA3E", CA3_INT, CA3_PYR)
+    conn_stats("Sch CA3E->CA1E", CA3_PYR, CA1_PYR)
+    conn_stats("Sch CA3E->CA1I", CA3_PYR, CA1_BASKET)
+    conn_stats("CA1E->CA1E", CA1_PYR, CA1_PYR)
+    conn_stats("CA1I->CA1E", CA1_BASKET, CA1_PYR)
+
+    return dict(
+        # CA1
+        PYR=CA1_PYR,
+        BASKET=CA1_BASKET,
+        OLM=CA1_OLM,
+        spk_pyr=spk_ca1_pyr,
+        spk_ba=spk_ca1_ba,
+        spk_olm=spk_ca1_olm,
+        # CA3
+        CA3_PYR=CA3_PYR,
+        CA3_INT=CA3_INT,
+        spk_ca3_pyr=spk_ca3_pyr,
+        spk_ca3_int=spk_ca3_int,
+        # probes
+        vm=vm,
+        ca1_probe=ca1_probe,
+        ca3_probe=ca3_probe,
+    )
+
+
 def run_report_plot(net, sim_ms=1000.0):
     nest.Simulate(float(sim_ms))
 
@@ -205,6 +408,17 @@ def run_report_plot(net, sim_ms=1000.0):
     print(f"  BASKET: {mean_rate(net['BASKET'], net['spk_ba'], sim_ms):.2f}")
     print(f"  OLM   : {mean_rate(net['OLM'], net['spk_olm'], sim_ms):.2f}")
 
+    # Optional CA3 report (present when using build_ca1_ca3_izh)
+    if "CA3_PYR" in net:
+        ev_c3e = nest.GetStatus(net["spk_ca3_pyr"], "events")[0]
+        ev_c3i = nest.GetStatus(net["spk_ca3_int"], "events")[0]
+        print("\nCA3 Spike counts:")
+        print("  CA3_PYR:", len(ev_c3e["times"]))
+        print("  CA3_INT:", len(ev_c3i["times"]))
+        print("\nCA3 Mean firing rates (Hz):")
+        print(f"  CA3_PYR: {mean_rate(net['CA3_PYR'], net['spk_ca3_pyr'], sim_ms):.2f}")
+        print(f"  CA3_INT: {mean_rate(net['CA3_INT'], net['spk_ca3_int'], sim_ms):.2f}")
+
     # Plots
     import matplotlib.pyplot as plt
 
@@ -219,6 +433,10 @@ def run_report_plot(net, sim_ms=1000.0):
     raster(net["spk_pyr"], "CA1 PYR spikes (izhikevich)")
     raster(net["spk_ba"], "CA1 Basket spikes (izhikevich)")
     raster(net["spk_olm"], "CA1 OLM spikes (izhikevich)")
+
+    if "CA3_PYR" in net:
+        raster(net["spk_ca3_pyr"], "CA3 PYR spikes (izhikevich)")
+        raster(net["spk_ca3_int"], "CA3 INH spikes (izhikevich)")
 
     # Vm trace per neuron (critical to avoid fake diagonals)
     ev = nest.GetStatus(net["vm"], "events")[0]
@@ -238,17 +456,21 @@ def run_report_plot(net, sim_ms=1000.0):
 
 
 if __name__ == "__main__":
-    net = build_ca1_izh(
-        N_pyr=200,
-        N_basket=40,
-        N_olm=30,
-        p_EE=0.02,
-        p_EI=0.10,
-        p_IE=0.15,
-        p_OE=0.10,
-        rate_ca3_pyr=2000.0,
-        rate_ec_pyr=900.0,
-        rate_ca3_ba=1200.0,
+    net = build_ca1_ca3_izh(
+        # CA1
+        N_ca1_pyr=200,
+        N_ca1_basket=40,
+        N_ca1_olm=30,
+        # CA3
+        N_ca3_pyr=300,
+        N_ca3_int=60,
+        # Drive (keep these as your first tuning knobs)
+        rate_ec_ca1_pyr=900.0,
+        rate_dg_ca3_pyr=1200.0,
+        rate_ec_ca3_pyr=800.0,
+        rate_ca3_drive_pyr=600.0,
+        rate_drive_ca1_basket=1200.0,
+        rate_drive_ca3_int=1200.0,
     )
     run_report_plot(net, sim_ms=1000.0)
 
