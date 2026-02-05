@@ -254,9 +254,9 @@ def build_ca1_ca3_izh(
     theta_rate_mean_ca1: float = 200.0,
     theta_rate_amp_ca1: float = 150.0,
     # weights (mV jump per theta spike)
-    theta_w_ca3_pyr: float = 0.25,
+    theta_w_ca3_pyr: float = 1.25,
     theta_w_ca3_int: float = 0.20,
-    theta_w_ca1_pyr: float = 0.20,
+    theta_w_ca1_pyr: float = 1.20,
     theta_w_ca1_int: float = 0.15,
     theta_delay: float = 1.0,
     # --- RNG seed
@@ -550,10 +550,10 @@ if __name__ == "__main__":
         # Theta (optional)
         theta_on=True,
         theta_hz=8.0,
-        theta_rate_mean_ca3=250.0,
-        theta_rate_amp_ca3=200.0,
-        theta_rate_mean_ca1=200.0,
-        theta_rate_amp_ca1=150.0,
+        theta_rate_mean_ca3=1000.0,
+        theta_rate_amp_ca3=900.0,
+        theta_rate_mean_ca1=1000.0,
+        theta_rate_amp_ca1=900.0,
     )
     run_report_plot(net, sim_ms=1000.0)
 
