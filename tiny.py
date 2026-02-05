@@ -77,8 +77,8 @@ def mean_rate(pop, spk, sim_ms: float) -> float:
 
 def build_ca1_izh(
     N_pyr=200,
-    N_basket=40,
-    N_olm=30,
+    N_basket=15,
+    N_olm=12,
     p_EE=0.02,
     p_EI=0.10,
     p_IE=0.15,
@@ -194,11 +194,11 @@ def build_ca1_izh(
 def build_ca1_ca3_izh(
     # --- CA1 sizes
     N_ca1_pyr=200,
-    N_ca1_basket=40,
-    N_ca1_olm=30,
+    N_ca1_basket=15,
+    N_ca1_olm=12,
     # --- CA3 sizes
     N_ca3_pyr=300,
-    N_ca3_int=60,
+    N_ca3_int=41,
     # --- CA1 recurrent probabilities
     p_ca1_EE=0.02,
     p_ca1_EI=0.10,
@@ -459,11 +459,11 @@ if __name__ == "__main__":
     net = build_ca1_ca3_izh(
         # CA1
         N_ca1_pyr=200,
-        N_ca1_basket=40,
-        N_ca1_olm=30,
+        N_ca1_basket=15,
+        N_ca1_olm=12,
         # CA3
         N_ca3_pyr=300,
-        N_ca3_int=60,
+        N_ca3_int=41,
         # Drive (keep these as your first tuning knobs)
         rate_ec_ca1_pyr=900.0,
         rate_dg_ca3_pyr=1200.0,
