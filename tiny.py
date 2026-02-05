@@ -97,7 +97,57 @@ def maybe_make_theta_generators(n: int, rate_mean: float, rate_amp: float, freq_
     except Exception as e:
         print(f"[theta] sinusoidal_poisson_generator not available ({e}); running without theta.")
         return None
-# -------------------------
+# ------------
+def make_swr_event_generators(
+    n: int,
+    start_ms: float,
+    stop_ms: float,
+    sharpwave_rate: float,
+    ripple_rate_mean: float,
+    ripple_rate_amp: float,
+    ripple_hz: float,
+    ripple_phase: float = 0.0,
+):
+    """Create generators for a single SWR event.
+
+    We model SWR as:
+      1) a 'sharp wave' (slow depolarizing) drive: Poisson at sharpwave_rate between start/stop
+      2) a 'ripple' drive: ideally sinusoidally-modulated Poisson at ripple_hz between start/stop
+         (falls back to plain Poisson if sinusoidal_poisson_generator is unavailable).
+
+    Returns:
+        (sharp_gen, ripple_gen) NodeCollections, each of size n (or ripple_gen may be None).
+    """
+    sharp = nest.Create(
+        "poisson_generator",
+        int(n),
+        params={"rate": float(sharpwave_rate), "start": float(start_ms), "stop": float(stop_ms)},
+    )
+
+    ripple = None
+    try:
+        ripple = nest.Create(
+            "sinusoidal_poisson_generator",
+            int(n),
+            params={
+                "rate": float(ripple_rate_mean),
+                "amplitude": float(ripple_rate_amp),
+                "frequency": float(ripple_hz),
+                "phase": float(ripple_phase),
+                "start": float(start_ms),
+                "stop": float(stop_ms),
+            },
+        )
+    except Exception as e:
+        # Fallback: constant high-rate Poisson during the ripple window
+        print(f"[swr] sinusoidal_poisson_generator not available ({e}); using poisson_generator for ripple.")
+        ripple = nest.Create(
+            "poisson_generator",
+            int(n),
+            params={"rate": float(ripple_rate_mean), "start": float(start_ms), "stop": float(stop_ms)},
+        )
+    return sharp, ripple
+# -----------
 # Build CA1 microcircuit
 # -------------------------
 
@@ -259,6 +309,22 @@ def build_ca1_ca3_izh(
     theta_w_ca1_pyr: float = 1.20,
     theta_w_ca1_int: float = 0.15,
     theta_delay: float = 1.0,
+    # --- SWR events (optional; toy approximation of sharp-wave ripple bursts)
+    swr_on: bool = False,
+    # list of (start_ms, stop_ms) tuples; if None and swr_on=True, a default event is used
+    swr_events=None,
+    # generator parameters
+    swr_sharpwave_rate: float = 300.0,
+    swr_ripple_hz: float = 180.0,
+    swr_ripple_rate_mean: float = 1200.0,
+    swr_ripple_rate_amp: float = 900.0,
+    # weights (mV jump per SWR spike)
+    swr_w_sharp_ca3_pyr: float = 0.35,
+    swr_w_ripple_ca3_int: float = 0.60,
+    swr_w_ripple_ca3_pyr: float = 0.15,
+    swr_w_sharp_ca1_pyr: float = 0.20,
+    swr_w_ripple_ca1_basket: float = 0.55,
+    swr_w_ripple_ca1_pyr: float = 0.10,
     # --- RNG seed
     seed_connect=42,
 ):
@@ -391,6 +457,83 @@ def build_ca1_ca3_izh(
                 th_ca1_olm, CA1_OLM, conn_spec="one_to_one",
                 syn_spec={"weight": float(theta_w_ca1_int), "delay": float(theta_delay)},
             )
+
+    # --- SWR (sharp-wave ripple) events: brief CA3-driven bursts that can recruit CA1
+    if swr_on:
+        if swr_events is None:
+            # default: one SWR around the middle of a 1 s sim
+            swr_events = [(550.0, 630.0)]  # (start_ms, stop_ms)
+
+        for (swr_start, swr_stop) in swr_events:
+            # CA3: sharp wave mainly excites PYR; ripple mainly drives INH (and weakly PYR)
+            sw_sharp_ca3, sw_ripple_ca3 = make_swr_event_generators(
+                n=len(CA3_PYR),
+                start_ms=swr_start,
+                stop_ms=swr_stop,
+                sharpwave_rate=swr_sharpwave_rate,
+                ripple_rate_mean=swr_ripple_rate_mean,
+                ripple_rate_amp=swr_ripple_rate_amp,
+                ripple_hz=swr_ripple_hz,
+            )
+            nest.Connect(
+                sw_sharp_ca3, CA3_PYR, conn_spec="one_to_one",
+                syn_spec={"weight": float(swr_w_sharp_ca3_pyr), "delay": 1.0},
+            )
+            # Ripple to CA3 PYR (weak)
+            nest.Connect(
+                sw_ripple_ca3, CA3_PYR, conn_spec="one_to_one",
+                syn_spec={"weight": float(swr_w_ripple_ca3_pyr), "delay": 1.0},
+            )
+
+            # Separate ripple drive for CA3 interneurons (stronger)
+            _, sw_ripple_ca3_int = make_swr_event_generators(
+                n=len(CA3_INT),
+                start_ms=swr_start,
+                stop_ms=swr_stop,
+                sharpwave_rate=0.0,  # no sharpwave to INH in this toy version
+                ripple_rate_mean=swr_ripple_rate_mean,
+                ripple_rate_amp=swr_ripple_rate_amp,
+                ripple_hz=swr_ripple_hz,
+            )
+            nest.Connect(
+                sw_ripple_ca3_int, CA3_INT, conn_spec="one_to_one",
+                syn_spec={"weight": float(swr_w_ripple_ca3_int), "delay": 1.0},
+            )
+
+            # CA1: sharpwave weakly excites PYR; ripple strongly drives basket, weakly PYR
+            sw_sharp_ca1, sw_ripple_ca1_pyr = make_swr_event_generators(
+                n=len(CA1_PYR),
+                start_ms=swr_start,
+                stop_ms=swr_stop,
+                sharpwave_rate=swr_sharpwave_rate * 0.6,
+                ripple_rate_mean=swr_ripple_rate_mean * 0.6,
+                ripple_rate_amp=swr_ripple_rate_amp * 0.6,
+                ripple_hz=swr_ripple_hz,
+            )
+            nest.Connect(
+                sw_sharp_ca1, CA1_PYR, conn_spec="one_to_one",
+                syn_spec={"weight": float(swr_w_sharp_ca1_pyr), "delay": 1.0},
+            )
+            nest.Connect(
+                sw_ripple_ca1_pyr, CA1_PYR, conn_spec="one_to_one",
+                syn_spec={"weight": float(swr_w_ripple_ca1_pyr), "delay": 1.0},
+            )
+
+            # Ripple to CA1 basket cells (strong)
+            _, sw_ripple_ca1_ba = make_swr_event_generators(
+                n=len(CA1_BASKET),
+                start_ms=swr_start,
+                stop_ms=swr_stop,
+                sharpwave_rate=0.0,
+                ripple_rate_mean=swr_ripple_rate_mean * 0.8,
+                ripple_rate_amp=swr_ripple_rate_amp * 0.8,
+                ripple_hz=swr_ripple_hz,
+            )
+            nest.Connect(
+                sw_ripple_ca1_ba, CA1_BASKET, conn_spec="one_to_one",
+                syn_spec={"weight": float(swr_w_ripple_ca1_basket), "delay": 1.0},
+            )
+
     # --- Recurrent connectivity (explicit Bernoulli)
     rng = np.random.default_rng(int(seed_connect))
 
@@ -550,10 +693,16 @@ if __name__ == "__main__":
         # Theta (optional)
         theta_on=True,
         theta_hz=8.0,
-        theta_rate_mean_ca3=1000.0,
+        theta_rate_mean_ca3=950.0,
         theta_rate_amp_ca3=900.0,
-        theta_rate_mean_ca1=1000.0,
-        theta_rate_amp_ca1=900.0,
+        theta_rate_mean_ca1=900.0,
+        theta_rate_amp_ca1=950.0,
+        # SWR (optional)
+        swr_on=True,
+        swr_events=[(550.0, 630.0)],
+        swr_ripple_hz=180.0,
+        swr_ripple_rate_mean=1200.0,
+        swr_ripple_rate_amp=900.0,
     )
     run_report_plot(net, sim_ms=1000.0)
 
