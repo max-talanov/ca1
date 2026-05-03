@@ -1647,51 +1647,38 @@ def run_stc_hook(
 
 def build_homeostasis_hook(net, alpha: float = 0.75):
     """
-    Cache Schaffer collateral and CA3 recurrent connection arrays for
-    Phase 4 synaptic downscaling.  Call once after all SWR epochs complete.
+    Phase 4 synaptic homeostasis: downscale CA3 recurrent excitatory weights
+    (CA3_SUP → CA3_SUP) by alpha after consolidation completes.
 
-    alpha : multiplicative downscaling factor for hippocampal synapses.
-            Biology: ~0.75 per sleep night (Vyazovskiy et al. 2008).
-            L-LTP synapses in CA1->EC are NOT touched here — they live in
-            the STC hook and represent the consolidated cortical trace.
-
-    Returns a plain dict with pre-downscaling weights and NEST connection
-    objects so run_homeostasis_hook() can apply and verify the changes.
+    Schaffer collaterals (CA3_SUP → CA1_PYR, ~345M synapses) are NOT touched
+    — at this scale, GetConnections + SetConnections through the Python
+    binding takes >10 hours and is the bottleneck identified in job 39873506.
+    The Synaptic Homeostasis Hypothesis primarily targets recurrent attractor
+    circuits, so downscaling CA3 recurrent alone is the canonical test of
+    EC trace independence from hippocampal replay machinery.
     """
     import dataclasses
 
     @dataclasses.dataclass
     class HomeoHook:
-        alpha:          float
-        # Schaffer collaterals CA3_SUP -> CA1_PYR
-        sch_conns:      object          # NEST ConnectionCollection
-        sch_w_pre:      np.ndarray      # weights before downscaling (copy)
-        sch_w:          np.ndarray      # live weight array (modified in-place)
-        n_sch:          int
-        # CA3 recurrent excitatory (CA3_SUP -> CA3_SUP, w > 0)
-        ca3_conns:      object
-        ca3_exc_mask:   np.ndarray      # boolean mask: excitatory synapses
-        ca3_w_pre:      np.ndarray      # weights before (full array, copy)
-        ca3_w:          np.ndarray      # live weight array
-        n_ca3_exc:      int
-
-    print("  [homeo] Querying Schaffer collaterals (CA3_SUP → CA1_PYR)...")
-    sch_conns = nest.GetConnections(net["CA3_SUP"], net["PYR"])
-    sch_d     = sch_conns.get(["weight"])
-    sch_w     = np.array(sch_d["weight"], dtype=float)
+        alpha:        float
+        ca3_conns:    object
+        ca3_exc_mask: np.ndarray
+        ca3_w_pre:    np.ndarray
+        ca3_w:        np.ndarray
+        n_ca3_exc:    int
 
     print("  [homeo] Querying CA3 recurrent connections (CA3_SUP → CA3_SUP)...")
+    print("  [homeo] (Schaffer collaterals skipped — 345M synapses, infeasible)")
+    t0 = time.perf_counter()
     ca3_conns    = nest.GetConnections(net["CA3_SUP"], net["CA3_SUP"])
     ca3_d        = ca3_conns.get(["weight"])
     ca3_w        = np.array(ca3_d["weight"], dtype=float)
     ca3_exc_mask = ca3_w > 0
+    print(f"  [homeo] CA3 scan: {len(ca3_w):,} synapses in {time.perf_counter()-t0:.1f}s")
 
-    hook = HomeoHook(
+    return HomeoHook(
         alpha         = alpha,
-        sch_conns     = sch_conns,
-        sch_w_pre     = sch_w.copy(),
-        sch_w         = sch_w,
-        n_sch         = len(sch_w),
         ca3_conns     = ca3_conns,
         ca3_exc_mask  = ca3_exc_mask,
         ca3_w_pre     = ca3_w.copy(),
@@ -1699,56 +1686,24 @@ def build_homeostasis_hook(net, alpha: float = 0.75):
         n_ca3_exc     = int(ca3_exc_mask.sum()),
     )
 
-    print(f"  [homeo] Cached {hook.n_sch:,} Schaffer + "
-          f"{hook.n_ca3_exc:,} CA3-exc synapses  (alpha={alpha:.2f})")
-    return hook
-
 
 def run_homeostasis_hook(homeo):
-    """
-    Apply multiplicative downscaling (×alpha) to all non-L-LTP hippocampal
-    synapses:
-      • All Schaffer collateral weights (CA3_SUP → CA1_PYR)
-      • Excitatory CA3 recurrent weights (CA3_SUP → CA3_SUP, w > 0)
-    Inhibitory weights (w < 0) are left unchanged.
-    A floor of 0.01 prevents weights from collapsing to zero.
-
-    After writing back via NEST SetConnections, returns a stats dict
-    for HDF5 logging and console reporting.
-    """
     alpha = homeo.alpha
-
-    # -- Schaffer collaterals: all excitatory, downscale uniformly --
-    homeo.sch_w[:] = np.maximum(homeo.sch_w * alpha, 0.01)
-    homeo.sch_conns.set({"weight": homeo.sch_w.tolist()})
-
-    # -- CA3 recurrent: excitatory only --
     homeo.ca3_w[homeo.ca3_exc_mask] = np.maximum(
         homeo.ca3_w[homeo.ca3_exc_mask] * alpha, 0.01)
     homeo.ca3_conns.set({"weight": homeo.ca3_w.tolist()})
 
     stats = {
         "alpha":              alpha,
-        # Schaffer
-        "sch_w_pre_mean":     float(homeo.sch_w_pre.mean()),
-        "sch_w_post_mean":    float(homeo.sch_w.mean()),
-        "sch_w_pre_std":      float(homeo.sch_w_pre.std()),
-        "sch_w_post_std":     float(homeo.sch_w.std()),
-        "n_sch_synapses":     homeo.n_sch,
-        # CA3 recurrent (excitatory only)
         "ca3_w_pre_mean":     float(homeo.ca3_w_pre[homeo.ca3_exc_mask].mean()),
         "ca3_w_post_mean":    float(homeo.ca3_w[homeo.ca3_exc_mask].mean()),
         "ca3_w_pre_std":      float(homeo.ca3_w_pre[homeo.ca3_exc_mask].std()),
         "ca3_w_post_std":     float(homeo.ca3_w[homeo.ca3_exc_mask].std()),
         "n_ca3_exc_synapses": homeo.n_ca3_exc,
     }
-
-    print(f"  [homeo] Schaffer:  {stats['sch_w_pre_mean']:.4f}±{stats['sch_w_pre_std']:.4f}"
-          f" → {stats['sch_w_post_mean']:.4f}±{stats['sch_w_post_std']:.4f}  (×{alpha:.2f})")
-    print(f"  [homeo] CA3 exc:   {stats['ca3_w_pre_mean']:.4f}±{stats['ca3_w_pre_std']:.4f}"
-          f" → {stats['ca3_w_post_mean']:.4f}±{stats['ca3_w_post_std']:.4f}  (×{alpha:.2f})")
+    print(f"  [homeo] CA3 exc:   {stats['ca3_w_pre_mean']:.4f} → "
+          f"{stats['ca3_w_post_mean']:.4f}  (×{alpha:.2f})")
     return stats
-
 
 # ============================================================================
 # Replay quality metric
