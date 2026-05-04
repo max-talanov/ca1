@@ -1650,59 +1650,96 @@ def build_homeostasis_hook(net, alpha: float = 0.75):
     Phase 4 synaptic homeostasis: downscale CA3 recurrent excitatory weights
     (CA3_SUP → CA3_SUP) by alpha after consolidation completes.
 
-    Schaffer collaterals (CA3_SUP → CA1_PYR, ~345M synapses) are NOT touched
-    — at this scale, GetConnections + SetConnections through the Python
-    binding takes >10 hours and is the bottleneck identified in job 39873506.
-    The Synaptic Homeostasis Hypothesis primarily targets recurrent attractor
-    circuits, so downscaling CA3 recurrent alone is the canonical test of
-    EC trace independence from hippocampal replay machinery.
+    Schaffer collaterals (CA3_SUP → CA1_PYR, ~345M synapses) are NOT touched.
+    Only CA3 recurrent excitatory synapses are downscaled, which is the
+    canonical test of EC trace independence per the Synaptic Homeostasis
+    Hypothesis (Tononi & Cirelli).
+
+    IMPORTANT — why we use target-only GetConnections:
+    Calling nest.GetConnections(source, target) with BOTH filters forces NEST 3.9
+    to walk the full ~471M-synapse connectome (>15 h on MN5, hangs the SLURM job).
+    Calling nest.GetConnections(target=...) walks only the target's incoming
+    slots. CA3_SUP receives ~12.7M synapses (recurrent + INT_SUP + DEEP +
+    drives); we then post-filter in Python by source GID and weight sign.
+    This is the same trick the STC hook uses for CA1→EC.
     """
     import dataclasses
+    import nest
 
     @dataclasses.dataclass
     class HomeoHook:
         alpha:        float
-        ca3_conns:    object
-        ca3_exc_mask: np.ndarray
-        ca3_w_pre:    np.ndarray
-        ca3_w:        np.ndarray
-        n_ca3_exc:    int
+        all_conns:    object       # full incoming collection (target=CA3_SUP)
+        exc_mask:     np.ndarray   # bool mask: CA3_SUP→CA3_SUP excitatory
+        weights_pre:  np.ndarray
+        weights:      np.ndarray
+        n_rec_exc:    int
 
-    print("  [homeo] Querying CA3 recurrent connections (CA3_SUP → CA3_SUP)...")
+    print("  [homeo] Querying connections incoming to CA3_SUP (target-only filter)...")
     print("  [homeo] (Schaffer collaterals skipped — 345M synapses, infeasible)")
     t0 = time.perf_counter()
-    ca3_conns    = nest.GetConnections(net["CA3_SUP"], net["CA3_SUP"])
-    ca3_d        = ca3_conns.get(["weight"])
-    ca3_w        = np.array(ca3_d["weight"], dtype=float)
-    ca3_exc_mask = ca3_w > 0
-    print(f"  [homeo] CA3 scan: {len(ca3_w):,} synapses in {time.perf_counter()-t0:.1f}s")
+    all_conns = nest.GetConnections(target=net["CA3_SUP"])
+    n_total   = len(all_conns)
+    print(f"  [homeo] CA3_SUP incoming scan: {n_total:,} synapses in {time.perf_counter()-t0:.1f}s")
+
+    # Pull source GIDs and weights via vectorized GetStatus
+    t1 = time.perf_counter()
+    sources = np.array(nest.GetStatus(all_conns, "source"), dtype=np.int64)
+    weights = np.array(nest.GetStatus(all_conns, "weight"), dtype=float)
+    print(f"  [homeo] Pulled source GIDs + weights in {time.perf_counter()-t1:.1f}s")
+
+    # Build set of CA3_SUP GIDs once (66k entries) for fast membership test
+    ca3_sup_gids = set(net["CA3_SUP"].tolist())
+
+    # Mark synapses whose source is a CA3_SUP neuron, AND excitatory (w>0)
+    t2 = time.perf_counter()
+    src_in_ca3sup = np.fromiter((s in ca3_sup_gids for s in sources),
+                                 dtype=bool, count=n_total)
+    exc_mask = src_in_ca3sup & (weights > 0)
+    n_rec_exc = int(exc_mask.sum())
+    print(f"  [homeo] Filtered CA3_SUP→CA3_SUP excitatory: {n_rec_exc:,} synapses "
+          f"({time.perf_counter()-t2:.1f}s)")
 
     return HomeoHook(
-        alpha         = alpha,
-        ca3_conns     = ca3_conns,
-        ca3_exc_mask  = ca3_exc_mask,
-        ca3_w_pre     = ca3_w.copy(),
-        ca3_w         = ca3_w,
-        n_ca3_exc     = int(ca3_exc_mask.sum()),
+        alpha        = alpha,
+        all_conns    = all_conns,
+        exc_mask     = exc_mask,
+        weights_pre  = weights.copy(),
+        weights      = weights,
+        n_rec_exc    = n_rec_exc,
     )
 
 
 def run_homeostasis_hook(homeo):
+    """
+    Apply multiplicative downscaling to CA3 recurrent excitatory synapses.
+    Writes back the full weight vector to the cached SynapseCollection;
+    non-excitatory entries retain their original values (no-op write).
+    """
+    import nest
+
     alpha = homeo.alpha
-    homeo.ca3_w[homeo.ca3_exc_mask] = np.maximum(
-        homeo.ca3_w[homeo.ca3_exc_mask] * alpha, 0.01)
-    homeo.ca3_conns.set({"weight": homeo.ca3_w.tolist()})
+    t0 = time.perf_counter()
+
+    # Downscale only the masked subset (CA3_SUP→CA3_SUP excitatory)
+    homeo.weights[homeo.exc_mask] = np.maximum(
+        homeo.weights[homeo.exc_mask] * alpha, 0.01)
+
+    # SetStatus on the full collection — non-excitatory rows write same value
+    nest.SetStatus(homeo.all_conns, "weight", homeo.weights.tolist())
+    print(f"  [homeo] SetStatus complete in {time.perf_counter()-t0:.1f}s")
 
     stats = {
         "alpha":              alpha,
-        "ca3_w_pre_mean":     float(homeo.ca3_w_pre[homeo.ca3_exc_mask].mean()),
-        "ca3_w_post_mean":    float(homeo.ca3_w[homeo.ca3_exc_mask].mean()),
-        "ca3_w_pre_std":      float(homeo.ca3_w_pre[homeo.ca3_exc_mask].std()),
-        "ca3_w_post_std":     float(homeo.ca3_w[homeo.ca3_exc_mask].std()),
-        "n_ca3_exc_synapses": homeo.n_ca3_exc,
+        "ca3_w_pre_mean":     float(homeo.weights_pre[homeo.exc_mask].mean()),
+        "ca3_w_post_mean":    float(homeo.weights[homeo.exc_mask].mean()),
+        "ca3_w_pre_std":      float(homeo.weights_pre[homeo.exc_mask].std()),
+        "ca3_w_post_std":     float(homeo.weights[homeo.exc_mask].std()),
+        "n_ca3_exc_synapses": homeo.n_rec_exc,
     }
-    print(f"  [homeo] CA3 exc:   {stats['ca3_w_pre_mean']:.4f} → "
-          f"{stats['ca3_w_post_mean']:.4f}  (×{alpha:.2f})")
+    print(f"  [homeo] CA3 exc:  mean {stats['ca3_w_pre_mean']:.4f} → "
+          f"{stats['ca3_w_post_mean']:.4f}  (×{alpha:.2f})  "
+          f"[{stats['n_ca3_exc_synapses']:,} synapses]")
     return stats
 
 # ============================================================================
