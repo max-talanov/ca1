@@ -2198,19 +2198,39 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                   f"{int(stc_hook.ltp_done.sum()):,} L-LTP synapses")
 
         # ---- Phase 4: Homeostasis group ------------------------------------
-        if homeo_stats is not None:
+        # Multi-alpha aware: each alpha gets its own subgroup
+        # /homeostasis/alpha_050/, /homeostasis/alpha_075/, etc.
+        # If single alpha, also flatten into /homeostasis/ root attrs for
+        # backward compatibility with existing analysis scripts.
+        if homeo_results:
             hg = h5.create_group("homeostasis")
-            for k, v in homeo_stats.items():
-                hg.attrs[k] = float(v)
             hg.attrs["description"] = (
                 "Phase 4 synaptic homeostasis: multiplicative downscaling of "
-                "Schaffer collateral and CA3 recurrent excitatory weights "
-                "after all SWR epochs. L-LTP synapses in CA1->EC are exempt. "
-                "rho_fwd/rev_post_homeo = replay quality in verification epoch "
-                "immediately after downscaling.")
-            print(f"  [HDF5] Homeostasis: alpha={homeo_stats['alpha']:.2f}  "
-                  f"Schaffer {homeo_stats['sch_w_pre_mean']:.4f}→{homeo_stats['sch_w_post_mean']:.4f}  "
-                  f"ρ_fwd_post={homeo_stats.get('rho_fwd_post_homeo', float('nan')):+.3f}")
+                "CA3 recurrent excitatory weights after consolidation. "
+                "L-LTP synapses in CA1->EC are NOT modified. "
+                "rho_fwd/rev_post_homeo = replay quality during the "
+                "verification epoch run immediately after downscaling.")
+            hg.attrs["n_alphas"]    = len(homeo_results)
+            hg.attrs["alpha_list"]  = np.array(sorted(homeo_results.keys()),
+                                                dtype=float)
+            hg.attrs["sweep_mode"]  = bool(len(homeo_results) > 1)
+
+            for alpha_val, stats in sorted(homeo_results.items()):
+                tag = f"alpha_{int(round(alpha_val * 100)):03d}"   # e.g. "alpha_075"
+                sg  = hg.create_group(tag)
+                for k, v in stats.items():
+                    sg.attrs[k] = float(v)
+                print(f"  [HDF5] /homeostasis/{tag}: "
+                      f"alpha={stats['alpha']:.2f}  "
+                      f"CA3 {stats['ca3_w_pre_mean']:.4f}->"
+                      f"{stats['ca3_w_post_mean']:.4f}  "
+                      f"rho_fwd={stats.get('rho_fwd_post_homeo', float('nan')):+.3f}")
+
+            # Flatten single-alpha case to root attrs (legacy compatibility)
+            if len(homeo_results) == 1:
+                only_alpha = list(homeo_results.keys())[0]
+                for k, v in homeo_results[only_alpha].items():
+                    hg.attrs[k] = float(v)
 
     print(f">>> Saved HDF5: {outpath}")
 
@@ -2313,7 +2333,28 @@ Cortical module:
              "Biology: ~0.75 per sleep night (Vyazovskiy et al. 2008). "
              "Applied multiplicatively to all Schaffer and CA3 exc synapses. "
              "L-LTP synapses in CA1->EC are exempt.")
+    parser.add_argument(
+        "--alpha-sweep", type=str, default=None, metavar="A1,A2,...",
+        help="Phase 4 multi-alpha sweep: comma-separated list of alpha values, "
+             "e.g. '0.50,0.75,0.90'. Runs ONE consolidation, then loops over "
+             "alphas (restore checkpoint -> apply alpha -> run verification "
+             "epoch -> record metrics). Saves ~10 hours of compute vs separate "
+             "jobs. Overrides --homeo-alpha. Requires --homeostasis --stc.")
     args = parser.parse_args()
+
+    # Parse alpha sweep into a list of floats; empty list = single-alpha mode
+    if args.alpha_sweep is not None:
+        try:
+            args.alpha_list = [float(a) for a in args.alpha_sweep.split(",") if a.strip()]
+        except ValueError:
+            parser.error("--alpha-sweep must be comma-separated floats, "
+                         f"got '{args.alpha_sweep}'")
+        if not args.alpha_list:
+            parser.error("--alpha-sweep cannot be empty")
+        if not args.homeostasis:
+            parser.error("--alpha-sweep requires --homeostasis")
+    else:
+        args.alpha_list = [args.homeo_alpha] if args.homeostasis else []
 
     if args.stc and not args.ec_lii:
         parser.error("--stc requires --ec-lii")
@@ -2453,23 +2494,53 @@ Cortical module:
     print(f"    Total simulation done in {time.perf_counter()-t_sim:.1f}s")
 
     # ---- Phase 4: Synaptic Homeostasis (after all SWR epochs) ---------------
-    homeo_stats       = None
-    homeo_post_rho_fwd = None
-    homeo_post_rho_rev = None
+    # Supports both single-alpha (--homeo-alpha) and sweep (--alpha-sweep) modes.
+    # In sweep mode: scan CA3 incoming connections ONCE, checkpoint post-
+    # consolidation weights, then for each alpha: restore -> apply -> verify.
+    # This avoids redundant build + 14-epoch consolidation for each alpha,
+    # saving ~4-5 hours per additional alpha vs separate SLURM jobs.
+    homeo_results = {}    # alpha (float) -> stats dict
+    homeo         = None
     if args.homeostasis and stc_hook is not None:
-        print("\n>>> Phase 4: Synaptic homeostasis — downscaling hippocampal weights...")
-        homeo      = build_homeostasis_hook(net, alpha=args.homeo_alpha)
-        homeo_stats = run_homeostasis_hook(homeo)
+        n_sweep = len(args.alpha_list)
+        sweep_label = "alpha-sweep" if n_sweep > 1 else "single-alpha"
+        print(f"\n>>> Phase 4: Synaptic homeostasis ({sweep_label}, "
+              f"{n_sweep} alpha value(s): {args.alpha_list})")
 
-        # Verification epoch: one additional SWR pair after downscaling
-        # Measures whether CA3 replay quality degrades (expected) while
-        # EC LII weights (already L-LTP captured) remain unchanged (expected).
-        print(f"\n>>> Phase 4: Running post-homeostasis verification epoch "
-              f"({SIM_MS:.0f} ms)...")
-        t_verify = time.perf_counter()
-        nest.Simulate(SIM_MS)
-        epoch_t0_verify = n_epochs * SIM_MS
-        if stc_hook is not None:
+        # Build hook ONCE: this is the expensive GetConnections(target=CA3_SUP) scan.
+        # Use the first alpha as a placeholder; we override it inside the loop.
+        homeo = build_homeostasis_hook(net, alpha=args.alpha_list[0])
+
+        # Checkpoint: snapshot post-consolidation CA3 recurrent weights so we
+        # can restore them between alpha iterations (otherwise alphas compound).
+        ca3_weights_checkpoint = homeo.weights.copy()
+        print(f"  [homeo] Checkpointed {len(ca3_weights_checkpoint):,} CA3 incoming "
+              f"weights for {n_sweep} sweep iteration(s)")
+
+        for sweep_idx, alpha_val in enumerate(args.alpha_list):
+            print(f"\n  ---- alpha = {alpha_val:.3f}  "
+                  f"({sweep_idx+1}/{n_sweep}) ----")
+
+            # Restore checkpoint before each alpha (idempotent application)
+            homeo.weights[:]    = ca3_weights_checkpoint
+            homeo.weights_pre[:] = ca3_weights_checkpoint
+            homeo.alpha         = alpha_val
+
+            # Apply downscaling
+            stats = run_homeostasis_hook(homeo)
+
+            # Verification epoch: SIM_MS of additional simulation post-downscaling.
+            # Each iteration extends total simulation by SIM_MS; SWR generators
+            # already fired during epoch 1, so the verification window picks up
+            # CA3 attractor dynamics under the downscaled weights.
+            print(f"  [homeo] Running verification epoch ({SIM_MS:.0f} ms)...")
+            t_verify = time.perf_counter()
+            nest.Simulate(SIM_MS)
+
+            # Verification epoch global start time = consolidation total + prior verifications
+            epoch_t0_verify = (n_epochs + sweep_idx) * SIM_MS
+
+            # Continue STC bookkeeping (writes are no-ops for already-LLTP synapses)
             run_stc_hook(
                 stc_hook, ec_module,
                 t_swr_start   = epoch_t0_verify + swr_fwd[0],
@@ -2484,35 +2555,42 @@ Cortical module:
                 current_t_ms  = epoch_t0_verify + SIM_MS,
                 PRP_threshold = args.prp_threshold,
             )
-        print(f"    Verification epoch done in {time.perf_counter()-t_verify:.1f}s")
+            print(f"    Verification epoch done in {time.perf_counter()-t_verify:.1f}s")
 
-        # Compute replay quality in the verification epoch
-        from nest import GetStatus as _gs
-        _ev3 = _gs(net["spk_ca3_sup"], "events")[0]
-        _t3  = np.array(_ev3["times"],   dtype=float)
-        _s3  = np.array(_ev3["senders"], dtype=int)
-        # Restrict to verification epoch window
-        _t0v = epoch_t0_verify
-        _rho_f, _pf = replay_score(_t3, _s3, net["ca3_seq_groups"],
-                                    _t0v + swr_fwd[0] - 5,
-                                    _t0v + swr_fwd[1] + 30)
-        _rho_r, _pr = replay_score(_t3, _s3, net["ca3_seq_groups"],
-                                    _t0v + swr_rev[0] - 5,
-                                    _t0v + swr_rev[1] + 30)
-        homeo_post_rho_fwd = float(_rho_f) if _rho_f is not None else float("nan")
-        homeo_post_rho_rev = float(_rho_r) if _rho_r is not None else float("nan")
-        homeo_stats["rho_fwd_post_homeo"] = homeo_post_rho_fwd
-        homeo_stats["rho_rev_post_homeo"] = homeo_post_rho_rev
+            # Measure replay quality on this verification epoch's SWR windows
+            from nest import GetStatus as _gs
+            _ev3 = _gs(net["spk_ca3_sup"], "events")[0]
+            _t3  = np.array(_ev3["times"],   dtype=float)
+            _s3  = np.array(_ev3["senders"], dtype=int)
+            _rho_f, _pf = replay_score(_t3, _s3, net["ca3_seq_groups"],
+                                        epoch_t0_verify + swr_fwd[0] - 5,
+                                        epoch_t0_verify + swr_fwd[1] + 30)
+            _rho_r, _pr = replay_score(_t3, _s3, net["ca3_seq_groups"],
+                                        epoch_t0_verify + swr_rev[0] - 5,
+                                        epoch_t0_verify + swr_rev[1] + 30)
+            stats["rho_fwd_post_homeo"] = float(_rho_f) if _rho_f is not None else float("nan")
+            stats["rho_rev_post_homeo"] = float(_rho_r) if _rho_r is not None else float("nan")
+            stats["verification_t0_ms"] = float(epoch_t0_verify)
+            stats["verification_t1_ms"] = float(epoch_t0_verify + SIM_MS)
 
-        print(f"\n  [homeo] Post-homeostasis replay quality:")
-        print(f"    ρ_fwd = {homeo_post_rho_fwd:+.3f}  "
-              f"(pre-homeo: {stc_hook.rho_history_fwd[-1] if hasattr(stc_hook, 'rho_history_fwd') and stc_hook.rho_history_fwd else 'N/A'})")
-        print(f"    ρ_rev = {homeo_post_rho_rev:+.3f}")
-        print(f"  [homeo] EC LII CA1→EC mean weight (should remain at L-LTP level): "
-              f"{float(stc_hook.w.mean()):.4f}")
+            print(f"  [homeo] alpha={alpha_val:.2f}:  "
+                  f"rho_fwd={stats['rho_fwd_post_homeo']:+.3f}  "
+                  f"rho_rev={stats['rho_rev_post_homeo']:+.3f}  "
+                  f"EC L-LTP w_mean={float(stc_hook.w.mean()):.4f}")
 
-        # Extend total_sim_ms to include verification epoch
-        total_sim_ms += SIM_MS
+            homeo_results[alpha_val] = stats
+            total_sim_ms += SIM_MS
+
+        # Backwards-compatible alias for single-alpha downstream code
+        homeo_stats        = homeo_results[args.alpha_list[0]] if n_sweep == 1 else None
+        homeo_post_rho_fwd = (homeo_stats["rho_fwd_post_homeo"]
+                              if homeo_stats is not None else None)
+        homeo_post_rho_rev = (homeo_stats["rho_rev_post_homeo"]
+                              if homeo_stats is not None else None)
+    else:
+        homeo_stats        = None
+        homeo_post_rho_fwd = None
+        homeo_post_rho_rev = None
 
     rank = _mpi_rank()
 
