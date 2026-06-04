@@ -1,0 +1,55 @@
+# tinyHippo: Hippocampo-cortical bidirectional replay & STC consolidation
+# ========================================================================
+# Requirements for Watson et al. 2025 circuit model with full HPC support
+#
+# Install: pip install -r requirements.txt
+#
+# For MPI on HPC (MareNostrum5, etc.):
+#   mpirun -n N python -m pip install -r requirements.txt
+#   OR install mpi4py separately after module load mpi
+
+# Core scientific stack
+# =====================
+numpy>=1.21.0,<2.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+h5py>=3.0.0
+
+# NEST neural simulator (3.9.0+ required for this project)
+# =========================================================
+# Install with: pip install nest-simulator
+# For MPI: pip install nest-simulator[mpi]
+# On HPC clusters, NEST may already be available via module load;
+# verify with: python -c "import nest; print(nest.__version__)"
+nest-simulator>=3.9.0,<4.0
+
+# Optional: MPI support for large-scale HPC runs
+# ===============================================
+# Only needed if using mpirun on clusters like MareNostrum5
+# Uncomment and install separately via module system if available:
+# mpi4py>=3.0.0
+
+# Development & analysis (optional)
+# ==================================
+# For Jupyter notebooks and interactive analysis:
+# jupyter>=1.0.0
+# ipython>=7.0.0
+# pytest>=6.0.0  (for testing)
+
+# Notes
+# =====
+# 1. NEST must be compiled with matching Python version (3.8+)
+#    and OpenMP/MPI support as needed.
+#
+# 2. On MareNostrum5 or other HPC clusters:
+#    - Load appropriate modules: module load nest, module load mpi
+#    - NEST is pre-installed; verify with: python -c "import nest"
+#    - mpi4py may need separate installation or module load
+#
+# 3. For 100% rat-scale simulations (781k neurons, 256 nodes):
+#    - Use NEST with MPI: pip install nest-simulator[mpi]
+#    - Ensure HDF5 is compiled with MPI support for parallel I/O
+#    - Run via SLURM: sbatch run_bidir_replay.sh
+#
+# 4. tiny.py is part of this repository and not a pip package;
+#    ensure it is in the same directory as scripts that import it.
