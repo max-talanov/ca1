@@ -71,11 +71,38 @@ Four changes address this:
 check_grid_resolves_criterion() now warns explicitly when the floor
 condition recurs, so a future run cannot fail this way silently.
 
-Caveat carried forward: applying the same interpolation to the OLD 07-22
-response curves gives an MC_HIGH/MC_LOW ratio near 2x rather than 5x. That
-estimate is itself unreliable (it interpolates across a single 200 Hz
-interval), but it is a hint that the 5.0x target may not survive the finer
-sweep, and that MC_HIGH's I_e = -9.0 will need re-tuning.
+DC current probe (2026-07-23 revision)
+--------------------------------------
+The finer sweep above resolved the threshold region (res/2026-07-23) and in
+doing so exposed a deeper problem: the extrapolated threshold is undefined
+for every population, because every linear fit extrapolates to a negative
+drive rate. At 20 Hz drive PPGC_HGC already fires at 8.75 Hz -- roughly 44%
+of input spikes evoke an output spike.
+
+The cause is the probe, not the sweep. Solving the Izhikevich fixed points
+(0.04 v^2 + (5-b) v + 140 + I_e = 0) puts MC_LOW's rest at -70.00 mV and its
+threshold at -50.00 mV, a gap of exactly 20.00 mV -- identical to the
+--weight 20.0 probe's single-EPSP amplitude. Single inputs are therefore
+suprathreshold, the cell relays rather than integrates, and "rheobase in Hz
+of Poisson drive" measures the probe rather than the neuron. No rate grid,
+however fine, can fix that.
+
+--probe dc measures rheobase the way Watson et al. (~77 vs ~128 pA) and
+Kassab & Alexandre (theta_l / theta_h) define it: by current injection. For
+Izhikevich this has a closed form (analytic_dc_rheobase), which the sweep
+reports alongside the measured value as a solver cross-check:
+
+    I_rheo = (5 - b)^2 / 0.16 - 140 - I_e
+
+MC_LOW -> 4.00 and MC_HIGH at I_e=-9.0 -> 13.00, a ratio of 3.25x (3.38x
+under forward Euler) -- outside the +/-20% band, so the 5.0x target failed
+and the numpy stand-in in izh_calibrate.py did overestimate the separation.
+MC_HIGH's I_e is retuned to -15.1, which gives 5.00x numerically; the NEST
+DC sweep is the arbiter.
+
+Incidental: DG_BASKET has the same -70/-50 geometry as the granule cells.
+Its ~6x steeper f-I gain comes from d=2.0 (weak adaptation), not from a
+lower threshold -- FS cells here are higher-gain, not more excitable.
 
 Requirements: NEST >= 3.9, numpy, matplotlib, h5py.
 """
@@ -106,8 +133,20 @@ CANDIDATE_PARAMS = {
     "ppgc_hgc":  dict(a=0.02, b=0.2,  c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=0.0),
     "dg_basket": dict(a=0.10, b=0.2,  c=-65.0, d=2.0, V_m=-65.0, U_m=-13.0, I_e=0.0),
     "mc_low":    dict(a=0.02, b=0.2,  c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=0.0),
-    "mc_high":   dict(a=0.02, b=0.2,  c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=-9.0),
+    # I_e retuned -9.0 -> -15.1 (2026-07-23). The Izhikevich DC rheobase is
+    # analytic: tonic firing begins at the saddle-node where the rest and
+    # threshold fixed points annihilate,
+    #     I_rheo = (5 - b)^2 / 0.16 - 140 - I_e
+    # giving 4.00 for MC_LOW and 13.00 for I_e=-9.0, a ratio of 3.25x -- well
+    # outside the +/-20% band around the 5.0x target. I_e = -15.1 puts the
+    # numerically integrated ratio at 5.00x (analytic -16.0 gives 5.00x exactly
+    # but 5.24x under forward Euler; -15.1 is the better compromise, and the
+    # NEST DC sweep arbitrates). See threshold_by_extrapolation and --probe dc.
+    "mc_high":   dict(a=0.02, b=0.2,  c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=-15.1),
 }
+
+# Previous value, kept so a rerun can reproduce the 2026-07-23 result.
+MC_HIGH_I_E_PREV = -9.0
 
 # The MC_HIGH/MC_LOW ratio is a function of where the rheobase criterion is
 # placed, so a single criterion cannot tell you whether the target 5.0x
@@ -250,6 +289,83 @@ def run_fi_sweep(rates_hz, weight, delay, sim_ms, n_repeats, n_threads):
     return response_hz, raw_spikes
 
 
+def analytic_dc_rheobase(b, I_e):
+    """Injected current at which the Izhikevich neuron starts tonic firing.
+
+    Fixed points of dv/dt = 0.04 v^2 + 5 v + 140 - u + I with u = b v satisfy
+    0.04 v^2 + (5-b) v + 140 + I = 0. The stable rest and unstable threshold
+    roots annihilate in a saddle-node when the discriminant vanishes, so
+
+        I_total_rheo = (5 - b)^2 / 0.16 - 140
+
+    and the *injected* current needed on top of the neuron's own I_e is that
+    minus I_e. Exact for the ODE; NEST's solver and the forward-Euler
+    stand-in both land within a few percent.
+    """
+    return ((5.0 - b) ** 2) / 0.16 - 140.0 - I_e
+
+
+def run_dc_sweep(currents, sim_ms, settle_ms, n_threads):
+    """Rheobase by DC current injection -- the measurement the source papers make.
+
+    The Poisson probe cannot measure rheobase for these parameter sets: at
+    weight 20.0 a single EPSP delivers +20.0 mV, which is exactly the 20.00 mV
+    separating MC_LOW's rest (-70.0) from its threshold (-50.0). The neuron
+    relays single input spikes instead of integrating them, so the f-I curve
+    has no subthreshold region to extrapolate a threshold from, and the
+    measured "rheobase in Hz" is a property of the probe rather than the cell.
+    Watson et al. (~77 vs ~128 pA) and Kassab & Alexandre (theta_l/theta_h)
+    both define rheobase as injected current, which is what this sweeps.
+
+    Current is applied by setting I_e directly (no synapse, no generator), so
+    the sweep is deterministic -- one neuron per (population, current) is
+    sufficient. Spikes are counted only after `settle_ms` so the transient
+    from the V_m = -65.0 initial condition (above the true rest of -70.0)
+    cannot be mistaken for tonic firing.
+    """
+    nest.ResetKernel()
+    nest.SetKernelStatus({"resolution": 0.1, "local_num_threads": n_threads,
+                           "print_time": False, "overwrite_files": True})
+    safe_set_seeds()
+
+    currents = np.asarray(currents, dtype=float)
+    neuron_index, spk_index = {}, {}
+    for label, params in CANDIDATE_PARAMS.items():
+        per_current = [dict(params, I_e=float(params["I_e"] + I)) for I in currents]
+        neurons = nest.Create("izhikevich", len(currents), params=per_current)
+        spk = nest.Create("spike_recorder", params={"start": float(settle_ms)})
+        nest.Connect(neurons, spk)
+        neuron_index[label] = neurons
+        spk_index[label]    = spk
+
+    nest.Simulate(sim_ms)
+
+    window_s = (sim_ms - settle_ms) / 1000.0
+    response_hz = {}
+    for label in CANDIDATE_PARAMS:
+        ev = nest.GetStatus(spk_index[label], "events")[0]
+        senders = np.asarray(ev["senders"], dtype=np.int64)
+        first   = neuron_index[label][0].global_id
+        counts  = np.bincount(senders - first, minlength=len(currents))
+        response_hz[label] = counts[:len(currents)] / window_s
+    return response_hz
+
+
+def dc_rheobase(currents, response_hz, criterion_hz, min_spikes, window_s):
+    """Smallest injected current sustaining firing.
+
+    Onset at a saddle-node is continuous (rate grows like sqrt(I - I_rheo)),
+    so a criterion is unavoidable; requiring `min_spikes` in the measurement
+    window on top of it rejects a lone transient spike being read as tonic
+    firing.
+    """
+    currents = np.asarray(currents, dtype=float)
+    response = np.asarray(response_hz, dtype=float)
+    ok = (response >= criterion_hz) & (response * window_s >= min_spikes)
+    idx = np.where(ok)[0]
+    return float(currents[idx[0]]) if len(idx) else float("nan")
+
+
 def save_calibration_hdf5(outpath, rates_hz, response_hz, raw_spikes,
                            weight, delay, sim_ms, n_repeats, criterion_hz):
     """
@@ -341,6 +457,113 @@ def save_calibration_hdf5(outpath, rates_hz, response_hz, raw_spikes,
     print(f">>> Saved calibration data -> {outpath}")
 
 
+def save_dc_hdf5(outpath, currents, dc_response, sim_ms, settle_ms,
+                  criterion_hz, min_spikes):
+    """Append the DC sweep to the calibration HDF5 as a /dc group.
+
+    Schema
+    ------
+    /dc                  attrs: sim_ms, settle_ms, criterion_hz, min_spikes,
+                         window_s, mc_high_low_dc_ratio
+        currents         swept injected currents [n_dc] (float32)
+        <population>/
+            attrs: I_e_base, dc_rheobase, dc_rheobase_analytic
+            response_hz  steady-state rate per current [n_dc] (float32)
+    """
+    if not _HDF5_AVAILABLE:
+        print(">>> [WARNING] h5py not installed -- skipping DC HDF5 export.")
+        return
+
+    window_s = (sim_ms - settle_ms) / 1000.0
+    mode = "a" if os.path.exists(outpath) else "w"
+    with h5py.File(outpath, mode) as h5:
+        if "dc" in h5:
+            del h5["dc"]
+        g = h5.create_group("dc")
+        g.attrs["sim_ms"]       = float(sim_ms)
+        g.attrs["settle_ms"]    = float(settle_ms)
+        g.attrs["criterion_hz"] = float(criterion_hz)
+        g.attrs["min_spikes"]   = int(min_spikes)
+        g.attrs["window_s"]     = float(window_s)
+        g.create_dataset("currents", data=np.asarray(currents, dtype=np.float32))
+
+        for label, params in CANDIDATE_PARAMS.items():
+            sub = g.create_group(label)
+            sub.attrs["I_e_base"] = float(params["I_e"])
+            sub.attrs["dc_rheobase"] = dc_rheobase(
+                currents, dc_response[label], criterion_hz, min_spikes, window_s)
+            sub.attrs["dc_rheobase_analytic"] = analytic_dc_rheobase(
+                params["b"], params["I_e"])
+            sub.create_dataset("response_hz",
+                                data=np.asarray(dc_response[label], dtype=np.float32))
+
+        r_low  = g["mc_low"].attrs["dc_rheobase"]
+        r_high = g["mc_high"].attrs["dc_rheobase"]
+        if r_low and not np.isnan(r_low) and not np.isnan(r_high):
+            g.attrs["mc_high_low_dc_ratio"] = float(r_high / r_low)
+
+    print(f">>> Saved DC rheobase data -> {outpath} (/dc)")
+
+
+def print_dc_report(currents, dc_response, sim_ms, settle_ms, criterion_hz,
+                     min_spikes):
+    window_s = (sim_ms - settle_ms) / 1000.0
+    step = float(np.min(np.diff(currents))) if len(currents) > 1 else float("nan")
+    print(f"\n=== DC rheobase (injected current)  criterion = {criterion_hz:.1f} Hz "
+          f"and >= {min_spikes} spikes in {window_s:.1f}s, step = {step:.3f} ===")
+    print(f"  {'population':12s} {'I_e':>7s} {'measured':>10s} {'analytic':>10s} {'delta':>8s}")
+    rheo = {}
+    for label, params in CANDIDATE_PARAMS.items():
+        r = dc_rheobase(currents, dc_response[label], criterion_hz,
+                        min_spikes, window_s)
+        a = analytic_dc_rheobase(params["b"], params["I_e"])
+        rheo[label] = r
+        print(f"  {label:12s} {params['I_e']:7.2f} {r:10.3f} {a:10.3f} "
+              f"{r - a:+8.3f}")
+
+    r_low, r_high = rheo.get("mc_low"), rheo.get("mc_high")
+    if (r_low and not np.isnan(r_low) and r_high and not np.isnan(r_high)):
+        ratio = r_high / r_low
+        lo = MC_RATIO_TARGET * (1.0 - MC_RATIO_TOL)
+        hi = MC_RATIO_TARGET * (1.0 + MC_RATIO_TOL)
+        print(f"\n  MC_HIGH / MC_LOW DC rheobase ratio = {ratio:.2f}x  "
+              f"(target {MC_RATIO_TARGET:.1f}x, accept {lo:.1f}-{hi:.1f}x)")
+        if lo <= ratio <= hi:
+            print("  [OK] within tolerance -- MC parameters confirmed for Phase 6.2.")
+        else:
+            need = analytic_dc_rheobase(0.2, 0.0) * MC_RATIO_TARGET
+            print("  [FLAG] ratio outside +/-20% of target. Analytic retune: set "
+                  f"MC_HIGH I_e = {analytic_dc_rheobase(0.2, 0.0) - need:.2f} "
+                  f"for exactly {MC_RATIO_TARGET:.1f}x.")
+    else:
+        print("\n  [FLAG] DC rheobase not bracketed for MC_LOW and/or MC_HIGH -- "
+              "raise --dc-max.")
+
+
+def plot_dc_calibration(currents, dc_response, sim_ms, settle_ms, criterion_hz,
+                         min_spikes, out_png):
+    window_s = (sim_ms - settle_ms) / 1000.0
+    colors = {"ppgc_hgc": "seagreen", "dg_basket": "mediumorchid",
+              "mc_low": "steelblue", "mc_high": "firebrick"}
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    for label, resp in dc_response.items():
+        r = dc_rheobase(currents, resp, criterion_hz, min_spikes, window_s)
+        ax.plot(currents, resp, lw=1.8, color=colors[label],
+                label=f"{label} (I_rheo = {r:.2f})")
+        if not np.isnan(r):
+            ax.axvline(r, color=colors[label], ls="--", lw=0.8, alpha=0.6)
+    ax.axhline(criterion_hz, color="k", ls=":", lw=1.0)
+    ax.set_xlabel("Injected current I (Izhikevich units, added to I_e)")
+    ax.set_ylabel("Steady-state firing rate (Hz)")
+    ax.set_title("DG-CA3 extension: DC rheobase (Phase 6.1)")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f">>> Saved DC plot -> {out_png}")
+
+
 def plot_calibration(rates_hz, response_hz, criterion_hz, out_png, fine_max=None):
     """Full f-I sweep plus a zoom on the threshold region.
 
@@ -387,7 +610,7 @@ def plot_calibration(rates_hz, response_hz, criterion_hz, out_png, fine_max=None
     print(f">>> Saved plot -> {out_png}")
 
 
-def print_report(rates_hz, response_hz, criterion_hz):
+def print_report(rates_hz, response_hz, criterion_hz, dc_is_authority=False):
     step_lo = float(np.min(np.diff(rates_hz))) if len(rates_hz) > 1 else float("nan")
     print(f"\n=== Rheobase table (NEST 3.9)  criterion = {criterion_hz:.0f} Hz, "
           f"interpolated, finest grid step = {step_lo:.0f} Hz ===")
@@ -408,10 +631,10 @@ def print_report(rates_hz, response_hz, criterion_hz):
         mark = "  <-- criterion" if abs(c - criterion_hz) < 1e-9 else ""
         print(f"  {c:9.0f} {r_low:9.1f} {r_high:9.1f} {ratio:8.2f}{mark}")
 
-    print("  (ratios above are biased toward 1.0 by the criterion itself; the "
-          "verdict below\n   uses the criterion-free extrapolated threshold.)")
+    print("  (ratios above are biased toward 1.0 by the criterion itself.)")
 
-    # Primary, criterion-free metric.
+    # Criterion-free, but still a property of the Poisson probe: see
+    # run_dc_sweep() for why a strong probe leaves no threshold to extrapolate.
     print("\n=== Extrapolated threshold (linear fit -> zero response) ===")
     thr = {}
     for label, resp in response_hz.items():
@@ -421,27 +644,26 @@ def print_report(rates_hz, response_hz, criterion_hz):
               f"Hz/Hz   ({n_fit} fit pts)")
 
     t_low, t_high = thr.get("mc_low"), thr.get("mc_high")
+    suffix = ("  (informational -- the DC probe decides)" if dc_is_authority else "")
     if (t_low and not np.isnan(t_low) and t_high and not np.isnan(t_high)):
         ratio = t_high / t_low
         lo = MC_RATIO_TARGET * (1.0 - MC_RATIO_TOL)
         hi = MC_RATIO_TARGET * (1.0 + MC_RATIO_TOL)
         print(f"\n  MC_HIGH / MC_LOW threshold ratio = {ratio:.2f}x  "
-              f"(target {MC_RATIO_TARGET:.1f}x, accept {lo:.1f}-{hi:.1f}x)")
-        if not (lo <= ratio <= hi):
+              f"(target {MC_RATIO_TARGET:.1f}x, accept {lo:.1f}-{hi:.1f}x){suffix}")
+        if not dc_is_authority and not (lo <= ratio <= hi):
             print("  [FLAG] ratio outside +/-20% of target -- re-tune I_e for "
-                  "MC_HIGH before Phase 6.2 (see izh_calibrate.py numpy sweep "
-                  "for the search procedure).")
-            if abs(ratio - 1.0) < 0.05:
-                print("  [FLAG] ratio ~1.0 -- check the sweep resolved threshold "
-                      "at all (see the floored-grid warning below).")
-        else:
+                  "MC_HIGH before Phase 6.2. Prefer --probe dc, which measures "
+                  "rheobase as the source papers define it.")
+        elif not dc_is_authority:
             print("  [OK] within tolerance -- parameters confirmed for Phase 6.2.")
     else:
-        print("\n  [FLAG] threshold fit failed for MC_LOW and/or MC_HIGH -- too "
-              "few points in the 5-60 Hz output band, or the fit extrapolates "
-              "outside the swept range. Lower --fine-rate-step (and/or raise "
-              "--fine-rate-max) and rerun; no verdict on the 5.0x target is "
-              "possible from this sweep.")
+        print(f"\n  [NOTE] threshold fit did not converge for MC_LOW and/or "
+              f"MC_HIGH.{suffix}")
+        print("   Expected when the probe weight is comparable to the neuron's "
+              "rest-to-threshold\n   gap: single EPSPs are then suprathreshold, "
+              "there is no integration regime,\n   and the f-I curve has no "
+              "threshold to extrapolate. Use --probe dc.")
 
 
 def check_grid_resolves_criterion(rates_hz, response_hz, criterion_hz):
@@ -493,6 +715,29 @@ if __name__ == "__main__":
                               "verdict uses the criterion-free extrapolated "
                               "threshold, since criterion-based ratios are biased "
                               "toward 1.0.")
+    # ---- DC current probe (rheobase as the source papers define it) ---------
+    parser.add_argument("--probe", choices=("poisson", "dc", "both"), default="both",
+                         help="Which probe(s) to run. 'dc' measures rheobase by "
+                              "current injection (what Watson / Kassab & Alexandre "
+                              "report); 'poisson' is the network-drive f-I sweep, "
+                              "which cannot measure rheobase at weight 20.0 "
+                              "(default: both)")
+    parser.add_argument("--dc-max", type=float, default=30.0,
+                         help="Max injected current for the DC sweep (default: 30)")
+    parser.add_argument("--dc-step", type=float, default=0.05,
+                         help="Injected-current step for the DC sweep (default: 0.05)")
+    parser.add_argument("--dc-sim-ms", type=float, default=3000.0,
+                         help="DC sweep duration per current, ms (default: 3000)")
+    parser.add_argument("--dc-settle-ms", type=float, default=500.0,
+                         help="Ignore spikes before this time, ms, so the V_m=-65 "
+                              "initial transient is not counted (default: 500)")
+    parser.add_argument("--dc-criterion-hz", type=float, default=1.0,
+                         help="Firing rate counting as tonic for DC rheobase, Hz "
+                              "(default: 1.0)")
+    parser.add_argument("--dc-min-spikes", type=int, default=2,
+                         help="Minimum spikes in the measurement window for DC "
+                              "rheobase, so a lone transient does not count "
+                              "(default: 2)")
     parser.add_argument("--out-hdf5", type=str, default=None, metavar="FILE",
                          help="Path for output HDF5 file. If omitted, written to "
                               "calibration_output/dg_ca3_fi_calib.h5")
@@ -503,39 +748,81 @@ if __name__ == "__main__":
     n_threads = (args.threads if args.threads is not None
                  else int(os.environ.get("OMP_NUM_THREADS", 4)))
 
-    rates_hz = build_rate_grid(args.fine_rate_max, args.fine_rate_step,
-                                args.rate_max, args.rate_step)
-
-    print(">>> Running DG-CA3 f-I calibration sweep in NEST 3.9 ...")
-    print(f"    threads={n_threads}  sim_ms={args.sim_ms}  n_repeats={args.n_repeats}")
-    if args.fine_rate_max > 0:
-        print(f"    fine   0..{args.fine_rate_max:.0f}Hz step {args.fine_rate_step:.0f}Hz")
-        print(f"    coarse {args.fine_rate_max:.0f}..{args.rate_max:.0f}Hz "
-              f"step {args.rate_step:.0f}Hz")
-    else:
-        print(f"    uniform 0..{args.rate_max:.0f}Hz step {args.rate_step:.0f}Hz")
-    print(f"    {len(rates_hz)} rate conditions x {len(CANDIDATE_PARAMS)} populations "
-          f"x {args.n_repeats} repeats = "
-          f"{len(rates_hz) * len(CANDIDATE_PARAMS) * args.n_repeats} neurons")
-
-    response_hz, raw_spikes = run_fi_sweep(
-        rates_hz, args.weight, args.delay, args.sim_ms, args.n_repeats, n_threads)
-
-    print_report(rates_hz, response_hz, args.criterion_hz)
-    check_grid_resolves_criterion(rates_hz, response_hz, args.criterion_hz)
-
     out_dir  = os.path.join(_script_dir, "calibration_output")
     os.makedirs(out_dir, exist_ok=True)
     hdf5_path = args.out_hdf5 if args.out_hdf5 else os.path.join(out_dir, "dg_ca3_fi_calib.h5")
 
-    save_calibration_hdf5(hdf5_path, rates_hz, response_hz, raw_spikes,
-                          args.weight, args.delay, args.sim_ms, args.n_repeats,
-                          args.criterion_hz)
+    run_poisson = args.probe in ("poisson", "both")
+    run_dc      = args.probe in ("dc", "both")
 
-    if not args.no_figures:
-        plot_calibration(rates_hz, response_hz, args.criterion_hz,
-                         os.path.join(out_dir, "nest_fi_calibration.png"),
-                         fine_max=args.fine_rate_max)
-    else:
-        print(">>> Figure generation skipped (--no-figures). "
+    print(f">>> MC_HIGH I_e = {CANDIDATE_PARAMS['mc_high']['I_e']:.2f} "
+          f"(was {MC_HIGH_I_E_PREV:.1f}); analytic DC rheobase ratio = "
+          f"{analytic_dc_rheobase(0.2, CANDIDATE_PARAMS['mc_high']['I_e']) / analytic_dc_rheobase(0.2, 0.0):.2f}x")
+
+    # ---- Poisson f-I sweep (network-drive characterisation) -----------------
+    if run_poisson:
+        rates_hz = build_rate_grid(args.fine_rate_max, args.fine_rate_step,
+                                    args.rate_max, args.rate_step)
+
+        print("\n>>> Running DG-CA3 Poisson f-I sweep in NEST 3.9 ...")
+        print(f"    threads={n_threads}  sim_ms={args.sim_ms}  n_repeats={args.n_repeats}")
+        if args.fine_rate_max > 0:
+            print(f"    fine   0..{args.fine_rate_max:.0f}Hz step {args.fine_rate_step:.0f}Hz")
+            print(f"    coarse {args.fine_rate_max:.0f}..{args.rate_max:.0f}Hz "
+                  f"step {args.rate_step:.0f}Hz")
+        else:
+            print(f"    uniform 0..{args.rate_max:.0f}Hz step {args.rate_step:.0f}Hz")
+        print(f"    {len(rates_hz)} rate conditions x {len(CANDIDATE_PARAMS)} populations "
+              f"x {args.n_repeats} repeats = "
+              f"{len(rates_hz) * len(CANDIDATE_PARAMS) * args.n_repeats} neurons")
+
+        response_hz, raw_spikes = run_fi_sweep(
+            rates_hz, args.weight, args.delay, args.sim_ms, args.n_repeats, n_threads)
+
+        print_report(rates_hz, response_hz, args.criterion_hz,
+                     dc_is_authority=run_dc)
+        check_grid_resolves_criterion(rates_hz, response_hz, args.criterion_hz)
+
+        save_calibration_hdf5(hdf5_path, rates_hz, response_hz, raw_spikes,
+                              args.weight, args.delay, args.sim_ms, args.n_repeats,
+                              args.criterion_hz)
+
+        if not args.no_figures:
+            plot_calibration(rates_hz, response_hz, args.criterion_hz,
+                             os.path.join(out_dir, "nest_fi_calibration.png"),
+                             fine_max=args.fine_rate_max)
+
+    # ---- DC current sweep (rheobase, as the source papers define it) --------
+    if run_dc:
+        currents = np.arange(0.0, args.dc_max + args.dc_step, args.dc_step)
+        print("\n>>> Running DG-CA3 DC rheobase sweep in NEST 3.9 ...")
+        print(f"    threads={n_threads}  sim_ms={args.dc_sim_ms}  "
+              f"settle_ms={args.dc_settle_ms}")
+        print(f"    currents 0..{args.dc_max:.1f} step {args.dc_step:.3f}  "
+              f"({len(currents)} conditions x {len(CANDIDATE_PARAMS)} populations "
+              f"= {len(currents) * len(CANDIDATE_PARAMS)} neurons, deterministic)")
+
+        dc_response = run_dc_sweep(currents, args.dc_sim_ms, args.dc_settle_ms,
+                                    n_threads)
+
+        print_dc_report(currents, dc_response, args.dc_sim_ms, args.dc_settle_ms,
+                        args.dc_criterion_hz, args.dc_min_spikes)
+
+        if not run_poisson and not os.path.exists(hdf5_path):
+            # /dc is appended to the calibration file; make sure one exists.
+            if _HDF5_AVAILABLE:
+                with h5py.File(hdf5_path, "w") as h5:
+                    h5.attrs["created_utc"] = datetime.datetime.utcnow().isoformat()
+                    h5.attrs["probe"] = "dc"
+        save_dc_hdf5(hdf5_path, currents, dc_response, args.dc_sim_ms,
+                     args.dc_settle_ms, args.dc_criterion_hz, args.dc_min_spikes)
+
+        if not args.no_figures:
+            plot_dc_calibration(currents, dc_response, args.dc_sim_ms,
+                                 args.dc_settle_ms, args.dc_criterion_hz,
+                                 args.dc_min_spikes,
+                                 os.path.join(out_dir, "nest_dc_rheobase.png"))
+
+    if args.no_figures:
+        print("\n>>> Figure generation skipped (--no-figures). "
               "Plot locally from the HDF5 with your own script.")

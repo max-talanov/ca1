@@ -17,6 +17,13 @@
 # Re-tuning MC_HIGH's I_e: sweep the threshold region only, cheaply
 #   sbatch --export=ALL,RATE_MAX=1200,FINE_RATE_MAX=1200,FINE_RATE_STEP=10 run_calibrate.sh
 
+# DC rheobase only -- this is the measurement that tests the 5.0x MC target.
+# Much cheaper than the Poisson sweep (no synapses, deterministic).
+#   sbatch --export=ALL,PROBE=dc run_calibrate.sh
+
+# Finer DC resolution
+#   sbatch --export=ALL,PROBE=dc,DC_STEP=0.01 run_calibrate.sh
+
 # Data-only run, no PNG (e.g. for a batch of calibration variants)
 #   sbatch --export=ALL,NO_FIGURES=1 run_calibrate.sh
 
@@ -32,6 +39,16 @@ FINE_RATE_MAX=${FINE_RATE_MAX:-800}
 FINE_RATE_STEP=${FINE_RATE_STEP:-20}
 WEIGHT=${WEIGHT:-20.0}
 CRITERION_HZ=${CRITERION_HZ:-2.0}
+# DC current probe. This is the authoritative rheobase measurement -- the
+# Poisson probe cannot measure rheobase at WEIGHT=20.0, because a single EPSP
+# (+20 mV) already spans MC_LOW's entire rest-to-threshold gap (20.00 mV).
+PROBE=${PROBE:-both}
+DC_MAX=${DC_MAX:-30.0}
+DC_STEP=${DC_STEP:-0.05}
+DC_SIM_MS=${DC_SIM_MS:-3000}
+DC_SETTLE_MS=${DC_SETTLE_MS:-500}
+DC_CRITERION_HZ=${DC_CRITERION_HZ:-1.0}
+DC_MIN_SPIKES=${DC_MIN_SPIKES:-2}
 NO_FIGURES=${NO_FIGURES:-0}
 OUTDIR="calibration_output"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -49,6 +66,7 @@ export OMP_PLACES=cores
 echo "[Slurm] job=$SLURM_JOB_ID  ntasks=$SLURM_NTASKS  cpus-per-task=$SLURM_CPUS_PER_TASK"
 echo "[Slurm] sim_ms=$SIM_MS  n_repeats=$N_REPEATS  rate_max=$RATE_MAX  rate_step=$RATE_STEP  weight=$WEIGHT"
 echo "[Slurm] fine_rate_max=$FINE_RATE_MAX  fine_rate_step=$FINE_RATE_STEP  criterion_hz=$CRITERION_HZ"
+echo "[Slurm] probe=$PROBE  dc_max=$DC_MAX  dc_step=$DC_STEP  dc_criterion_hz=$DC_CRITERION_HZ"
 
 python3 - <<'PY'
 import nest
@@ -75,5 +93,12 @@ srun --cpu-bind=cores \
     --fine-rate-step "$FINE_RATE_STEP" \
     --weight       "$WEIGHT" \
     --criterion-hz "$CRITERION_HZ" \
+    --probe           "$PROBE" \
+    --dc-max          "$DC_MAX" \
+    --dc-step         "$DC_STEP" \
+    --dc-sim-ms       "$DC_SIM_MS" \
+    --dc-settle-ms    "$DC_SETTLE_MS" \
+    --dc-criterion-hz "$DC_CRITERION_HZ" \
+    --dc-min-spikes   "$DC_MIN_SPIKES" \
     --out-hdf5     "$OUTFILE" \
     $OPTIONAL_FLAGS
