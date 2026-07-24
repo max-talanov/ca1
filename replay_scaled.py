@@ -185,6 +185,22 @@ _REF_CORTEX = dict(
     N_ec_lii = 100_000,   # EC layer II/III stellate cells (direct CA1 recipient)
 )
 
+# Reference counts for the dentate gyrus (Phase 6.2, --dg). Kept separate for
+# the same reason as _REF_CORTEX: hippocampal (CA3/CA1) gradual-scale maths is
+# untouched when --dg is not requested. Andersen et al. 2007, "The Hippocampus
+# Book", rat:
+#   granule cells    ~1,200,000  (the input/pattern-separation stage)
+#   mossy cells         ~30,000  (hilar; split into low/high threshold per
+#                                 Kassab & Alexandre 2018 — see the confirmed
+#                                 f-I calibration, nest_dg_ca3_fi_calibration.py)
+#   DG basket/HIPP      ~10,000  (feedback inhibition -> sparse coding)
+_REF_DG = dict(
+    N_dg_gc       = 1_200_000,
+    N_dg_mc_low   =    15_000,   # 50% of ~30k mossy cells
+    N_dg_mc_high  =    15_000,   # 50%
+    N_dg_basket   =    10_000,
+)
+
 
 def _round_to_multiple(n: float, m: int) -> int:
     """Round n to the nearest multiple of m, minimum m."""
@@ -265,6 +281,18 @@ TARGET_INDEGREE = {
     "ca1_OE"               :    20,
     # Cortical projections (phase 1+)
     "ca1_ec_lii"           :   500,   # CA1 PYR -> EC LII (Naber et al. 2001)
+    # Dentate gyrus (Phase 6.2, --dg). Scale-invariant in-degrees.
+    "dg_gc_basket"         :    50,   # GC -> DG basket  (E->I, recruits inhibition)
+    "dg_basket_gc"         :   140,   # DG basket -> GC  (I->E, feedback -> sparse)
+    "dg_gc_mc"             :    30,   # GC -> mossy cell (mossy collaterals in hilus)
+    "dg_mc_gc"             :     8,   # mossy cell -> GC (associational back-projection)
+    "dg_mc_basket"         :    20,   # mossy cell -> DG basket (drives feedback inh)
+    # Mossy fibre DG -> CA3: the "detonator" synapse. Each CA3 pyramidal cell
+    # receives very FEW mossy-fibre inputs (~15-50 in rat; Acsady et al. 1998,
+    # Henze et al. 2002) but each is disproportionately powerful. Low in-degree,
+    # high weight -- the opposite of the dense Schaffer collaterals.
+    "dg_mf_ca3_sup"        :    15,   # GC -> CA3 SUP  (primary MF target)
+    "dg_mf_ca3_deep"       :     8,   # GC -> CA3 DEEP (weaker; SUP is main target)
 }
 
 
@@ -565,6 +593,11 @@ def build_replay_network(
     # Parallel
     n_threads=8,
     seed_connect=42,  # RNG seed for V_m heterogeneity + connectivity
+    # Phase 6.2: when a real DG circuit (--dg) drives CA3 via mossy fibres,
+    # the Poisson DG proxy on CA3 SUP/DEEP is suppressed so drive is not
+    # double-counted. The EC and background CA3 drives are kept -- they model
+    # the direct perforant path and tonic background, distinct from DG input.
+    suppress_dg_drive=False,
 ):
     """
     Build Watson 2025 two-layer CA1+CA3 replay network.
@@ -666,15 +699,21 @@ def build_replay_network(
 
     _drive(N_ca1_pyr,      rate_ec_ca1_pyr,         CA1_PYR,      2.0, d_slow)
     _drive(N_ca1_basket,   rate_drive_ca1_basket,   CA1_BASKET,   2.0, d_fast)
-    # DG→CA3 SUP: heterogeneous rates (σ=100 Hz) to spread membrane potentials
-    _dg_rates_sup = _rng_vm.normal(rate_dg_ca3_sup, 100.0,
-                                    N_ca3_sup).clip(400.0, 1400.0)
-    _dg_gen_sup   = nest.Create("poisson_generator", N_ca3_sup)
-    nest.SetStatus(_dg_gen_sup, "rate", _dg_rates_sup.tolist())
-    nest.Connect(_dg_gen_sup, CA3_SUP, conn_spec="one_to_one",
-                 syn_spec={"weight": 3.0, "delay": d_fast})
-    # DG→CA3 DEEP: uniform (smaller pop, less impact on replay clarity)
-    _drive(N_ca3_deep,     rate_dg_ca3_deep,        CA3_DEEP,     1.0, d_fast)
+    if suppress_dg_drive:
+        # A real DG circuit will drive CA3 via mossy fibres (build_dg_module);
+        # skip the Poisson proxy so the mossy-fibre input is not double-counted.
+        print("    [DG] Poisson DG->CA3 proxy suppressed (real DG mossy fibres "
+              "will drive CA3)")
+    else:
+        # DG→CA3 SUP: heterogeneous rates (σ=100 Hz) to spread membrane potentials
+        _dg_rates_sup = _rng_vm.normal(rate_dg_ca3_sup, 100.0,
+                                        N_ca3_sup).clip(400.0, 1400.0)
+        _dg_gen_sup   = nest.Create("poisson_generator", N_ca3_sup)
+        nest.SetStatus(_dg_gen_sup, "rate", _dg_rates_sup.tolist())
+        nest.Connect(_dg_gen_sup, CA3_SUP, conn_spec="one_to_one",
+                     syn_spec={"weight": 3.0, "delay": d_fast})
+        # DG→CA3 DEEP: uniform (smaller pop, less impact on replay clarity)
+        _drive(N_ca3_deep,     rate_dg_ca3_deep,        CA3_DEEP,     1.0, d_fast)
     _drive(N_ca3_sup,      rate_ec_ca3_sup,         CA3_SUP,      2.0, d_slow)
     _drive(N_ca3_deep,     rate_ec_ca3_deep,        CA3_DEEP,     1.2, d_slow)
     _drive(N_ca3_sup,      rate_ca3_drive_sup,      CA3_SUP,      2.0, d_fast)
@@ -946,6 +985,205 @@ def build_replay_network(
         swr_events=[(swr_fwd_start, swr_fwd_stop), (swr_rev_start, swr_rev_stop)],
         swr_ripple_hz=swr_ripple_hz, theta_on=theta_on, theta_hz=theta_hz,
     )
+
+
+# ============================================================================
+# Dentate gyrus module  (Phase 6.2 — real DG replacing the CA3 Poisson proxy)
+# ============================================================================
+#
+# Motivation
+# ----------
+# "DG" in build_replay_network() was a Poisson generator, not a spiking
+# population -- the largest bio-plausibility gap in the EC->DG->CA3->CA1->EC
+# loop. This module builds a real DG: granule cells (the pattern-separation
+# stage), two mossy-cell classes, and a basket-cell feedback loop, then drives
+# CA3 through the mossy-fibre "detonator" synapse.
+#
+# Neuron parameters come verbatim from CANDIDATE_PARAMS in
+# nest_dg_ca3_fi_calibration.py, whose MC_LOW/MC_HIGH threshold split was
+# confirmed on MN5 (NEST 3.9) at a 4.97x DC-rheobase ratio against the 5.0x
+# Kassab & Alexandre target (MC_HIGH I_e = -15.1).
+#
+# Circuit
+# -------
+#   perforant path (Poisson, models EC LII)  --> GC        [sparse, strong]
+#   GC        --> DG_BASKET   (E->I)   recruits feedback inhibition
+#   DG_BASKET --> GC          (I->E)   winner-take-all -> ~2-4% sparse coding
+#   GC        --> MC_LOW/HIGH (mossy collaterals in the hilus)
+#   MC        --> GC          (associational back-projection, weak excitatory)
+#   MC        --> DG_BASKET   (mossy cells drive feedback inhibition of GC)
+#   GC        --> CA3 SUP/DEEP (mossy fibre, LOW in-degree, HIGH weight)
+#
+# Sparse coding is the DG hallmark and the substrate of pattern separation:
+# strong DG_BASKET->GC feedback keeps only the most-driven granule cells above
+# threshold, so overlapping cortical inputs map to near-orthogonal CA3 inputs.
+# dg_pattern_separation_stats() measures the active fraction as the validation
+# metric, alongside the existing CA3 replay-score check.
+
+@dataclass
+class DGModule:
+    """Dentate gyrus: granule cells, two mossy-cell classes, basket cells.
+
+    Built optionally via --dg, self-contained like ECModule so no existing
+    hippocampal code changes when DG is absent. When present, the caller passes
+    suppress_dg_drive=True to build_replay_network so the Poisson DG proxy on
+    CA3 is replaced by this module's mossy fibres.
+    """
+    GC          : object   # nest.NodeCollection — granule cells
+    MC_LOW      : object   # nest.NodeCollection — low-threshold mossy cells
+    MC_HIGH     : object   # nest.NodeCollection — high-threshold mossy cells
+    BASKET      : object   # nest.NodeCollection — DG basket/HIPP interneurons
+    spk_gc      : object
+    spk_mc_low  : object
+    spk_mc_high : object
+    spk_basket  : object
+    N_gc        : int
+    N_mc_low    : int
+    N_mc_high   : int
+    N_basket    : int
+    K_mf_sup    : int      # mossy-fibre in-degree onto CA3 SUP
+    K_mf_deep   : int      # mossy-fibre in-degree onto CA3 DEEP
+
+
+def build_dg_module(
+    ca3_sup, ca3_deep,
+    N_gc, N_mc_low, N_mc_high, N_basket,
+    # perforant path (EC LII proxy) — heterogeneous Poisson onto GC
+    pp_rate_mean=140.0, pp_rate_sigma=45.0, pp_weight=8.0,
+    # mossy-fibre DG->CA3 detonator weights (LOW in-degree set in TARGET_INDEGREE)
+    w_mf_ca3_sup=6.0, w_mf_ca3_deep=4.0,
+    # intra-DG weights
+    w_gc_basket=1.6, w_basket_gc=-4.5,
+    w_gc_mc=2.0, w_mc_gc=0.6, w_mc_basket=1.4,
+    # background drive to keep mossy cells / interneurons near-threshold
+    rate_bg_mc=200.0, w_bg_mc=1.5,
+    rate_bg_basket=300.0, w_bg_basket=1.5,
+    seed_connect=42,
+) -> DGModule:
+    """Create the DG populations and wire them, incl. mossy fibres onto CA3.
+
+    Weights below reproduce the *net* excitatory drive the suppressed Poisson
+    proxy delivered to CA3 SUP, but through a sparse, spiking, feedback-shaped
+    granule population. The absolute values need confirmation on MN5 (the local
+    environment has no NEST); they are set from the confirmed single-neuron f-I
+    gains and the removed proxy's drive budget, and flagged for tuning.
+    """
+    import nest
+    t0 = time.perf_counter()
+
+    print(f"\n  [DGModule] Building dentate gyrus")
+    print(f"  [DGModule]   N_gc={N_gc:,}  N_mc_low={N_mc_low:,}  "
+          f"N_mc_high={N_mc_high:,}  N_basket={N_basket:,}")
+
+    # ---- Populations (params verbatim from the confirmed calibration) -------
+    gc_params      = dict(a=0.02, b=0.2, c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=0.0)
+    mc_low_params  = dict(a=0.02, b=0.2, c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=0.0)
+    mc_high_params = dict(a=0.02, b=0.2, c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=-15.1)
+    basket_params  = dict(a=0.10, b=0.2, c=-65.0, d=2.0, V_m=-65.0, U_m=-13.0, I_e=0.0)
+
+    _rng = np.random.default_rng(seed_connect + 7)
+
+    GC = nest.Create("izhikevich", N_gc, params=gc_params)
+    # V_m heterogeneity → graded excitability → sparse, ordered recruitment
+    nest.SetStatus(GC, "V_m",
+                   _rng.normal(-65.0, 4.0, N_gc).clip(-75, -55).tolist())
+    MC_LOW  = nest.Create("izhikevich", N_mc_low,  params=mc_low_params)
+    MC_HIGH = nest.Create("izhikevich", N_mc_high, params=mc_high_params)
+    BASKET  = nest.Create("izhikevich", N_basket,  params=basket_params)
+
+    d_fast = 1.5
+
+    # ---- Perforant-path input (EC LII proxy) onto GC ------------------------
+    # Heterogeneous Poisson rates: some granule cells are driven harder than
+    # others, so with strong feedback inhibition only a sparse subset fires.
+    pp_rates = _rng.normal(pp_rate_mean, pp_rate_sigma, N_gc).clip(10.0, None)
+    pp = nest.Create("poisson_generator", N_gc)
+    nest.SetStatus(pp, "rate", pp_rates.tolist())
+    nest.Connect(pp, GC, conn_spec="one_to_one",
+                 syn_spec={"weight": float(pp_weight), "delay": d_fast})
+
+    # ---- Background drive: mossy cells + interneurons near threshold ---------
+    for pop, rate, w in [(MC_LOW, rate_bg_mc, w_bg_mc),
+                          (MC_HIGH, rate_bg_mc, w_bg_mc),
+                          (BASKET, rate_bg_basket, w_bg_basket)]:
+        bg = nest.Create("poisson_generator", len(pop), params={"rate": float(rate)})
+        nest.Connect(bg, pop, conn_spec="one_to_one",
+                     syn_spec={"weight": float(w), "delay": d_fast})
+
+    # ---- Intra-DG feedback loops (fixed_indegree, C++/MPI-parallel) ---------
+    print("  [DGModule] Wiring intra-DG feedback (fixed_indegree)...")
+    MC = MC_LOW + MC_HIGH        # combined mossy-cell NodeCollection for GC/basket wiring
+
+    # GC -> basket (E->I): recruit feedback inhibition
+    fixed_connect(GC, BASKET, K("dg_gc_basket", N_gc), w_gc_basket, d_fast)
+    # basket -> GC (I->E): the sparsifying feedback loop
+    fixed_connect(BASKET, GC, K("dg_basket_gc", N_basket), w_basket_gc, d_fast)
+    # GC -> mossy cells (mossy collaterals in the hilus)
+    fixed_connect(GC, MC_LOW,  K("dg_gc_mc", N_gc), w_gc_mc, d_fast)
+    fixed_connect(GC, MC_HIGH, K("dg_gc_mc", N_gc), w_gc_mc, d_fast)
+    # mossy cells -> GC (associational back-projection, net excitatory but weak)
+    fixed_connect(MC, GC, K("dg_mc_gc", len(MC)), w_mc_gc, d_fast)
+    # mossy cells -> basket (drive feedback inhibition of GC: the MC "gain control")
+    fixed_connect(MC, BASKET, K("dg_mc_basket", len(MC)), w_mc_basket, d_fast)
+
+    # ---- Mossy fibre DG -> CA3 (detonator: low in-degree, high weight) -------
+    print("  [DGModule] Wiring mossy fibres GC->CA3 (detonator)...")
+    t_mf = time.perf_counter()
+    K_mf_sup  = K("dg_mf_ca3_sup",  N_gc)
+    K_mf_deep = K("dg_mf_ca3_deep", N_gc)
+    fixed_connect(GC, ca3_sup,  K_mf_sup,  w_mf_ca3_sup,  d_fast)
+    fixed_connect(GC, ca3_deep, K_mf_deep, w_mf_ca3_deep, d_fast)
+    n_mf = len(ca3_sup) * K_mf_sup + len(ca3_deep) * K_mf_deep
+    print(f"  [DGModule] mossy fibres: ~{n_mf:,} synapses "
+          f"(K_sup={K_mf_sup}, K_deep={K_mf_deep})  "
+          f"in {time.perf_counter()-t_mf:.2f}s")
+
+    # ---- Recorders ----------------------------------------------------------
+    spk_gc      = nest.Create("spike_recorder")
+    spk_mc_low  = nest.Create("spike_recorder")
+    spk_mc_high = nest.Create("spike_recorder")
+    spk_basket  = nest.Create("spike_recorder")
+    nest.Connect(GC,      spk_gc)
+    nest.Connect(MC_LOW,  spk_mc_low)
+    nest.Connect(MC_HIGH, spk_mc_high)
+    nest.Connect(BASKET,  spk_basket)
+
+    print(f"  [DGModule] Total DG build: {time.perf_counter()-t0:.1f}s")
+
+    return DGModule(
+        GC=GC, MC_LOW=MC_LOW, MC_HIGH=MC_HIGH, BASKET=BASKET,
+        spk_gc=spk_gc, spk_mc_low=spk_mc_low, spk_mc_high=spk_mc_high,
+        spk_basket=spk_basket,
+        N_gc=N_gc, N_mc_low=N_mc_low, N_mc_high=N_mc_high, N_basket=N_basket,
+        K_mf_sup=K_mf_sup, K_mf_deep=K_mf_deep,
+    )
+
+
+def dg_pattern_separation_stats(dg_module, sim_ms, window=None):
+    """Sparse-coding / pattern-separation metric for the granule population.
+
+    The DG hallmark is a very low active fraction (~2-4% of granule cells per
+    input pattern; Chawla et al. 2005, Jung & McNaughton 1993). A high active
+    fraction means feedback inhibition is too weak and pattern separation is
+    lost -- the DG-specific analog of a failed replay score.
+
+    Returns a dict: active_fraction, n_active, n_gc, mean_rate_hz,
+    plus a PASS/FLAG verdict against the 2-4% sparse-coding band.
+    """
+    ev = nest.GetStatus(dg_module.spk_gc, "events")[0]
+    t = np.asarray(ev["times"]);  s = np.asarray(ev["senders"])
+    if window is not None:
+        m = (t >= window[0]) & (t <= window[1])
+        t, s = t[m], s[m]
+        dur_s = (window[1] - window[0]) / 1000.0
+    else:
+        dur_s = sim_ms / 1000.0
+    n_active = int(np.unique(s).size)
+    frac = n_active / max(dg_module.N_gc, 1)
+    mean_hz = len(t) / (max(dg_module.N_gc, 1) * max(dur_s, 1e-9))
+    verdict = "PASS" if 0.005 <= frac <= 0.06 else "FLAG"
+    return dict(active_fraction=frac, n_active=n_active, n_gc=dg_module.N_gc,
+                mean_rate_hz=mean_hz, verdict=verdict)
 
 
 # ============================================================================
@@ -1886,7 +2124,8 @@ def plot_bidirectional_replay(net, sim_ms=1000.0, save_prefix="replay"):
 # Console report
 # ============================================================================
 
-def print_report(net, sim_ms, scale_label, ec_module=None, eclv_module=None, mpfc_module=None):
+def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
+                 eclv_module=None, mpfc_module=None):
     print(f"\n{'='*72}")
     print(f"SIMULATION REPORT  [{scale_label}]")
     print(f"{'='*72}")
@@ -1924,6 +2163,36 @@ def print_report(net, sim_ms, scale_label, ec_module=None, eclv_module=None, mpf
         n_s = np.sum((t_sup  >= ws) & (t_sup  <= we))
         n_d = np.sum((t_deep >= ws) & (t_deep <= we))
         print(f"  {label}: SUP={n_s:,}  DEEP={n_d:,}  DEEP/SUP ratio={n_d/max(n_s,1):.2f}")
+
+    if dg_module is not None:
+        print("\n--- Dentate gyrus (Phase 6.2 — input / pattern separation) ---")
+        for label, pop_n, spk in [
+            ("DG GC",      dg_module.N_gc,      dg_module.spk_gc),
+            ("DG MC_LOW",  dg_module.N_mc_low,  dg_module.spk_mc_low),
+            ("DG MC_HIGH", dg_module.N_mc_high, dg_module.spk_mc_high),
+            ("DG BASKET",  dg_module.N_basket,  dg_module.spk_basket),
+        ]:
+            ev   = nest.GetStatus(spk, "events")[0]
+            rate = len(ev["senders"]) / (max(pop_n, 1) * sim_ms / 1000.0)
+            print(f"  {label:20s}: N={pop_n:8,} | {len(ev['times']):10,} spikes | {rate:6.2f} Hz")
+
+        # MC_HIGH should fire less than MC_LOW under equal drive (higher rheobase)
+        r_low  = len(nest.GetStatus(dg_module.spk_mc_low,  "events")[0]["senders"]) / max(dg_module.N_mc_low, 1)
+        r_high = len(nest.GetStatus(dg_module.spk_mc_high, "events")[0]["senders"]) / max(dg_module.N_mc_high, 1)
+        print(f"  MC_LOW/MC_HIGH spikes-per-cell ratio = {r_low/max(r_high,1e-9):.2f} "
+              f"(expect >1: MC_HIGH has the higher rheobase)")
+
+        print("  Pattern separation (granule sparse coding):")
+        overall = dg_pattern_separation_stats(dg_module, sim_ms)
+        print(f"    whole run : active {overall['active_fraction']*100:5.2f}% "
+              f"({overall['n_active']:,}/{overall['n_gc']:,})  "
+              f"mean {overall['mean_rate_hz']:.2f} Hz  [{overall['verdict']}]")
+        for label, win in [("SWR-1 fwd", net["swr_fwd"]), ("SWR-2 rev", net["swr_rev"])]:
+            w = dg_pattern_separation_stats(dg_module, sim_ms, window=win)
+            print(f"    {label:9s} : active {w['active_fraction']*100:5.2f}% "
+                  f"({w['n_active']:,} cells)  [{w['verdict']}]")
+        print("    (DG hallmark: 2-4% active per pattern; FLAG = feedback "
+              "inhibition too weak, needs MN5 tuning of w_basket_gc/pp_weight)")
 
     if ec_module is not None:
         print("\n--- EC LII/III (cortical target) ---")
@@ -2261,6 +2530,13 @@ Cortical module:
   --ec-lii   adds EC LII/III (Phase 1 consolidation target).
              CA1→EC projection uses stdp_synapse.  At 10% scale this
              adds ~10k neurons and ~5M STDP synapses (~0.6 GB RAM).
+
+Dentate gyrus (Phase 6.2):
+  --dg       replaces the Poisson DG proxy with a real granule/mossy/basket
+             circuit driving CA3 via mossy-fibre detonator synapses. Neuron
+             params come from the MN5-confirmed f-I calibration. Granule cells
+             are large (1.2M ref); use --dg-scale to size DG independently of
+             --scale on smaller test runs.
         """,
     )
     parser.add_argument(
@@ -2279,6 +2555,17 @@ Cortical module:
         "--out-hdf5", type=str, default=None, metavar="FILE",
         help="Path for the output HDF5 file. "
              "If omitted, written to replay_output_<N>pct/replay_<N>pct.h5")
+    # ---- Phase 6.2 dentate gyrus flags --------------------------------------
+    parser.add_argument(
+        "--dg", action="store_true",
+        help="Add a real dentate gyrus (Phase 6.2): granule + two mossy-cell "
+             "classes + basket feedback, driving CA3 via mossy-fibre detonator "
+             "synapses. Replaces the Poisson DG proxy on CA3 (suppress_dg_drive). "
+             "Params from the confirmed f-I calibration.")
+    parser.add_argument(
+        "--dg-scale", type=int, default=None, metavar="PCT",
+        help="DG scale as independent percent of the rat DG reference counts "
+             "(1.2M granule cells etc.). Defaults to --scale if omitted.")
     # ---- Phase 1 cortical flag ----------------------------------------------
     parser.add_argument(
         "--ec-lii", action="store_true",
@@ -2380,6 +2667,12 @@ Cortical module:
         n_groups,
     )
 
+    # DG population sizes (Phase 6.2). Scaled by their own pct, rounded like the
+    # cortex so hippocampal maths is untouched when --dg is absent.
+    dg_pct = args.dg_scale if args.dg_scale is not None else args.scale
+    N_dg = {k: _round_to_multiple(v * dg_pct / 100.0, n_groups)
+            for k, v in _REF_DG.items()}
+
     # Total simulation time: either single sim_ms OR n_swr × epoch_ms
     SIM_MS       = args.sim_ms if not args.stc else args.epoch_ms
     n_epochs     = args.n_swr if args.stc else 1
@@ -2392,6 +2685,10 @@ Cortical module:
     print(f"  CA1_PYR  : {cfg['N_ca1_pyr']:>10,}  groups   : {n_groups:>8,}  "
           f"(CA3_SUP/group = {cfg['N_ca3_sup']//n_groups})")
     print(f"  Total N  : {total_N:>10,}")
+    if args.dg:
+        print(f"  DG       : GC={N_dg['N_dg_gc']:>9,}  MC_low={N_dg['N_dg_mc_low']:,}  "
+              f"MC_high={N_dg['N_dg_mc_high']:,}  BSK={N_dg['N_dg_basket']:,}  "
+              f"({dg_pct}% of rat DG)  [--dg]")
     if args.ec_lii:
         print(f"  EC LII   : {N_ec_lii:>10,}  ({ec_lii_pct}% of 100k ref)  "
               f"K={args.ec_lii_k}  [--ec-lii]")
@@ -2421,7 +2718,21 @@ Cortical module:
         N_ca1_olm      = cfg["N_ca1_olm"],
         n_seq_groups   = cfg["n_seq_groups"],
         n_threads      = n_threads,
+        suppress_dg_drive = args.dg,   # real DG mossy fibres replace the proxy
     )
+
+    # ---- Optional Phase 6.2: dentate gyrus -----------------------------------
+    dg_module = None
+    if args.dg:
+        print(">>> Building dentate gyrus module (Phase 6.2)...")
+        dg_module = build_dg_module(
+            ca3_sup   = net["CA3_SUP"],
+            ca3_deep  = net["CA3_DEEP"],
+            N_gc      = N_dg["N_dg_gc"],
+            N_mc_low  = N_dg["N_dg_mc_low"],
+            N_mc_high = N_dg["N_dg_mc_high"],
+            N_basket  = N_dg["N_dg_basket"],
+        )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
     ec_module = None
@@ -2617,7 +2928,7 @@ Cortical module:
         raise SystemExit(0)
 
     print_report(net, SIM_MS, cfg["label"],
-                 ec_module=ec_module,
+                 ec_module=ec_module, dg_module=dg_module,
                  eclv_module=eclv_module, mpfc_module=mpfc_module)
 
     if not args.no_figures:
