@@ -1053,11 +1053,19 @@ def build_dg_module(
     # mossy-fibre DG->CA3 detonator weights (LOW in-degree set in TARGET_INDEGREE)
     w_mf_ca3_sup=6.0, w_mf_ca3_deep=4.0,
     # intra-DG weights
-    w_gc_basket=1.6, w_basket_gc=-4.5,
+    w_gc_basket=2.5, w_basket_gc=-4.5,
     w_gc_mc=2.0, w_mc_gc=0.6, w_mc_basket=1.4,
-    # background drive to keep mossy cells / interneurons near-threshold
-    rate_bg_mc=200.0, w_bg_mc=1.5,
-    rate_bg_basket=300.0, w_bg_basket=1.5,
+    # Background drive to keep mossy cells / interneurons near threshold.
+    # First 1% run (2026-07-24) fired the interneurons and mossy cells at 0 Hz
+    # at rate_bg=200-300 / w=1.5, so DG_BASKET->GC feedback never engaged and
+    # granule cells ran to ~98% active (dense, no pattern separation). These
+    # values are anchored to the PROVEN CA1-basket recipe in this same model
+    # (rate_drive_ca1_basket=820 @ w=2.0 -> 47 Hz). MC gets identical background
+    # to both classes, so MC_HIGH (I_e=-15.1) fires less than MC_LOW under equal
+    # drive -- the confirmed rheobase split. NEEDS a local re-run to confirm the
+    # interneurons now fire and to tune w_basket_gc for the 2-4% target.
+    rate_bg_mc=700.0, w_bg_mc=2.0,
+    rate_bg_basket=820.0, w_bg_basket=2.0,
     seed_connect=42,
 ) -> DGModule:
     """Create the DG populations and wire them, incl. mossy fibres onto CA3.
@@ -2229,7 +2237,7 @@ def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
 def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                      ec_module=None, stc_hook=None,
                      eclv_module=None, mpfc_module=None,
-                     homeo_stats=None):
+                     homeo_stats=None, dg_module=None):
     """
     Save all simulation results to an HDF5 file for offline plotting.
 
@@ -2291,6 +2299,16 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
     if ec_module is not None:
         t_local, s_local = _get_spikes(ec_module.spike_rec)
         spk_cache["ec_lii"] = _gather_spikes(t_local, s_local)
+
+    # Gather DG spikes if the module is present (Phase 6.2)
+    if dg_module is not None:
+        for cache_key, spk_rec in [
+            ("dg_gc",      dg_module.spk_gc),
+            ("dg_mc_low",  dg_module.spk_mc_low),
+            ("dg_mc_high", dg_module.spk_mc_high),
+            ("dg_basket",  dg_module.spk_basket),
+        ]:
+            spk_cache[cache_key] = _gather_spikes(*_get_spikes(spk_rec))
     # Phase 3 spike gathering handled inline (modules may be None)
 
     # Only rank 0 writes the file — all other ranks are done here.
@@ -2381,6 +2399,36 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                 g_pfc.create_dataset("rate",
                     data=(counts_pfc/(bin_ms/1e3)/max(mpfc_module.N,1)).astype(np.float32))
                 h5.attrs["mpfc_present"] = True
+
+        # --- Dentate gyrus groups (optional, Phase 6.2) ----------------------
+        h5.attrs["dg_present"] = dg_module is not None
+        if dg_module is not None:
+            dg_pops = [
+                ("dg_gc",      dg_module.N_gc),
+                ("dg_mc_low",  dg_module.N_mc_low),
+                ("dg_mc_high", dg_module.N_mc_high),
+                ("dg_basket",  dg_module.N_basket),
+            ]
+            for cache_key, n_cells in dg_pops:
+                t_spk, s_spk = spk_cache[cache_key]
+                g_dg = h5.create_group(cache_key)
+                g_dg.attrs["n_cells"] = int(n_cells)
+                g_dg.create_dataset("spk_times",   data=t_spk.astype(np.float32), **compress)
+                g_dg.create_dataset("spk_senders", data=s_spk.astype(np.int32),   **compress)
+                counts, _ = np.histogram(t_spk, bins=edges)
+                g_dg.create_dataset("rate",
+                    data=(counts/(bin_ms/1e3)/max(n_cells,1)).astype(np.float32))
+            # Pattern-separation summary — the DG validation metric, so it can
+            # be read offline without re-deriving it from the granule rasters.
+            h5["dg_gc"].attrs["K_mf_ca3_sup"]  = dg_module.K_mf_sup
+            h5["dg_gc"].attrs["K_mf_ca3_deep"] = dg_module.K_mf_deep
+            overall = dg_pattern_separation_stats(dg_module, sim_ms)
+            h5["dg_gc"].attrs["active_fraction"] = overall["active_fraction"]
+            h5["dg_gc"].attrs["n_active"]        = overall["n_active"]
+            h5["dg_gc"].attrs["sparse_verdict"]  = overall["verdict"]
+            for name, win in [("fwd", net["swr_fwd"]), ("rev", net["swr_rev"])]:
+                w = dg_pattern_separation_stats(dg_module, sim_ms, window=win)
+                h5["dg_gc"].attrs[f"active_fraction_{name}"] = w["active_fraction"]
 
         # --- sequence group membership (CA3 SUP + DEEP) ----------------------
         sup_groups  = net["ca3_sup_groups"]
@@ -2921,7 +2969,7 @@ Dentate gyrus (Phase 6.2):
     save_replay_hdf5(net, total_sim_ms, cfg["label"], hdf5_path,
                      ec_module=ec_module, stc_hook=stc_hook,
                      eclv_module=eclv_module, mpfc_module=mpfc_module,
-                     homeo_stats=homeo_stats)
+                     homeo_stats=homeo_stats, dg_module=dg_module)
 
     if rank != 0:
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
