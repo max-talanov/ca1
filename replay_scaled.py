@@ -576,6 +576,10 @@ def build_replay_network(
     # d_seq: separate delay for the sequence chain (MUST exceed scaffold_step
     # ≈2.9 ms so scaffold beats the cascade to each group).
     w_seq_fwd=0.60,  w_seq_bwd=0.50,  w_sup_local=0.90,
+    # CA3 INT->SUP feedback-inhibition weight. Exposed (was hardcoded -2.0) so
+    # the pattern-completion probe can rebalance E/I for its isolated build
+    # without touching replay runs, which keep the -2.0 default.
+    w_ca3_ie_sup=-2.0,
     w_sup_to_deep=1.30, w_deep_local=0.85, w_deep_fwd=0.70, w_deep_to_sup=0.20,
     # Schaffer collateral weights (mV per synapse)
     # Bio: single Schaffer EPSP ~0.1-0.3 mV (Andersen 2007).
@@ -835,7 +839,7 @@ def build_replay_network(
 
     fixed_connect(CA3_SUP,      CA3_INT_SUP,  K("ca3_EI_sup",   N_ca3_sup),      0.5,  d_fast)
     fixed_connect(CA3_DEEP,     CA3_INT_DEEP, K("ca3_EI_deep",  N_ca3_deep),     0.5,  d_fast)
-    fixed_connect(CA3_INT_SUP,  CA3_SUP,      K("ca3_IE_sup",   N_ca3_int_sup),  -2.0, d_fast)
+    fixed_connect(CA3_INT_SUP,  CA3_SUP,      K("ca3_IE_sup",   N_ca3_int_sup),  w_ca3_ie_sup, d_fast)
     fixed_connect(CA3_INT_DEEP, CA3_DEEP,     K("ca3_IE_deep",  N_ca3_int_deep), -2.0, d_fast)
     fixed_connect(CA3_INT_SUP,  CA3_DEEP,     K("ca3_IE_cross", N_ca3_int_sup),  -0.2, d_fast)
     fixed_connect(CA3_INT_DEEP, CA3_SUP,      K("ca3_IE_cross", N_ca3_int_deep), -0.2, d_fast)
@@ -1262,7 +1266,10 @@ def completion_index(spk_times, spk_senders, cued, uncued, win_start, win_stop):
     """
     m = (spk_times >= win_start) & (spk_times <= win_stop)
     fired = np.unique(spk_senders[m])
-    comp = np.intersect1d(uncued, fired).size / max(uncued.size, 1)
+    # NaN (not 0) when the cue is the whole assembly: there is nothing to
+    # complete, so completion is undefined rather than failed.
+    comp = (np.intersect1d(uncued, fired).size / uncued.size
+            if uncued.size else float("nan"))
     rec  = np.intersect1d(cued,   fired).size / max(cued.size, 1)
     return dict(completion=comp, cue_recall=rec,
                 n_uncued=int(uncued.size), n_cued=int(cued.size),
@@ -1272,25 +1279,40 @@ def completion_index(spk_times, spk_senders, cued, uncued, win_start, win_stop):
 def run_pattern_completion(cfg, n_threads, cue_fracs,
                            ablate=False, cue_rate=2600.0, cue_weight=2.5,
                            cue_dur_ms=16.0, win_ms=60.0, gap_ms=150.0,
+                           prime_rate=250.0, w_sup_local=3.0, w_ca3_ie_sup=-0.5,
                            seed=42):
     """Auto-association probe: partial cue -> recurrent completion of a group.
 
     Builds a CA3 with the between-group sequence chain OFF (so no replay
-    propagation contaminates the measurement) and external excitatory drive to
-    CA3 OFF (so any un-cued firing is completion-driven, not baseline). Only the
-    within-group recurrence (sup_local) can restore the pattern. Interneuron
-    drive is also external-off, leaving feedback (E->I) inhibition responsive
-    rather than tonic. `ablate=True` zeroes sup_local -- the control in which
-    completion should vanish while cue_recall stays ~1.
+    propagation contaminates the measurement). Only the within-group recurrence
+    (sup_local) can restore the pattern. `ablate=True` zeroes sup_local -- the
+    control in which completion should vanish while cue_recall stays ~1.
+
+    Priming
+    -------
+    The first (cold-baseline) version returned 0 completion everywhere: from
+    rest, cued cells recruited CA3's fast feedback inhibition (E->I->E ~3 ms)
+    before the slower within-group recurrence (sup_local at the 4 ms sequence
+    delay) could ignite the un-cued cells. Biologically, completion happens
+    during a sharp-wave, when CA3 is broadly depolarised. `prime_rate` gives
+    CA3 SUP a subthreshold background so cells sit near threshold (low baseline
+    firing) and cue-driven recurrence can tip them over. The pre-cue baseline
+    window is measured over an equal-length slice and subtracted, so priming
+    cannot manufacture a false completion signal -- if priming alone fired the
+    un-cued cells, baseline would rise by the same amount.
 
     Each cue fraction is delivered to a DISTINCT group at a DISTINCT time
-    (spaced by gap_ms > win_ms + inhibition decay) so all fractions are swept
-    in one build. A pre-cue baseline window is measured to confirm the quiet
-    baseline. Returns a list of per-fraction result dicts.
+    (spaced by gap_ms) so all fractions are swept in one build.
     """
-    default_w_sup_local = 0.90   # matches build_replay_network default
+    # Auto-association needs the within-group recurrence to be able to win
+    # locally against feedback inhibition -- the replay-tuned default
+    # (w_sup_local 0.90 vs INT->SUP -2.0) cannot, so the probe strengthens the
+    # recurrence and weakens the inhibition. These apply ONLY to this isolated
+    # probe build; replay runs keep the -2.0 / 0.90 defaults.
     print(f"\n  [PatternCompletion] build: ablate={ablate}  "
-          f"cue_fracs={cue_fracs}  cue(rate={cue_rate},w={cue_weight})")
+          f"cue_fracs={cue_fracs}  cue(rate={cue_rate},w={cue_weight})  "
+          f"prime_rate={prime_rate}  w_sup_local={0.0 if ablate else w_sup_local}  "
+          f"w_ca3_ie_sup={w_ca3_ie_sup}")
 
     net = build_replay_network(
         N_ca3_sup      = cfg["N_ca3_sup"],
@@ -1305,11 +1327,14 @@ def run_pattern_completion(cfg, n_threads, cue_fracs,
         # isolate auto-association: no sequence chain, no replay stimulation
         trigger_on=False, scaffold_on=False, theta_on=False,
         w_seq_fwd=0.0, w_seq_bwd=0.0, w_deep_fwd=0.0,
-        w_sup_local=(0.0 if ablate else default_w_sup_local),
-        # silence external drive so baseline CA3 ~0; cue is the only excitation
+        w_sup_local=(0.0 if ablate else w_sup_local),
+        w_ca3_ie_sup=w_ca3_ie_sup,
+        # sharp-wave-like priming: CA3 SUP near threshold, low baseline firing,
+        # so cue-driven recurrence can complete. Other external drive off; INT
+        # drive off leaves feedback inhibition responsive rather than tonic.
         suppress_dg_drive=True,
         rate_ec_ca3_sup=0.0, rate_ec_ca3_deep=0.0,
-        rate_ca3_drive_sup=0.0, rate_ca3_drive_deep=0.0,
+        rate_ca3_drive_sup=prime_rate, rate_ca3_drive_deep=0.0,
         rate_drive_ca3_int_sup=0.0, rate_drive_ca3_int_deep=0.0,
     )
 
@@ -1342,7 +1367,9 @@ def run_pattern_completion(cfg, n_threads, cue_fracs,
     results = []
     for frac, gidx, tc, cued, uncued in cues:
         ci   = completion_index(t_sup, s_sup, cued, uncued, tc, tc + win_ms)
-        base = completion_index(t_sup, s_sup, cued, uncued, 0.0, t0)  # quiet baseline
+        # baseline over an EQUAL-length quiet slice just before the first cue,
+        # so completion-above-baseline is a fair comparison
+        base = completion_index(t_sup, s_sup, cued, uncued, t0 - win_ms, t0)
         results.append(dict(cue_frac=float(frac), group=gidx, t_cue=tc,
                             completion=ci["completion"],
                             completion_baseline=base["completion"],
@@ -1360,9 +1387,16 @@ def print_pattern_completion(intact, ablated):
     print(f"  {'':>6s} {'':>4s} | {'compl':>7s} {'recall':>7s} base | {'compl':>7s} {'recall':>7s}")
     abl = {r["group"]: r for r in ablated} if ablated else {}
     passes = 0
+    n_valid = 0
     for r in intact:
         a = abl.get(r["group"], {})
         ci, ai = r["completion"], a.get("completion", float("nan"))
+        if np.isnan(ci):                       # full-cue row: nothing to complete
+            print(f"  {r['cue_frac']*100:5.0f}% {r['group']:>4d} | "
+                  f"{'   n/a':>7s} {r['cue_recall']:7.2f} {'  - ':>4s} | "
+                  f"{'   n/a':>7s} {a.get('cue_recall', float('nan')):7.2f}")
+            continue
+        n_valid += 1
         # auto-association signature: substantial completion intact, near-zero ablated
         good = (ci - r["completion_baseline"] > 0.3) and (np.isnan(ai) or ci - ai > 0.3)
         passes += int(good)
@@ -1371,7 +1405,7 @@ def print_pattern_completion(intact, ablated):
               f"{ci:7.2f} {r['cue_recall']:7.2f} {r['completion_baseline']:4.2f} | "
               f"{ai:7.2f} {a.get('cue_recall', float('nan')):7.2f}{mark}")
     if ablated:
-        print(f"\n  Auto-association confirmed for {passes}/{len(intact)} cue levels "
+        print(f"\n  Auto-association confirmed for {passes}/{n_valid} testable cue levels "
               f"(intact completion >> baseline AND >> ablated).")
         print("  A sharp rise in the intact column as cue% grows, with the ablated")
         print("  column flat near 0, is the recurrent-completion signature (Marr 1971).")
