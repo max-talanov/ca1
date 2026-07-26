@@ -1049,13 +1049,15 @@ def build_dg_module(
     ca3_sup, ca3_deep,
     N_gc, N_mc_low, N_mc_high, N_basket,
     # Perforant path (EC LII proxy) — heterogeneous Poisson onto GC.
-    # 2nd 1% run (2026-07-26): at pp_weight=8.0 a granule cell detonates on
-    # 2-3 inputs, so ~97% fired regardless of the (now-active) basket feedback
-    # -- no winner-take-all, no pattern separation, and the resulting flood of
-    # mossy-fibre input into CA3 degraded forward replay (rho 0.89 -> 0.35).
-    # Lower weight + wider rate spread puts most granule cells sub-threshold so
-    # only the most-driven few win; the sharper feedback below prunes the rest.
-    pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=3.0,
+    # Bracketing the granule sparse-coding target across three 1% runs:
+    #   pp_weight 8.0 -> 97% active per window (dense; drowned CA3 replay)
+    #   pp_weight 3.0 -> 0.1% active per window (too sparse; CA3_SUP 2.9 Hz)
+    # Both bidirectional replay directions PASSED at 3.0 (rho_fwd +0.855,
+    # rho_rev -0.782), so the regime is right -- but 0.1%/window is below the
+    # 2-4% DG target and CA3 is under-driven. pp_weight 4.0 steps back up toward
+    # 2-4% and should lift CA3_SUP back toward ~5 Hz. The relationship is steep,
+    # so expect to bracket once more.
+    pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=4.0,
     # mossy-fibre DG->CA3 detonator weights (LOW in-degree set in TARGET_INDEGREE)
     # NOTE: once granule cells go sparse, far fewer mossy fibres are active, so
     # CA3 may lose drive. If CA3_SUP drops below ~4 Hz after this change, raise
