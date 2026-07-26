@@ -537,6 +537,10 @@ def build_replay_network(
     # Previous default of 8 ms gave 35×8=280 ms >> 120 ms → groups 15-34
     # never received scaffold, making the second half of each replay fail.
     scaffold_on=True, scaffold_step_ms=None,
+    # trigger_on gates the two SWR replay triggers on group0/group[-1]. The
+    # pattern-completion protocol turns them off (and the scaffold) so a partial
+    # cue is the only stimulus, isolating recurrent completion from driven replay.
+    trigger_on=True,
     # d_seq: axonal delay for the SEQUENCE CHAIN only (ms).
     # Must be > scaffold_step (≈2.9ms) to ensure the scaffold fires each
     # group BEFORE the recurrent cascade from the previous group arrives.
@@ -873,12 +877,13 @@ def build_replay_network(
     print(f"    scaffold_step_ms={scaffold_step_ms:.1f}  "
           f"(total span = {scaffold_step_ms * n_seq_groups:.1f} ms, "
           f"SWR window = {swr_fwd_stop - swr_fwd_start:.0f} ms)")
-    make_replay_trigger(ca3_sup_groups[0],  swr_fwd_start,
-                        trigger_dur_ms=trigger_dur_ms,
-                        trigger_rate=trigger_rate, weight=trigger_weight)
-    make_replay_trigger(ca3_sup_groups[-1], swr_rev_start,
-                        trigger_dur_ms=trigger_dur_ms,
-                        trigger_rate=trigger_rate, weight=trigger_weight)
+    if trigger_on:
+        make_replay_trigger(ca3_sup_groups[0],  swr_fwd_start,
+                            trigger_dur_ms=trigger_dur_ms,
+                            trigger_rate=trigger_rate, weight=trigger_weight)
+        make_replay_trigger(ca3_sup_groups[-1], swr_rev_start,
+                            trigger_dur_ms=trigger_dur_ms,
+                            trigger_rate=trigger_rate, weight=trigger_weight)
     if scaffold_on:
         make_staggered_replay_drive(
             ca3_sup_groups, swr_fwd_start, direction="forward",
@@ -1204,6 +1209,173 @@ def dg_pattern_separation_stats(dg_module, sim_ms, window=None):
     verdict = "PASS" if 0.005 <= frac <= 0.06 else "FLAG"
     return dict(active_fraction=frac, n_active=n_active, n_gc=dg_module.N_gc,
                 mean_rate_hz=mean_hz, verdict=verdict)
+
+
+# ============================================================================
+# CA3 pattern completion  (auto-association probe)
+# ============================================================================
+#
+# Pattern separation (DG, above) and pattern completion (CA3) are the classic
+# complementary pair. Completion is CA3's auto-associative hallmark: a PARTIAL
+# cue of a stored assembly is restored to the full pattern by the recurrent
+# collaterals. The sequence-replay experiment never tests this -- its triggers
+# activate a whole group. This probe cues only a fraction of one group and
+# measures how much of the REST the recurrent loop reactivates.
+#
+# Clean isolation: the probe runs on a network built with the between-group
+# sequence chain OFF (w_seq_fwd = w_seq_bwd = 0) so no hetero-associative
+# propagation contaminates the measurement -- only the within-group recurrence
+# (sup_local, the auto-associative loop) can complete the pattern. The control
+# ablates that loop (w_sup_local = 0); completion should then collapse, proving
+# the recurrent collaterals -- not the cue -- did the work (Marr 1971;
+# Nakazawa et al. 2002, CA3-NMDA knockout abolishes completion).
+
+def make_partial_cue(group_cells, cue_frac, start_ms, dur_ms,
+                     rate, weight, rng, delay=1.0):
+    """Drive only a random `cue_frac` subset of one group's cells.
+
+    Returns (cued_ids, uncued_ids) as int arrays so the completion measurement
+    can separate the cue from the cells the recurrent loop must recover.
+    """
+    cells   = np.asarray([int(i) for i in group_cells], dtype=np.int64)
+    n_cue   = max(1, int(round(cue_frac * len(cells))))
+    cued    = np.sort(rng.choice(cells, size=n_cue, replace=False))
+    uncued  = np.setdiff1d(cells, cued)
+    gens = nest.Create("poisson_generator", len(cued), params={
+        "rate": float(rate), "start": float(start_ms),
+        "stop":  float(start_ms + dur_ms),
+    })
+    nest.Connect(gens, nest.NodeCollection([int(i) for i in cued]),
+                 conn_spec="one_to_one",
+                 syn_spec={"weight": float(weight), "delay": float(delay)})
+    return cued, uncued
+
+
+def completion_index(spk_times, spk_senders, cued, uncued, win_start, win_stop):
+    """Fraction of un-cued assembly cells reactivated within the window.
+
+    completion = |uncued cells that fired| / |uncued cells|
+    cue_recall = |cued cells that fired|  / |cued cells|   (sanity: ~1.0)
+
+    A high completion with a small cue is auto-association; near-zero
+    completion (with cue_recall still ~1) is the ablated / no-recurrence case.
+    """
+    m = (spk_times >= win_start) & (spk_times <= win_stop)
+    fired = np.unique(spk_senders[m])
+    comp = np.intersect1d(uncued, fired).size / max(uncued.size, 1)
+    rec  = np.intersect1d(cued,   fired).size / max(cued.size, 1)
+    return dict(completion=comp, cue_recall=rec,
+                n_uncued=int(uncued.size), n_cued=int(cued.size),
+                n_uncued_fired=int(np.intersect1d(uncued, fired).size))
+
+
+def run_pattern_completion(cfg, n_threads, cue_fracs,
+                           ablate=False, cue_rate=2600.0, cue_weight=2.5,
+                           cue_dur_ms=16.0, win_ms=60.0, gap_ms=150.0,
+                           seed=42):
+    """Auto-association probe: partial cue -> recurrent completion of a group.
+
+    Builds a CA3 with the between-group sequence chain OFF (so no replay
+    propagation contaminates the measurement) and external excitatory drive to
+    CA3 OFF (so any un-cued firing is completion-driven, not baseline). Only the
+    within-group recurrence (sup_local) can restore the pattern. Interneuron
+    drive is also external-off, leaving feedback (E->I) inhibition responsive
+    rather than tonic. `ablate=True` zeroes sup_local -- the control in which
+    completion should vanish while cue_recall stays ~1.
+
+    Each cue fraction is delivered to a DISTINCT group at a DISTINCT time
+    (spaced by gap_ms > win_ms + inhibition decay) so all fractions are swept
+    in one build. A pre-cue baseline window is measured to confirm the quiet
+    baseline. Returns a list of per-fraction result dicts.
+    """
+    default_w_sup_local = 0.90   # matches build_replay_network default
+    print(f"\n  [PatternCompletion] build: ablate={ablate}  "
+          f"cue_fracs={cue_fracs}  cue(rate={cue_rate},w={cue_weight})")
+
+    net = build_replay_network(
+        N_ca3_sup      = cfg["N_ca3_sup"],
+        N_ca3_deep     = cfg["N_ca3_deep"],
+        N_ca3_int_sup  = cfg["N_ca3_int_sup"],
+        N_ca3_int_deep = cfg["N_ca3_int_deep"],
+        N_ca1_pyr      = cfg["N_ca1_pyr"],
+        N_ca1_basket   = cfg["N_ca1_basket"],
+        N_ca1_olm      = cfg["N_ca1_olm"],
+        n_seq_groups   = cfg["n_seq_groups"],
+        n_threads      = n_threads,
+        # isolate auto-association: no sequence chain, no replay stimulation
+        trigger_on=False, scaffold_on=False, theta_on=False,
+        w_seq_fwd=0.0, w_seq_bwd=0.0, w_deep_fwd=0.0,
+        w_sup_local=(0.0 if ablate else default_w_sup_local),
+        # silence external drive so baseline CA3 ~0; cue is the only excitation
+        suppress_dg_drive=True,
+        rate_ec_ca3_sup=0.0, rate_ec_ca3_deep=0.0,
+        rate_ca3_drive_sup=0.0, rate_ca3_drive_deep=0.0,
+        rate_drive_ca3_int_sup=0.0, rate_drive_ca3_int_deep=0.0,
+    )
+
+    rng    = np.random.default_rng(seed)
+    groups = net["ca3_sup_groups"]
+    n_grp  = len(groups)
+    if len(cue_fracs) > n_grp:
+        raise ValueError(f"{len(cue_fracs)} cue fractions but only {n_grp} groups; "
+                         f"use --scale with more groups or fewer fractions.")
+
+    # Assign each fraction to its own group, spread across the middle of the
+    # sequence (avoid the endpoint groups 0 and n-1, which are smaller targets
+    # for replay elsewhere and keep the probe comparable across scales).
+    grp_choices = np.linspace(1, n_grp - 2, num=len(cue_fracs)).round().astype(int)
+    t0 = 100.0   # baseline window is [0, t0]
+    cues = []
+    t = t0
+    for frac, gidx in zip(cue_fracs, grp_choices):
+        cued, uncued = make_partial_cue(groups[int(gidx)], frac, t, cue_dur_ms,
+                                        cue_rate, cue_weight, rng)
+        cues.append((frac, int(gidx), t, cued, uncued))
+        t += gap_ms
+    total_ms = t + gap_ms
+
+    print(f"  [PatternCompletion] simulating {total_ms:.0f} ms "
+          f"({len(cues)} cues, gap={gap_ms:.0f} ms)...")
+    nest.Simulate(total_ms)
+
+    t_sup, s_sup = _get_spikes(net["spk_ca3_sup"])
+    results = []
+    for frac, gidx, tc, cued, uncued in cues:
+        ci   = completion_index(t_sup, s_sup, cued, uncued, tc, tc + win_ms)
+        base = completion_index(t_sup, s_sup, cued, uncued, 0.0, t0)  # quiet baseline
+        results.append(dict(cue_frac=float(frac), group=gidx, t_cue=tc,
+                            completion=ci["completion"],
+                            completion_baseline=base["completion"],
+                            cue_recall=ci["cue_recall"],
+                            n_cued=ci["n_cued"], n_uncued=ci["n_uncued"],
+                            n_uncued_fired=ci["n_uncued_fired"]))
+    return results
+
+
+def print_pattern_completion(intact, ablated):
+    print(f"\n{'='*72}")
+    print("CA3 PATTERN COMPLETION  (auto-association: partial cue -> full pattern)")
+    print(f"{'='*72}")
+    print(f"  {'cue%':>6s} {'grp':>4s} | {'intact':>18s} | {'ablated (sup_local=0)':>22s}")
+    print(f"  {'':>6s} {'':>4s} | {'compl':>7s} {'recall':>7s} base | {'compl':>7s} {'recall':>7s}")
+    abl = {r["group"]: r for r in ablated} if ablated else {}
+    passes = 0
+    for r in intact:
+        a = abl.get(r["group"], {})
+        ci, ai = r["completion"], a.get("completion", float("nan"))
+        # auto-association signature: substantial completion intact, near-zero ablated
+        good = (ci - r["completion_baseline"] > 0.3) and (np.isnan(ai) or ci - ai > 0.3)
+        passes += int(good)
+        mark = "  <-" if good else ""
+        print(f"  {r['cue_frac']*100:5.0f}% {r['group']:>4d} | "
+              f"{ci:7.2f} {r['cue_recall']:7.2f} {r['completion_baseline']:4.2f} | "
+              f"{ai:7.2f} {a.get('cue_recall', float('nan')):7.2f}{mark}")
+    if ablated:
+        print(f"\n  Auto-association confirmed for {passes}/{len(intact)} cue levels "
+              f"(intact completion >> baseline AND >> ablated).")
+        print("  A sharp rise in the intact column as cue% grows, with the ablated")
+        print("  column flat near 0, is the recurrent-completion signature (Marr 1971).")
+    print(f"{'='*72}")
 
 
 # ============================================================================
@@ -2628,6 +2800,20 @@ Dentate gyrus (Phase 6.2):
         "--dg-scale", type=int, default=None, metavar="PCT",
         help="DG scale as independent percent of the rat DG reference counts "
              "(1.2M granule cells etc.). Defaults to --scale if omitted.")
+    # ---- CA3 pattern-completion probe ---------------------------------------
+    parser.add_argument(
+        "--pattern-completion", action="store_true",
+        help="Run the CA3 auto-association probe INSTEAD of the replay sim: cue "
+             "a fraction of one assembly and measure how much of the rest the "
+             "recurrent collaterals restore, intact vs sup_local-ablated control. "
+             "Ignores STC/homeostasis/cortical flags.")
+    parser.add_argument(
+        "--pc-cue-fracs", type=str, default="0.1,0.2,0.3,0.5,0.7,1.0", metavar="F1,F2,...",
+        help="Comma-separated cue fractions to sweep (default: 0.1..1.0). Each is "
+             "cued on a distinct group; needs n_seq_groups >= count+2.")
+    parser.add_argument(
+        "--pc-cue-weight", type=float, default=2.5, metavar="W",
+        help="Synaptic weight of the partial cue (default: 2.5).")
     # ---- Phase 1 cortical flag ----------------------------------------------
     parser.add_argument(
         "--ec-lii", action="store_true",
@@ -2722,6 +2908,49 @@ Dentate gyrus (Phase 6.2):
 
     total_N  = sum(cfg[k] for k in _REF_100PCT)
     n_groups = cfg["n_seq_groups"]
+
+    # ---- CA3 pattern-completion probe (self-contained; exits after) ---------
+    if args.pattern_completion:
+        try:
+            cue_fracs = [float(x) for x in args.pc_cue_fracs.split(",") if x.strip()]
+        except ValueError:
+            parser.error(f"--pc-cue-fracs must be comma-separated floats, "
+                         f"got '{args.pc_cue_fracs}'")
+        if len(cue_fracs) + 2 > n_groups:
+            parser.error(f"--pattern-completion needs n_seq_groups >= "
+                         f"{len(cue_fracs)+2} for {len(cue_fracs)} cue fractions "
+                         f"(scale {args.scale} gives {n_groups}); raise --scale "
+                         f"or pass fewer --pc-cue-fracs.")
+        print(f"\n{'='*72}")
+        print(f"  CA3 PATTERN COMPLETION probe  [{cfg['label']}]  "
+              f"cue_fracs={cue_fracs}  cue_weight={args.pc_cue_weight}")
+        print(f"{'='*72}")
+        print(">>> Intact network (sup_local recurrence ON)...")
+        intact = run_pattern_completion(cfg, n_threads, cue_fracs,
+                                        ablate=False, cue_weight=args.pc_cue_weight)
+        print(">>> Ablated control (sup_local = 0)...")
+        ablated = run_pattern_completion(cfg, n_threads, cue_fracs,
+                                         ablate=True, cue_weight=args.pc_cue_weight)
+        print_pattern_completion(intact, ablated)
+
+        if _HDF5_AVAILABLE and _mpi_rank() == 0:
+            import h5py, datetime
+            out_dir = f"replay_output_{args.scale}pct"
+            os.makedirs(out_dir, exist_ok=True)
+            pc_path = args.out_hdf5 or os.path.join(out_dir, "pattern_completion.h5")
+            with h5py.File(pc_path, "w") as h5:
+                h5.attrs["created_utc"] = datetime.datetime.utcnow().isoformat()
+                h5.attrs["scale"]       = cfg["label"]
+                h5.attrs["cue_weight"]  = args.pc_cue_weight
+                for name, res in [("intact", intact), ("ablated", ablated)]:
+                    g = h5.create_group(name)
+                    g.create_dataset("cue_frac",   data=np.array([r["cue_frac"] for r in res], dtype=np.float32))
+                    g.create_dataset("completion", data=np.array([r["completion"] for r in res], dtype=np.float32))
+                    g.create_dataset("completion_baseline", data=np.array([r["completion_baseline"] for r in res], dtype=np.float32))
+                    g.create_dataset("cue_recall", data=np.array([r["cue_recall"] for r in res], dtype=np.float32))
+                    g.create_dataset("group",      data=np.array([r["group"] for r in res], dtype=np.int32))
+            print(f"\n>>> Saved pattern-completion data -> {pc_path}")
+        sys.exit(0)
 
     ec_lii_pct = args.ec_lii_scale if args.ec_lii_scale is not None else args.scale
     N_ec_lii   = _round_to_multiple(
