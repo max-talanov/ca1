@@ -2237,7 +2237,7 @@ def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
 def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                      ec_module=None, stc_hook=None,
                      eclv_module=None, mpfc_module=None,
-                     homeo_stats=None, dg_module=None):
+                     homeo_stats=None, homeo_results=None, dg_module=None):
     """
     Save all simulation results to an HDF5 file for offline plotting.
 
@@ -2519,6 +2519,8 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
         # /homeostasis/alpha_050/, /homeostasis/alpha_075/, etc.
         # If single alpha, also flatten into /homeostasis/ root attrs for
         # backward compatibility with existing analysis scripts.
+        if homeo_results is None:
+            homeo_results = {}
         if homeo_results:
             hg = h5.create_group("homeostasis")
             hg.attrs["description"] = (
@@ -2969,7 +2971,8 @@ Dentate gyrus (Phase 6.2):
     save_replay_hdf5(net, total_sim_ms, cfg["label"], hdf5_path,
                      ec_module=ec_module, stc_hook=stc_hook,
                      eclv_module=eclv_module, mpfc_module=mpfc_module,
-                     homeo_stats=homeo_stats, dg_module=dg_module)
+                     homeo_stats=homeo_stats, homeo_results=homeo_results,
+                     dg_module=dg_module)
 
     if rank != 0:
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
