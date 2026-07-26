@@ -1048,12 +1048,22 @@ class DGModule:
 def build_dg_module(
     ca3_sup, ca3_deep,
     N_gc, N_mc_low, N_mc_high, N_basket,
-    # perforant path (EC LII proxy) — heterogeneous Poisson onto GC
-    pp_rate_mean=140.0, pp_rate_sigma=45.0, pp_weight=8.0,
+    # Perforant path (EC LII proxy) — heterogeneous Poisson onto GC.
+    # 2nd 1% run (2026-07-26): at pp_weight=8.0 a granule cell detonates on
+    # 2-3 inputs, so ~97% fired regardless of the (now-active) basket feedback
+    # -- no winner-take-all, no pattern separation, and the resulting flood of
+    # mossy-fibre input into CA3 degraded forward replay (rho 0.89 -> 0.35).
+    # Lower weight + wider rate spread puts most granule cells sub-threshold so
+    # only the most-driven few win; the sharper feedback below prunes the rest.
+    pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=3.0,
     # mossy-fibre DG->CA3 detonator weights (LOW in-degree set in TARGET_INDEGREE)
+    # NOTE: once granule cells go sparse, far fewer mossy fibres are active, so
+    # CA3 may lose drive. If CA3_SUP drops below ~4 Hz after this change, raise
+    # w_mf_ca3_sup (the detonator is meant to be powerful per-spike).
     w_mf_ca3_sup=6.0, w_mf_ca3_deep=4.0,
-    # intra-DG weights
-    w_gc_basket=2.5, w_basket_gc=-4.5,
+    # intra-DG weights. w_basket_gc strengthened -4.5 -> -7.0 for a sharper
+    # k-winners-take-all cutoff.
+    w_gc_basket=2.5, w_basket_gc=-7.0,
     w_gc_mc=2.0, w_mc_gc=0.6, w_mc_basket=1.4,
     # Background drive to keep mossy cells / interneurons near threshold.
     # First 1% run (2026-07-24) fired the interneurons and mossy cells at 0 Hz
