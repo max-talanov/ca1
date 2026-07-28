@@ -23,8 +23,20 @@
 # Phase 4 alpha-sweep (3 alphas in one job, ~5h vs ~15h for 3 separate jobs)
 #  sbatch --export=ALL,SCALE=25,N_SWR=14,PRP_THRESHOLD=3.5,HOMEOSTASIS=1,ALPHA_SWEEP=0.50,0.75,0.90 run.sh
 
+# ---- Phase 6.2 validation at 12% (three new capabilities) -------------------
+# JOB A — bidirectional replay + DG pattern separation, no consolidation stack
+#   (isolates the two so-far-1%-only results at scale; fastest, cleanest read)
+#  sbatch --export=ALL,SCALE=12,DG=1,NO_STC=1,EC_LII=0,EC_LV=0,MPFC=0 run.sh
+#
+# JOB B — CA3 pattern completion probe (separate run mode; ignores STC/cortex)
+#  sbatch --export=ALL,SCALE=12,PATTERN_COMPLETION=1 run.sh
+#
+# JOB C — full integrated stack WITH the real DG (run only after A+B look good)
+#  sbatch --export=ALL,SCALE=12,DG=1,N_SWR=14 run.sh
+
 
 SCALE=${SCALE:-25}
+EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)
 EC_LII_K=${EC_LII_K:-50}
 N_SWR=${N_SWR:-14}
 EPOCH_MS=${EPOCH_MS:-1000}
@@ -35,6 +47,12 @@ NO_STC=${NO_STC:-0}     # 1=skip STC hook (useful for Phase 3-only runs)
 HOMEOSTASIS=${HOMEOSTASIS:-0}  # 1=enable Phase 4 synaptic homeostasis
 HOMEO_ALPHA=${HOMEO_ALPHA:-0.75}  # downscaling factor (default 0.75)
 ALPHA_SWEEP=${ALPHA_SWEEP:-}      # comma-sep list, e.g. "0.50,0.75,0.90"; overrides HOMEO_ALPHA
+# ---- Phase 6.2 dentate gyrus + pattern completion ---------------------------
+DG=${DG:-0}                    # 1=add the real DG (Phase 6.2), replaces Poisson proxy
+DG_SCALE=${DG_SCALE:-$SCALE}   # DG scale %; defaults to SCALE
+PATTERN_COMPLETION=${PATTERN_COMPLETION:-0}  # 1=run the CA3 completion probe INSTEAD
+PC_CUE_FRACS=${PC_CUE_FRACS:-0.1,0.2,0.3,0.5,0.7,1.0}
+PC_CUE_WEIGHT=${PC_CUE_WEIGHT:-2.5}
 OUTDIR="results"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -51,6 +69,7 @@ export OMP_PLACES=cores
 echo "[Slurm] job=$SLURM_JOB_ID  ntasks=$SLURM_NTASKS  cpus-per-task=$SLURM_CPUS_PER_TASK"
 echo "[Slurm] scale=${SCALE}%  n_swr=$N_SWR  epoch_ms=$EPOCH_MS  prp_threshold=$PRP_THRESHOLD"
 echo "[Slurm] ec_lv=${EC_LV}  mpfc=${MPFC}  no_stc=${NO_STC}  homeostasis=${HOMEOSTASIS}  homeo_alpha=${HOMEO_ALPHA}  alpha_sweep=${ALPHA_SWEEP:-<none>}"
+echo "[Slurm] dg=${DG}  dg_scale=${DG_SCALE}  pattern_completion=${PATTERN_COMPLETION}"
 
 python3 - <<'PY'
 import nest
@@ -62,8 +81,29 @@ PY
 
 mkdir -p "$OUTDIR"
 
+# ---- Pattern-completion probe: separate run mode, short-circuits here --------
+# The probe builds an isolated CA3 twice (intact + sup_local-ablated), ignores
+# STC / EC / homeostasis, and exits after writing its own HDF5. Runs on the
+# same node config; it is lighter than the full consolidation run.
+if [ "$PATTERN_COMPLETION" = "1" ]; then
+  PC_OUT="${OUTDIR}/pattern_completion_${SCALE}pct.h5"
+  echo "[Slurm] PATTERN COMPLETION mode → $PC_OUT"
+  srun --cpu-bind=cores \
+    python3 -u "replay_scaled.py" \
+      --scale             "$SCALE" \
+      --threads           "$SLURM_CPUS_PER_TASK" \
+      --pattern-completion \
+      --pc-cue-fracs      "$PC_CUE_FRACS" \
+      --pc-cue-weight     "$PC_CUE_WEIGHT" \
+      --out-hdf5          "$PC_OUT" \
+      --no-figures
+  echo "[Slurm] pattern-completion done."
+  exit 0
+fi
+
 # Tag output filename with active phases
 PHASE_TAG=""
+[ "$DG" = "1" ] && PHASE_TAG="${PHASE_TAG}_dg"
 [ "$EC_LV" = "1" ]  && PHASE_TAG="${PHASE_TAG}_lv"
 [ "$MPFC"  = "1" ]  && PHASE_TAG="${PHASE_TAG}_mpfc"
 [ "${PRP_THRESHOLD%.*}" -gt 100 ] 2>/dev/null && PHASE_TAG="${PHASE_TAG}_ph5"
@@ -81,8 +121,13 @@ fi
 OUTFILE="${OUTDIR}/replay_${SCALE}pct_stc${PHASE_TAG}.h5"
 echo "[Slurm] output → $OUTFILE"
 
+# STC requires EC LII (the model errors otherwise) — force it on if STC is active.
+[ "$NO_STC" != "1" ] && EC_LII=1
+
 # Build optional flag list
 OPTIONAL_FLAGS=""
+[ "$EC_LII" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lii --ec-lii-k $EC_LII_K"
+[ "$DG"     = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg --dg-scale $DG_SCALE"
 [ "$NO_STC" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --stc --n-swr $N_SWR --epoch-ms $EPOCH_MS --prp-threshold $PRP_THRESHOLD"
 [ "$EC_LV"  = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lv"
 [ "$MPFC"   = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --mpfc"
@@ -99,7 +144,5 @@ srun --cpu-bind=cores \
     --scale       "$SCALE" \
     --threads     "$SLURM_CPUS_PER_TASK" \
     --out-hdf5    "$OUTFILE" \
-    --ec-lii \
-    --ec-lii-k    "$EC_LII_K" \
     $OPTIONAL_FLAGS \
     --no-figures
