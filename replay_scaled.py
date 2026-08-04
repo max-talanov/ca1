@@ -561,6 +561,22 @@ def build_replay_network(
     rate_dg_ca3_sup=820.0,  rate_dg_ca3_deep=220.0,
     rate_ec_ca3_sup=530.0,  rate_ec_ca3_deep=150.0,
     rate_ca3_drive_sup=400.0, rate_ca3_drive_deep=120.0,
+    # CA3 tonic excitability, applied ONLY when suppress_dg_drive=True (real DG).
+    # The Poisson DG proxy (rate_dg_ca3_sup=820 @ 3.0) had bundled in CA3's tonic
+    # drive; removing it dropped CA3_SUP to 2.8 Hz, which collapsed CA1 below its
+    # E/I threshold (0.2 Hz) and left EC/STC consolidation completely inert at
+    # 12% (res/2026-08-02 Job C: 0 EC fired, 0 L-LTP). Biologically this tonic
+    # floor is the EC LII direct perforant path + recurrent/neuromodulatory
+    # background, NOT the mossy fibre (a sparse detonator). Heterogeneous rate,
+    # like the old proxy, so CA3 firing stays structured (a flat drive
+    # over-synchronises CA3 and starves CA1). At 600 Hz @ 3.0 (1% scale):
+    # CA3_SUP ~7.5 Hz, CA1_PYR ~3.4 Hz, and consolidation runs again (EC fires,
+    # L-LTP forms, weights grow). DEEP already sits ~8 Hz, so it gets none.
+    # NOTE (1% caveat): forward replay + DG separation PASS at every tonic
+    # tried; reverse replay is weak at 1% (10 groups, noise-dominated), but was
+    # robust at 12% (rho_rev -0.54) -- the 12% Job C re-run is the acceptance
+    # test for reverse replay AND consolidation together.
+    ca3_tonic_rate_sup=600.0, ca3_tonic_rate_deep=0.0, ca3_tonic_weight=3.0,
     rate_drive_ca1_basket=820.0,
     rate_drive_ca3_int_sup=820.0, rate_drive_ca3_int_deep=820.0,
     # Theta
@@ -710,8 +726,28 @@ def build_replay_network(
     if suppress_dg_drive:
         # A real DG circuit will drive CA3 via mossy fibres (build_dg_module);
         # skip the Poisson proxy so the mossy-fibre input is not double-counted.
-        print("    [DG] Poisson DG->CA3 proxy suppressed (real DG mossy fibres "
-              "will drive CA3)")
+        # BUT restore CA3's tonic excitability (which the proxy had bundled in)
+        # through a generic tonic drive standing for the EC LII direct perforant
+        # path + recurrent/neuromodulatory background — otherwise CA3_SUP falls
+        # to ~2.8 Hz, CA1 collapses below its E/I threshold, and EC/STC
+        # consolidation goes inert (observed at 12%, res/2026-08-02 Job C).
+        print("    [DG] Poisson DG->CA3 proxy suppressed; real DG mossy fibres "
+              "(detonator) + heterogeneous CA3 tonic drive replace it")
+        # Heterogeneous tonic (rates spread like the old proxy) -- a flat drive
+        # over-synchronises CA3, which both under-drives CA1 and kills the weak
+        # reverse chain. The spread reproduces the proxy's structured firing that
+        # gave CA3~5 -> CA1~5 and bidirectional replay; it is now attributed to
+        # EC-direct/recurrent excitability, with the mossy fibre as a separate
+        # sparse detonator on top.
+        if ca3_tonic_rate_sup > 0:
+            _tr = _rng_vm.normal(ca3_tonic_rate_sup, 100.0,
+                                 N_ca3_sup).clip(400.0, 1400.0)
+            _tg = nest.Create("poisson_generator", N_ca3_sup)
+            nest.SetStatus(_tg, "rate", _tr.tolist())
+            nest.Connect(_tg, CA3_SUP, conn_spec="one_to_one",
+                         syn_spec={"weight": float(ca3_tonic_weight), "delay": d_fast})
+        if ca3_tonic_rate_deep > 0:
+            _drive(N_ca3_deep, ca3_tonic_rate_deep, CA3_DEEP, ca3_tonic_weight, d_fast)
     else:
         # DG→CA3 SUP: heterogeneous rates (σ=100 Hz) to spread membrane potentials
         _dg_rates_sup = _rng_vm.normal(rate_dg_ca3_sup, 100.0,
@@ -1067,11 +1103,16 @@ def build_dg_module(
     # 2-4% and should lift CA3_SUP back toward ~5 Hz. The relationship is steep,
     # so expect to bracket once more.
     pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=4.0,
-    # mossy-fibre DG->CA3 detonator weights (LOW in-degree set in TARGET_INDEGREE)
-    # NOTE: once granule cells go sparse, far fewer mossy fibres are active, so
-    # CA3 may lose drive. If CA3_SUP drops below ~4 Hz after this change, raise
-    # w_mf_ca3_sup (the detonator is meant to be powerful per-spike).
-    w_mf_ca3_sup=6.0, w_mf_ca3_deep=4.0,
+    # mossy-fibre DG->CA3 detonator weights (LOW in-degree set in TARGET_INDEGREE).
+    # Division of labour: CA3's ~5 Hz baseline comes from the tonic floor
+    # (build_replay_network ca3_tonic_rate_sup = EC-direct/recurrent); the mossy
+    # fibre adds a sparse pattern-specific kick. Tuning (2026-08-04) showed a
+    # strong detonator (w>=6) over-drives CA3 with CA1-ineffective bursty firing
+    # that breaks the replay-tuned E/I balance (reverse replay collapses, CA1
+    # stays low). At w=2.5 (still ~60x the Schaffer weight of 0.04) the mossy
+    # fibre is a real, pattern-specific input that perturbs rather than dominates
+    # CA3, so the tonic floor sets the CA1-effective baseline.
+    w_mf_ca3_sup=2.5, w_mf_ca3_deep=1.5,
     # intra-DG weights. w_basket_gc strengthened -4.5 -> -7.0 for a sharper
     # k-winners-take-all cutoff.
     w_gc_basket=2.5, w_basket_gc=-7.0,
