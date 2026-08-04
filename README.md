@@ -1,22 +1,92 @@
-# CA1 + CA3 tiny model 
-in NEST with Izhikevich neurons.
+# tinyHippo
 
-## Installation 
-Firstly, please, install NEST
-Source and installation guide here: https://nest-simulator.readthedocs.io/en/stable/installation/index.html
+A bio-plausible spiking model of the rat hippocampus in [NEST](https://nest-simulator.readthedocs.io)
+(Izhikevich neurons), built to study **memory consolidation through bidirectional
+replay and sharp-wave ripples** across the full entorhinal–hippocampal loop:
 
-Please, install with python(this key: --with-nrnpython) and mpi(key: --with-paranrn for parallel computing)
+```
+EC LII → DG → CA3 → CA1 → EC LII/LV → mPFC
+   ↑                              │
+   └──────────────────────────────┘
+```
 
-Then try tiny.py with 
-python3 tiny.py
+The model scales from a 1% test network (~8k neurons, runs on a laptop) to the
+full rat hippocampus (~780k neurons, MareNostrum 5), with the same code path.
 
-Currently it contains only three grops of neurons of CA1:
-Pyramidal, 
-Basket,
-OLM
+## What the model does
+
+| Capability | Flag | Status |
+|---|---|---|
+| **Bidirectional replay** — forward & reverse sequence replay during SWRs | *(default)* | validated at 12% (ρ_fwd +0.70, ρ_rev −0.54) |
+| **CA3 recurrent feedback loops** — Watson 2025 four-way asymmetric wiring + E↔I | *(always on)* | core |
+| **DG pattern separation** — granule sparse coding via basket feedback | `--dg` | validated at 12% (2.2% active/pattern) |
+| **CA3 pattern completion** — auto-association, partial cue → full pattern | `--pattern-completion` | validated at 12% (sharp ~30% threshold, ablation-controlled) |
+| **Synaptic tagging & capture** — early-LTP → tag → PRP → late-LTP on CA1→EC | `--stc` | implemented |
+| **Memory consolidation** — hippocampo-cortical loop (EC LII, EC LV, mPFC) | `--ec-lii --ec-lv --mpfc` | implemented |
+| **Synaptic homeostasis** — sleep downscaling, cortical L-LTP exempt | `--homeostasis` | implemented |
+
+An interactive map of all capabilities, with the functions implementing each,
+is in [`capability_map.html`](capability_map.html) (open it in a browser).
+
+## Quick start
+
+Install NEST ≥ 3.9 (see [INSTALL.md](INSTALL.md)), then:
+
+```bash
+# 1% test network: replay + dentate gyrus, ~1 min on a laptop
+python replay_scaled.py --scale 1 --dg --dg-scale 2 --no-figures
+
+# CA3 pattern completion probe (intact vs ablated recurrence)
+python replay_scaled.py --scale 1 --pattern-completion
+
+# full consolidation stack
+python replay_scaled.py --scale 1 --dg --ec-lii --stc --n-swr 3
+```
+
+Results are written to a self-describing HDF5 file (all populations, spike
+times, rates, and per-capability metrics), so analysis and plotting run
+anywhere without NEST.
+
+## Running on HPC
+
+[`run.sh`](run.sh) is the SLURM launcher (MareNostrum 5, MPI + OpenMP):
+
+```bash
+# replay + DG at 12%
+sbatch --export=ALL,SCALE=12,DG=1,NO_STC=1,EC_LII=0,EC_LV=0,MPFC=0 run.sh
+
+# pattern completion at 12%
+sbatch --export=ALL,SCALE=12,PATTERN_COMPLETION=1 run.sh
+
+# full stack with DG + consolidation
+sbatch --export=ALL,SCALE=12,DG=1,N_SWR=14 run.sh
+```
+
+Single-neuron f-I calibration has its own job:
+`sbatch --export=ALL,PROBE=dc run_calibrate.sh` → [`run_calibrate.sh`](run_calibrate.sh).
+
+## Layout
+
+| File | Purpose |
+|---|---|
+| [`replay_scaled.py`](replay_scaled.py) | Main simulation — all populations, capabilities, and HDF5 export |
+| [`tiny.py`](tiny.py) | Shared helpers (seeding, theta and SWR generators) |
+| [`nest_dg_ca3_fi_calibration.py`](nest_dg_ca3_fi_calibration.py) | DG/CA3 single-neuron f-I + DC-rheobase calibration |
+| [`run.sh`](run.sh) / [`run_calibrate.sh`](run_calibrate.sh) | SLURM launchers |
+| [`plot_pattern_completion.py`](plot_pattern_completion.py), [`replay_plot.py`](replay_plot.py), [`make_paper_figure.py`](make_paper_figure.py) | Offline plotting from HDF5 |
+| [`capability_map.html`](capability_map.html) | Visual capability reference |
 
 ## Bidirectional replay overview
 
+![overview](/figures/bidir_replay_fig1_overview.png)
+
 ![heatmap](/figures/bidir_replay_fig2_heatmap.png)
 
-![overview](/figures/bidir_replay_fig1_overview.png)
+## Key references
+
+- Watson et al. (2025) *Cell Reports* 44:116080 — cell-specific CA3 wiring
+  (superficial/deep split)
+- Marr (1971); Nakazawa et al. (2002) — CA3 auto-association / pattern completion
+- Frey & Morris (1997) — synaptic tagging and capture
+- Kassab & Alexandre (2018) — DG mossy-cell threshold classes
+- Andersen et al. (2007) *The Hippocampus Book* — reference neuron counts
