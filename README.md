@@ -76,11 +76,22 @@ Single-neuron f-I calibration has its own job:
 | [`plot_pattern_completion.py`](plot_pattern_completion.py), [`replay_plot.py`](replay_plot.py), [`make_paper_figure.py`](make_paper_figure.py) | Offline plotting from HDF5 |
 | [`capability_map.html`](capability_map.html) | Visual capability reference |
 
-## Bidirectional replay overview
+## Results
 
-![overview](/figures/bidir_replay_fig1_overview.png)
+**Memory consolidation is dissociable from replay.** Blocking late-LTP capture
+(`--prp-threshold 999`) leaves replay quality identical (Δρ_fwd = 0.000) while
+cortical consolidation goes to zero — separating the replay mechanism from the
+consolidation mechanism in the same model. Full circuit, 12% scale:
 
-![heatmap](/figures/bidir_replay_fig2_heatmap.png)
+![consolidation vs replay](/figures/final_comparison_fig9.png)
+
+**CA3 performs pattern completion.** A partial cue of a stored assembly is
+restored to the full pattern by the recurrent collaterals, with a sharp
+attractor threshold near 30% cue. Ablating the within-group recurrence
+(`sup_local = 0`) abolishes it, confirming the collaterals — not the cue — do
+the work:
+
+![pattern completion](/figures/pattern_completion.png)
 
 ## Key references
 
