@@ -107,12 +107,33 @@ inhibition-dominated and is not an autonomous attractor without it.
 
 ---
 
+## 6. Cortical association build-up (EC LV → mPFC)
+
+A replay-gated Hebbian hook potentiates EC LV→mPFC synapses when an SWR
+co-activates both ends, with weak heterosynaptic depression when the target
+fires without the source.
+
+Selectivity required giving mPFC the same k-winners-take-all motif the DG uses
+(pyramidal → FS interneuron → pyramidal). Without it every mPFC cell fired on
+every SWR, so all 2 400 synapses potentiated together — association without an
+engram (final weight std 0.0018, 100 % "associated"). With it, over 8 replay
+events at 1 %:
+
+| event | co-active synapses | associated |
+|---|---|---|
+| 2 | 2 400 | 100 % |
+| 6 | 380 | 40 % |
+| 8 | 2 400 | **37.5 %** |
+
+A distinct **subset** now carries the association while mPFC stays active
+(3.6 Hz) — competition, not silencing. `--no-mpfc-lateral-inh` and
+`--no-mpfc-assoc` disable each half for controls.
+
 ## Open items
 
-- **Cortical association selectivity.** The EC LV→mPFC Hebbian hook builds
-  associations across replay events, but without sparse coding in mPFC every
-  synapse co-activates and potentiates uniformly (weight std 0.0018) — an
-  association without an engram. mPFC lateral inhibition addresses this.
+- **Engram selectivity at scale.** 37.5 % of LV→mPFC synapses associate at 1 %;
+  whether the subset sharpens further at 12 % (more cells, more competition)
+  is untested.
 - **SWR generators fire only in epoch 0.** They are created once with absolute
   times, so in an *n*-epoch run epochs 1…*n*−1 tag on background activity
   rather than on replay. Replay scoring is unaffected (it reads epoch 0).
