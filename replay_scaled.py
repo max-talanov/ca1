@@ -2252,6 +2252,20 @@ def run_homeostasis_hook(homeo):
 # ============================================================================
 
 def replay_score(spk_times, spk_senders, seq_groups, window_start, window_stop):
+    """Spearman rho between sequence-group index and mean spike time.
+
+    IMPORTANT -- score the SWR event window itself, not a padded window.
+    Call sites previously used (start-5, stop+30). That +30 ms tail reaches
+    past the SWR into the post-event rebound, where the strong forward chain
+    (seq_fwd K=20) re-ignites a FORWARD-propagating burst across all groups.
+    That rebound is harmless for forward replay (it shares the forward
+    ordering) but directly opposes reverse replay, cancelling it: measured on
+    the 12% + DG run, rho_rev reads -0.094 with the pad and -0.789 without it,
+    while rho_fwd is unchanged (+0.622 vs +0.613). Every archived consolidating
+    run shows the same one-sided distortion (e.g. 25%: -0.033 -> -0.512), which
+    is why bidirectional replay appeared to be incompatible with consolidation
+    when in fact both were present all along.
+    """
     try:
         from scipy.stats import spearmanr
     except ImportError:
@@ -2415,8 +2429,10 @@ def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
         ("SWR-1 forward", net["swr_fwd"], +1),
         ("SWR-2 reverse", net["swr_rev"], -1),
     ]:
+        # Score the SWR event window itself — see replay_score docstring for why
+        # the old (-5, +30) padding one-sidedly cancelled reverse replay.
         rho, pval = replay_score(t_sup, s_sup, net["ca3_seq_groups"],
-                                 win[0]-5, win[1]+30)
+                                 win[0], win[1])
         if rho is not None and not np.isnan(rho):
             ok      = (expected_sign > 0 and rho > 0.5) or (expected_sign < 0 and rho < -0.5)
             verdict = "PASS" if ok else "WEAK"
@@ -2722,7 +2738,7 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
         # --- replay quality stats --------------------------------------------
         sg = h5.create_group("stats")
         for label_key, win in [("fwd", net["swr_fwd"]), ("rev", net["swr_rev"])]:
-            rho, pval = replay_score(t_sup, s_sup, sup_groups, win[0] - 5, win[1] + 30)
+            rho, pval = replay_score(t_sup, s_sup, sup_groups, win[0], win[1])
             sg.attrs[f"rho_{label_key}"]  = float(rho)  if (rho  is not None and not np.isnan(rho))  else float("nan")
             sg.attrs[f"pval_{label_key}"] = float(pval) if (pval is not None and not np.isnan(pval)) else float("nan")
 
@@ -3240,11 +3256,11 @@ Dentate gyrus (Phase 6.2):
             _t3  = np.array(_ev3["times"],   dtype=float)
             _s3  = np.array(_ev3["senders"], dtype=int)
             _rho_f, _pf = replay_score(_t3, _s3, net["ca3_seq_groups"],
-                                        epoch_t0_verify + swr_fwd[0] - 5,
-                                        epoch_t0_verify + swr_fwd[1] + 30)
+                                        epoch_t0_verify + swr_fwd[0],
+                                        epoch_t0_verify + swr_fwd[1])
             _rho_r, _pr = replay_score(_t3, _s3, net["ca3_seq_groups"],
-                                        epoch_t0_verify + swr_rev[0] - 5,
-                                        epoch_t0_verify + swr_rev[1] + 30)
+                                        epoch_t0_verify + swr_rev[0],
+                                        epoch_t0_verify + swr_rev[1])
             stats["rho_fwd_post_homeo"] = float(_rho_f) if _rho_f is not None else float("nan")
             stats["rho_rev_post_homeo"] = float(_rho_r) if _rho_r is not None else float("nan")
             stats["verification_t0_ms"] = float(epoch_t0_verify)
@@ -3294,7 +3310,10 @@ Dentate gyrus (Phase 6.2):
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
         raise SystemExit(0)
 
-    print_report(net, SIM_MS, cfg["label"],
+    # total_sim_ms, not SIM_MS: with --stc the run is n_swr epochs long, and
+    # passing the per-epoch duration inflated every reported rate by n_swr
+    # (the HDF5 stats were always correct — they already use total_sim_ms).
+    print_report(net, total_sim_ms, cfg["label"],
                  ec_module=ec_module, dg_module=dg_module,
                  eclv_module=eclv_module, mpfc_module=mpfc_module)
 
