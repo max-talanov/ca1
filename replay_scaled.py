@@ -1944,6 +1944,116 @@ def build_mpfc(
         w_init      = w_eclv_mpfc,
     )
 
+# ============================================================================
+# Cortical association build-up  (EC LV -> mPFC Hebbian hook)
+# ============================================================================
+#
+# build_mpfc() wires EC LV -> mPFC with static_synapse and nothing ever
+# modified those weights, so the "cortical engram" its docstring describes
+# could never form: the mPFC was a passive readout. This hook makes the
+# association actually build up across SWR epochs.
+#
+# Rule: replay-gated Hebbian co-activation. In each SWR window, a synapse is
+# potentiated when its EC LV source AND its mPFC target both fired -- i.e. the
+# cortico-cortical link is strengthened exactly when hippocampal replay drove
+# both ends together. Synapses whose post fired without the pre are weakly
+# depressed (heterosynaptic competition), which is what makes the final weight
+# distribution BIMODAL -- an engram -- rather than uniformly drifting upward.
+#
+# This is deliberately simpler than the CA1->EC STC hook: no tag/PRP cascade,
+# because the cortical association is the SLOW integrator here -- it should
+# accumulate gradually over many replay events rather than gate on a
+# capture threshold.
+
+@dataclass
+class MPFCAssocHook:
+    """State for the EC LV -> mPFC associative projection."""
+    conns    : object        # nest.SynapseCollection
+    w        : np.ndarray    # current weights
+    w_init   : float
+    pre_idx  : np.ndarray    # source index into EC LV population
+    post_idx : np.ndarray    # target index into mPFC population
+    n_calls  : int = 0
+    history  : list = None
+
+
+def build_mpfc_assoc_hook(mpfc_module, eclv_module) -> MPFCAssocHook:
+    """Cache the EC LV -> mPFC synapses once (same pattern as build_stc_hook)."""
+    import nest
+    t0 = time.perf_counter()
+    print("\n  [mPFCAssoc] Fetching EC LV->mPFC synapse collection...")
+    conns = nest.GetConnections(target=mpfc_module.population)
+    n = len(conns)
+    w = np.array(nest.GetStatus(conns, "weight"), dtype=np.float32)
+    src = np.array(nest.GetStatus(conns, "source"), dtype=np.int64)
+    tgt = np.array(nest.GetStatus(conns, "target"), dtype=np.int64)
+    lv_map  = {g: i for i, g in enumerate(eclv_module.population.tolist())}
+    pfc_map = {g: i for i, g in enumerate(mpfc_module.population.tolist())}
+    # Sources may include non-EC-LV inputs if any exist; -1 marks "not EC LV"
+    pre_idx  = np.array([lv_map.get(g, -1)  for g in src], dtype=np.int32)
+    post_idx = np.array([pfc_map.get(g, -1) for g in tgt], dtype=np.int32)
+    print(f"  [mPFCAssoc] {n:,} synapses cached in {time.perf_counter()-t0:.2f}s")
+    return MPFCAssocHook(conns=conns, w=w, w_init=float(w[0]) if n else 1.0,
+                         pre_idx=pre_idx, post_idx=post_idx, history=[])
+
+
+def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
+                        t_swr_start, t_swr_end,
+                        A_assoc=0.02, A_hetero=0.004,
+                        w_max=2.0, w_min=0.05):
+    """Strengthen EC LV -> mPFC where replay co-activated both ends.
+
+    Called once per SWR event, after nest.Simulate() for that epoch.
+    """
+    import nest
+
+    def fired(spk_rec, pop):
+        ev = nest.GetStatus(spk_rec, "events")[0]
+        t  = np.asarray(ev["times"]); s = np.asarray(ev["senders"])
+        act = np.unique(s[(t >= t_swr_start) & (t <= t_swr_end)])
+        idx = {g: i for i, g in enumerate(pop.tolist())}
+        m = np.zeros(len(pop), dtype=bool)
+        for g in act:
+            i = idx.get(int(g))
+            if i is not None:
+                m[i] = True
+        return m
+
+    pre_fired  = fired(eclv_module.spike_rec, eclv_module.population)
+    post_fired = fired(mpfc_module.spike_rec, mpfc_module.population)
+
+    valid = (hook.pre_idx >= 0) & (hook.post_idx >= 0)
+    pre_a  = np.zeros(len(hook.w), dtype=bool)
+    post_a = np.zeros(len(hook.w), dtype=bool)
+    pre_a[valid]  = pre_fired[hook.pre_idx[valid]]
+    post_a[valid] = post_fired[hook.post_idx[valid]]
+
+    both  = pre_a & post_a           # Hebbian: co-activation -> potentiate
+    hetero = post_a & ~pre_a         # post without pre -> weak depression
+    hook.w[both]   = np.minimum(hook.w[both]   + A_assoc,  w_max)
+    hook.w[hetero] = np.maximum(hook.w[hetero] - A_hetero, w_min)
+    nest.SetStatus(hook.conns, "weight", hook.w.tolist())
+
+    hook.n_calls += 1
+    # "associated" = potentiated in at least half the replay events so far.
+    # Scales with run length, unlike an absolute threshold near w_max, which is
+    # unreachable in a short run and reports a misleading 0%.
+    thr = hook.w_init + 0.5 * hook.n_calls * A_assoc
+    # Selectivity is what distinguishes an ENGRAM from uniform drift: a real
+    # engram potentiates a SUBSET, so the weight distribution spreads out. CV
+    # near 0 means every synapse moved together -- association without
+    # specificity (see the note in build_mpfc_assoc_hook's section header).
+    w_cv = float(hook.w.std() / max(hook.w.mean(), 1e-9))
+    rec = dict(t_swr_start=float(t_swr_start),
+               n_coactive=int(both.sum()), n_hetero=int(hetero.sum()),
+               w_mean=float(hook.w.mean()), w_max_seen=float(hook.w.max()),
+               w_cv=w_cv,
+               n_associated=int((hook.w >= thr).sum()),
+               frac_associated=float((hook.w >= thr).mean()))
+    hook.history.append(rec)
+    return rec
+
+
 def build_stc_hook(ec_module, w_init_override=None) -> STCHook:
     """
     Initialise the STC hook by fetching the CA1→EC SynapseCollection.
@@ -2567,7 +2677,8 @@ def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
 def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                      ec_module=None, stc_hook=None,
                      eclv_module=None, mpfc_module=None,
-                     homeo_stats=None, homeo_results=None, dg_module=None):
+                     homeo_stats=None, homeo_results=None, dg_module=None,
+                     mpfc_assoc_hook=None):
     """
     Save all simulation results to an HDF5 file for offline plotting.
 
@@ -2729,6 +2840,25 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                 g_pfc.create_dataset("rate",
                     data=(counts_pfc/(bin_ms/1e3)/max(mpfc_module.N,1)).astype(np.float32))
                 h5.attrs["mpfc_present"] = True
+
+        # --- cortical association build-up (EC LV -> mPFC) -------------------
+        if mpfc_assoc_hook is not None and mpfc_assoc_hook.history:
+            hist = mpfc_assoc_hook.history
+            ag = h5.create_group("mpfc_assoc")
+            ag.attrs["description"] = (
+                "Replay-gated Hebbian build-up of the EC LV->mPFC projection: "
+                "co-activation during an SWR potentiates, post-without-pre "
+                "weakly depresses. frac_associated is the share of synapses "
+                "above the engram threshold.")
+            ag.attrs["n_events"] = len(hist)
+            ag.attrs["w_init"]   = mpfc_assoc_hook.w_init
+            for key, dt in (("n_coactive", np.int32), ("n_hetero", np.int32),
+                            ("w_mean", np.float32), ("n_associated", np.int32),
+                            ("frac_associated", np.float32),
+                            ("t_swr_start", np.float32)):
+                ag.create_dataset(key, data=np.array([r[key] for r in hist], dtype=dt))
+            ag.create_dataset("w_final", data=mpfc_assoc_hook.w.astype(np.float32),
+                              **compress)
 
         # --- Dentate gyrus groups (optional, Phase 6.2) ----------------------
         h5.attrs["dg_present"] = dg_module is not None
@@ -3002,6 +3132,11 @@ Dentate gyrus (Phase 6.2):
         help="Add mPFC population receiving EC LV input (Phase 3 endpoint). "
              "Requires --ec-lv.")
     parser.add_argument(
+        "--no-mpfc-assoc", action="store_true",
+        help="Disable the EC LV->mPFC associative (Hebbian) build-up that forms "
+             "the cortical engram. By default --mpfc enables it; without it the "
+             "LV->mPFC weights are static and no association ever forms.")
+    parser.add_argument(
         "--prp-threshold", type=float, default=3.0, metavar="T",
         help="PRP pool threshold for L-LTP capture (default: 3.0 = 3 SWR events). "
              "Set to 999 for Phase 5 falsification experiment (blocks L-LTP while "
@@ -3216,6 +3351,12 @@ Dentate gyrus (Phase 6.2):
                 ec_lv_pop = eclv_module.population,
             )
 
+    # ---- Cortical association build-up (EC LV -> mPFC Hebbian) --------------
+    mpfc_assoc_hook = None
+    if mpfc_module is not None and eclv_module is not None and not args.no_mpfc_assoc:
+        print(">>> Initialising mPFC association hook...")
+        mpfc_assoc_hook = build_mpfc_assoc_hook(mpfc_module, eclv_module)
+
     # ---- Simulation: single epoch or multi-epoch STC loop -------------------
     swr_fwd = net["swr_fwd"]
     swr_rev = net["swr_rev"]
@@ -3246,6 +3387,15 @@ Dentate gyrus (Phase 6.2):
                 current_t_ms  = current_t,
                 PRP_threshold = args.prp_threshold,
             )
+
+        # Cortical association build-up: same two SWR windows, EC LV -> mPFC
+        if mpfc_assoc_hook is not None:
+            for _ws, _we in ((swr_fwd[0], swr_fwd[1]), (swr_rev[0], swr_rev[1])):
+                run_mpfc_assoc_hook(
+                    mpfc_assoc_hook, eclv_module, mpfc_module,
+                    t_swr_start = epoch_t0 + _ws,
+                    t_swr_end   = epoch_t0 + _we,
+                )
 
         if n_epochs > 1:
             print(f"    Epoch {epoch+1}/{n_epochs} done "
@@ -3371,7 +3521,7 @@ Dentate gyrus (Phase 6.2):
                      ec_module=ec_module, stc_hook=stc_hook,
                      eclv_module=eclv_module, mpfc_module=mpfc_module,
                      homeo_stats=homeo_stats, homeo_results=homeo_results,
-                     dg_module=dg_module)
+                     dg_module=dg_module, mpfc_assoc_hook=mpfc_assoc_hook)
 
     if rank != 0:
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
@@ -3380,6 +3530,20 @@ Dentate gyrus (Phase 6.2):
     # total_sim_ms, not SIM_MS: with --stc the run is n_swr epochs long, and
     # passing the per-epoch duration inflated every reported rate by n_swr
     # (the HDF5 stats were always correct — they already use total_sim_ms).
+    if mpfc_assoc_hook is not None and mpfc_assoc_hook.history:
+        h = mpfc_assoc_hook.history
+        print(f"\n--- Cortical association build-up (EC LV -> mPFC) ---")
+        print(f"  {'event':>6s} {'co-active':>10s} {'w_mean':>8s} {'associated':>11s}")
+        for i, r in enumerate(h):
+            if i < 3 or i >= len(h) - 3:
+                print(f"  {i+1:6d} {r['n_coactive']:10,d} {r['w_mean']:8.4f} "
+                      f"{r['frac_associated']*100:10.1f}%")
+            elif i == 3:
+                print(f"  {'...':>6s}")
+        print(f"  weights {h[0]['w_mean']:.4f} -> {h[-1]['w_mean']:.4f}  "
+              f"| engram: {h[-1]['frac_associated']*100:.1f}% of LV->mPFC "
+              f"synapses associated after {len(h)} replay events")
+
     print_report(net, total_sim_ms, cfg["label"],
                  ec_module=ec_module, dg_module=dg_module,
                  eclv_module=eclv_module, mpfc_module=mpfc_module)
