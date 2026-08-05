@@ -293,6 +293,15 @@ TARGET_INDEGREE = {
     # high weight -- the opposite of the dense Schaffer collaterals.
     "dg_mf_ca3_sup"        :    15,   # GC -> CA3 SUP  (primary MF target)
     "dg_mf_ca3_deep"       :     8,   # GC -> CA3 DEEP (weaker; SUP is main target)
+    # Perforant path EC LII -> DG granule cells. This is the projection that
+    # CLOSES the EC->DG->CA3->CA1->EC loop; without it DG is driven by a Poisson
+    # stand-in and the "loop" is open at its entry point. Rat granule cells
+    # receive ~4,000 PP synapses each (Andersen 2007); the scale-invariant
+    # in-degree here is the usual reduced-model surrogate.
+    # NOTE this closes a POSITIVE-FEEDBACK loop, so its gain must stay well
+    # below unity. At K=100 w=1.2 the loop ran away (CA3 7.8 -> 73 Hz, granule
+    # cells 100% active, pattern separation destroyed). See w_ec_dg/pp_residual.
+    "ec_dg_pp"             :    50,   # EC LII -> GC
 }
 
 
@@ -1088,11 +1097,34 @@ class DGModule:
     N_basket    : int
     K_mf_sup    : int      # mossy-fibre in-degree onto CA3 SUP
     K_mf_deep   : int      # mossy-fibre in-degree onto CA3 DEEP
+    ec_driven   : bool = False   # True when the real EC LII perforant path is wired
+                                 # (i.e. the EC->DG->CA3->CA1->EC loop is closed)
 
 
 def build_dg_module(
     ca3_sup, ca3_deep,
     N_gc, N_mc_low, N_mc_high, N_basket,
+    # Real EC LII population for the perforant path. When given, the loop
+    # EC LII -> DG -> CA3 -> CA1 -> EC LII is CLOSED; when None, DG falls back
+    # to the Poisson stand-in and the loop is open at its entry point.
+    # Loop gain: EC LII->GC must contribute only a MODEST share of granule
+    # drive, because it closes a positive-feedback loop
+    # (EC->DG->CA3->CA1->EC). Budget per granule cell, at 1% scale:
+    # The binding constraint is SYNCHRONY, not mean rate. EC LII fires in
+    # SWR-locked bursts, so a granule cell's K perforant inputs arrive together:
+    # the instantaneous kick is K * w_ec_dg, and the granule rest->threshold gap
+    # is 20 mV (-70 -> -50, from the f-I calibration). Any K*w near 20 detonates
+    # every granule cell the moment EC bursts, destroying the sparse code.
+    #   K=100 w=1.2 (120 mV) residual=0.5 -> runaway: CA3 73 Hz, DG 100% active
+    #   K=50  w=0.4 ( 20 mV) residual=0.9 -> DG fine in SWR-1 (1.4%) but
+    #                                        saturates to 98.8% by SWR-2 once
+    #                                        the loop has built up
+    #   K=50  w=0.15 (7.5 mV) residual=0.95 -> subthreshold alone: EC modulates
+    #                                        which granule cells win rather than
+    #                                        firing them outright. <- current
+    # Mean-rate budget at the current setting: Poisson 0.95 * 520 = 494 mV/s
+    # plus EC 50 * ~3 Hz * 0.15 = 23, total ~517 vs the tuned 520.
+    ec_lii=None, w_ec_dg=0.15, pp_residual=0.95,
     # Perforant path (EC LII proxy) — heterogeneous Poisson onto GC.
     # Bracketing the granule sparse-coding target across three 1% runs:
     #   pp_weight 8.0 -> 97% active per window (dense; drowned CA3 replay)
@@ -1163,14 +1195,34 @@ def build_dg_module(
 
     d_fast = 1.5
 
-    # ---- Perforant-path input (EC LII proxy) onto GC ------------------------
-    # Heterogeneous Poisson rates: some granule cells are driven harder than
-    # others, so with strong feedback inhibition only a sparse subset fires.
-    pp_rates = _rng.normal(pp_rate_mean, pp_rate_sigma, N_gc).clip(10.0, None)
+    # ---- Perforant path onto GC ---------------------------------------------
+    # Two sources, mirroring the biology:
+    #   * the REAL EC LII projection (when available) -- this is what closes
+    #     the EC->DG->CA3->CA1->EC loop;
+    #   * a heterogeneous Poisson residual standing for the cortical input not
+    #     modelled here. It is also what breaks the cold-start deadlock: EC LII
+    #     is silent until CA1 drives it, and CA1 needs DG->CA3 first, so DG
+    #     needs some input that does not depend on the loop being already
+    #     running. Scaled by pp_residual when the real projection is present so
+    #     total granule drive (and hence the tuned 2-4% sparse code) is roughly
+    #     preserved.
+    ec_driven = ec_lii is not None
+    pp_scale  = pp_residual if ec_driven else 1.0
+    pp_rates = _rng.normal(pp_rate_mean * pp_scale, pp_rate_sigma * pp_scale,
+                           N_gc).clip(5.0, None)
     pp = nest.Create("poisson_generator", N_gc)
     nest.SetStatus(pp, "rate", pp_rates.tolist())
     nest.Connect(pp, GC, conn_spec="one_to_one",
                  syn_spec={"weight": float(pp_weight), "delay": d_fast})
+    if ec_driven:
+        K_pp = K("ec_dg_pp", len(ec_lii))
+        # 3 ms: entorhinal->dentate conduction, same as the other cortical hops
+        fixed_connect(ec_lii, GC, K_pp, w_ec_dg, 3.0)
+        print(f"  [DGModule] perforant path EC LII->GC: K={K_pp} w={w_ec_dg} "
+              f"({len(ec_lii):,} EC -> {N_gc:,} GC)  ** loop CLOSED **")
+    else:
+        print("  [DGModule] perforant path: Poisson stand-in only "
+              "(no --ec-lii; EC->DG loop OPEN)")
 
     # ---- Background drive: mossy cells + interneurons near threshold ---------
     for pop, rate, w in [(MC_LOW, rate_bg_mc, w_bg_mc),
@@ -1225,7 +1277,7 @@ def build_dg_module(
         spk_gc=spk_gc, spk_mc_low=spk_mc_low, spk_mc_high=spk_mc_high,
         spk_basket=spk_basket,
         N_gc=N_gc, N_mc_low=N_mc_low, N_mc_high=N_mc_high, N_basket=N_basket,
-        K_mf_sup=K_mf_sup, K_mf_deep=K_mf_deep,
+        K_mf_sup=K_mf_sup, K_mf_deep=K_mf_deep, ec_driven=ec_driven,
     )
 
 
@@ -2449,6 +2501,9 @@ def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
 
     if dg_module is not None:
         print("\n--- Dentate gyrus (Phase 6.2 — input / pattern separation) ---")
+        print("  perforant path : " + ("EC LII -> DG  [LOOP CLOSED: "
+              "EC LII->DG->CA3->CA1->EC]" if getattr(dg_module, "ec_driven", False)
+              else "Poisson stand-in  [loop OPEN — add --ec-lii to close]"))
         for label, pop_n, spk in [
             ("DG GC",      dg_module.N_gc,      dg_module.spk_gc),
             ("DG MC_LOW",  dg_module.N_mc_low,  dg_module.spk_mc_low),
@@ -2891,6 +2946,12 @@ Dentate gyrus (Phase 6.2):
         "--dg-scale", type=int, default=None, metavar="PCT",
         help="DG scale as independent percent of the rat DG reference counts "
              "(1.2M granule cells etc.). Defaults to --scale if omitted.")
+    parser.add_argument(
+        "--no-ec-dg-loop", action="store_true",
+        help="Keep the EC LII->DG perforant path as a Poisson stand-in even when "
+             "--ec-lii is present, leaving the EC->DG->CA3->CA1->EC loop OPEN. "
+             "By default --dg + --ec-lii closes it. Use this to reproduce the "
+             "pre-loop-closure behaviour or to isolate loop effects.")
     # ---- CA3 pattern-completion probe ---------------------------------------
     parser.add_argument(
         "--pattern-completion", action="store_true",
@@ -3103,6 +3164,20 @@ Dentate gyrus (Phase 6.2):
         suppress_dg_drive = args.dg,   # real DG mossy fibres replace the proxy
     )
 
+    # ---- Optional Phase 1: EC LII/III ----------------------------------------
+    # Built BEFORE the DG so its population can supply the perforant path and
+    # close the EC->DG->CA3->CA1->EC loop. EC LII itself only needs CA1, which
+    # build_replay_network has already created.
+    ec_module = None
+    if args.ec_lii:
+        print(">>> Building EC LII/III module...")
+        ec_module = build_ec_lii(
+            ca1_pyr       = net["PYR"],
+            ca1_spike_rec = net["spk_pyr"],
+            N_ec_lii      = N_ec_lii,
+            K_ca1_ec      = args.ec_lii_k,
+        )
+
     # ---- Optional Phase 6.2: dentate gyrus -----------------------------------
     dg_module = None
     if args.dg:
@@ -3114,17 +3189,9 @@ Dentate gyrus (Phase 6.2):
             N_mc_low  = N_dg["N_dg_mc_low"],
             N_mc_high = N_dg["N_dg_mc_high"],
             N_basket  = N_dg["N_dg_basket"],
-        )
-
-    # ---- Optional Phase 1: EC LII/III ----------------------------------------
-    ec_module = None
-    if args.ec_lii:
-        print(">>> Building EC LII/III module...")
-        ec_module = build_ec_lii(
-            ca1_pyr       = net["PYR"],
-            ca1_spike_rec = net["spk_pyr"],
-            N_ec_lii      = N_ec_lii,
-            K_ca1_ec      = args.ec_lii_k,
+            ec_lii    = (ec_module.population
+                         if (ec_module is not None and not args.no_ec_dg_loop)
+                         else None),
         )
 
     # ---- Optional Phase 2: STC hook initialisation ---------------------------
