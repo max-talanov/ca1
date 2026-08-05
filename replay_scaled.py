@@ -1604,6 +1604,9 @@ class MPFCModule:
     N           : int
     K_eclv_mpfc : int     # in-degree from EC LV
     w_init      : float
+    INT         : object = None   # NodeCollection — FS interneurons (lateral inhibition)
+    spk_int     : object = None
+    N_int       : int   = 0
 
 def build_ec_lii(
     ca1_pyr,
@@ -1896,6 +1899,17 @@ def build_mpfc(
     K_eclv_mpfc  : int   = 20,     # EC LV → mPFC in-degree
     w_eclv_mpfc  : float = 1.0,    # mV
     delay_lv_mpfc: float = 8.0,    # ms — longer cortico-cortical delay
+    # Lateral inhibition — the same k-winners-take-all motif the DG uses
+    # (GC->basket->GC) to turn dense input into a sparse code. Without it every
+    # mPFC cell fires on every SWR, so every EC LV->mPFC synapse co-activates
+    # and the associative hook potentiates ALL of them uniformly: association
+    # without specificity, i.e. no engram (measured final weight std 0.0018).
+    # With it, only the most-driven mPFC cells win each replay event, so
+    # different replayed patterns recruit different mPFC subsets.
+    lateral_inhibition: bool = True,
+    int_frac     : float = 0.20,   # FS interneurons as a fraction of mPFC
+    w_mpfc_ei    : float = 2.5,    # mPFC -> INT   (mirrors w_gc_basket)
+    w_mpfc_ie    : float = -7.0,   # INT -> mPFC   (mirrors w_basket_gc)
 ) -> "MPFCModule":
     """
     Build mPFC population receiving EC LV input.
@@ -1932,6 +1946,26 @@ def build_mpfc(
                            "weight": float(w_eclv_mpfc), "delay": float(delay_lv_mpfc)})
     print(f"  [MPFCModule] LV→mPFC: {N_pfc*K:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
+    # ---- Lateral inhibition: mPFC <-> FS interneurons --------------------
+    MPFC_INT, spk_int, N_int = None, None, 0
+    if lateral_inhibition:
+        N_int = max(10, int(N_pfc * int_frac))
+        MPFC_INT = nest.Create("izhikevich", N_int,
+                               params=dict(a=0.10, b=0.2, c=-65.0, d=2.0,
+                                           V_m=-65.0, U_m=-13.0, I_e=0.0))
+        # in-degrees clamped to the (small) cortical populations
+        K_ei = max(1, min(50, N_pfc))
+        K_ie = max(1, min(max(1, N_int // 2), N_int))
+        fixed_connect(MPFC,     MPFC_INT, K_ei, w_mpfc_ei, 1.5)
+        fixed_connect(MPFC_INT, MPFC,     K_ie, w_mpfc_ie, 1.5)
+        spk_int = nest.Create("spike_recorder")
+        nest.Connect(MPFC_INT, spk_int)
+        print(f"  [MPFCModule] lateral inhibition: {N_int} FS cells  "
+              f"E->I K={K_ei} w={w_mpfc_ei}  I->E K={K_ie} w={w_mpfc_ie}")
+    else:
+        print("  [MPFCModule] lateral inhibition DISABLED — mPFC will fire as a "
+              "whole population (no sparse code, no selective engram)")
+
     spk_mpfc = nest.Create("spike_recorder")
     nest.Connect(MPFC, spk_mpfc)
     print(f"  [MPFCModule] Total build: {_time.perf_counter()-t0:.1f}s")
@@ -1942,6 +1976,9 @@ def build_mpfc(
         N           = N_pfc,
         K_eclv_mpfc = K,
         w_init      = w_eclv_mpfc,
+        INT         = MPFC_INT,
+        spk_int     = spk_int,
+        N_int       = N_int,
     )
 
 # ============================================================================
@@ -1982,17 +2019,29 @@ def build_mpfc_assoc_hook(mpfc_module, eclv_module) -> MPFCAssocHook:
     import nest
     t0 = time.perf_counter()
     print("\n  [mPFCAssoc] Fetching EC LV->mPFC synapse collection...")
-    conns = nest.GetConnections(target=mpfc_module.population)
+    # Restrict the collection to EC LV sources. GetConnections(target=mPFC) also
+    # returns the INHIBITORY INT->mPFC lateral-inhibition synapses; letting the
+    # Hebbian rule touch those would clamp them to w_min on the depression
+    # branch, flipping them positive and destroying the lateral inhibition that
+    # makes the engram selective in the first place.
+    conns_all = nest.GetConnections(target=mpfc_module.population)
+    src_all   = np.array(nest.GetStatus(conns_all, "source"), dtype=np.int64)
+    lv_ids    = set(eclv_module.population.tolist())
+    keep      = np.array([g in lv_ids for g in src_all], dtype=bool)
+    n_drop    = int((~keep).sum())
+    conns = nest.GetConnections(source=eclv_module.population,
+                                target=mpfc_module.population)
     n = len(conns)
     w = np.array(nest.GetStatus(conns, "weight"), dtype=np.float32)
     src = np.array(nest.GetStatus(conns, "source"), dtype=np.int64)
     tgt = np.array(nest.GetStatus(conns, "target"), dtype=np.int64)
     lv_map  = {g: i for i, g in enumerate(eclv_module.population.tolist())}
     pfc_map = {g: i for i, g in enumerate(mpfc_module.population.tolist())}
-    # Sources may include non-EC-LV inputs if any exist; -1 marks "not EC LV"
     pre_idx  = np.array([lv_map.get(g, -1)  for g in src], dtype=np.int32)
     post_idx = np.array([pfc_map.get(g, -1) for g in tgt], dtype=np.int32)
-    print(f"  [mPFCAssoc] {n:,} synapses cached in {time.perf_counter()-t0:.2f}s")
+    print(f"  [mPFCAssoc] {n:,} EC LV->mPFC synapses cached in "
+          f"{time.perf_counter()-t0:.2f}s (excluded {n_drop:,} non-EC-LV inputs, "
+          f"incl. lateral inhibition)")
     return MPFCAssocHook(conns=conns, w=w, w_init=float(w[0]) if n else 1.0,
                          pre_idx=pre_idx, post_idx=post_idx, history=[])
 
@@ -2028,8 +2077,10 @@ def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
     pre_a[valid]  = pre_fired[hook.pre_idx[valid]]
     post_a[valid] = post_fired[hook.post_idx[valid]]
 
-    both  = pre_a & post_a           # Hebbian: co-activation -> potentiate
-    hetero = post_a & ~pre_a         # post without pre -> weak depression
+    # `valid` on BOTH branches: the depression branch must never touch a
+    # synapse whose source is not EC LV (see build_mpfc_assoc_hook).
+    both   = valid & pre_a & post_a    # Hebbian: co-activation -> potentiate
+    hetero = valid & post_a & ~pre_a   # post without pre -> weak depression
     hook.w[both]   = np.minimum(hook.w[both]   + A_assoc,  w_max)
     hook.w[hetero] = np.maximum(hook.w[hetero] - A_hetero, w_min)
     nest.SetStatus(hook.conns, "weight", hook.w.tolist())
@@ -2627,8 +2678,13 @@ def print_report(net, sim_ms, scale_label, ec_module=None, dg_module=None,
         # MC_HIGH should fire less than MC_LOW under equal drive (higher rheobase)
         r_low  = len(nest.GetStatus(dg_module.spk_mc_low,  "events")[0]["senders"]) / max(dg_module.N_mc_low, 1)
         r_high = len(nest.GetStatus(dg_module.spk_mc_high, "events")[0]["senders"]) / max(dg_module.N_mc_high, 1)
-        print(f"  MC_LOW/MC_HIGH spikes-per-cell ratio = {r_low/max(r_high,1e-9):.2f} "
-              f"(expect >1: MC_HIGH has the higher rheobase)")
+        if r_high > 0:
+            print(f"  MC_LOW/MC_HIGH spikes-per-cell ratio = {r_low/r_high:.2f} "
+                  f"(expect >1: MC_HIGH has the higher rheobase)")
+        else:
+            print(f"  MC_LOW/MC_HIGH: MC_HIGH silent (0 spikes) vs MC_LOW "
+                  f"{r_low:.3f} spikes/cell — consistent with its 4.97x higher "
+                  f"rheobase under equal drive")
 
         print("  Pattern separation (granule sparse coding):")
         overall = dg_pattern_separation_stats(dg_module, sim_ms)
@@ -3132,6 +3188,11 @@ Dentate gyrus (Phase 6.2):
         help="Add mPFC population receiving EC LV input (Phase 3 endpoint). "
              "Requires --ec-lv.")
     parser.add_argument(
+        "--no-mpfc-lateral-inh", action="store_true",
+        help="Disable mPFC lateral inhibition. Without it every mPFC cell fires "
+             "on every SWR, so the EC LV->mPFC association is non-selective and "
+             "no engram subset forms.")
+    parser.add_argument(
         "--no-mpfc-assoc", action="store_true",
         help="Disable the EC LV->mPFC associative (Hebbian) build-up that forms "
              "the cortical engram. By default --mpfc enables it; without it the "
@@ -3329,13 +3390,11 @@ Dentate gyrus (Phase 6.2):
                          else None),
         )
 
-    # ---- Optional Phase 2: STC hook initialisation ---------------------------
-    stc_hook = None
-    if args.stc and ec_module is not None:
-        print(">>> Initialising STC hook (Phase 2)...")
-        stc_hook = build_stc_hook(ec_module)
-
     # ---- Optional Phase 3: EC Layer V + mPFC ---------------------------------
+    # Built BEFORE the plasticity hooks: nest.GetConnections() descriptors are
+    # invalidated by any later Connect(), and NEST warns about exactly that.
+    # (Previously build_stc_hook ran first and its cached CA1->EC collection was
+    # invalidated by these two builds.)
     eclv_module  = None
     mpfc_module  = None
     if args.ec_lv and ec_module is not None:
@@ -3349,9 +3408,15 @@ Dentate gyrus (Phase 6.2):
             print(">>> Building mPFC module (Phase 3)...")
             mpfc_module = build_mpfc(
                 ec_lv_pop = eclv_module.population,
+                lateral_inhibition = not args.no_mpfc_lateral_inh,
             )
 
-    # ---- Cortical association build-up (EC LV -> mPFC Hebbian) --------------
+    # ---- Plasticity hooks: after ALL populations are wired -------------------
+    stc_hook = None
+    if args.stc and ec_module is not None:
+        print(">>> Initialising STC hook (Phase 2)...")
+        stc_hook = build_stc_hook(ec_module)
+
     mpfc_assoc_hook = None
     if mpfc_module is not None and eclv_module is not None and not args.no_mpfc_assoc:
         print(">>> Initialising mPFC association hook...")
