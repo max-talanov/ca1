@@ -111,29 +111,32 @@ inhibition-dominated and is not an autonomous attractor without it.
 
 A replay-gated Hebbian hook potentiates EC LV→mPFC synapses when an SWR
 co-activates both ends, with weak heterosynaptic depression when the target
-fires without the source.
+fires without the source. mPFC also has a k-winners-take-all interneuron loop
+(pyramidal → FS → pyramidal), mirroring the DG.
 
-Selectivity required giving mPFC the same k-winners-take-all motif the DG uses
-(pyramidal → FS interneuron → pyramidal). Without it every mPFC cell fired on
-every SWR, so all 2 400 synapses potentiated together — association without an
-engram (final weight std 0.0018, 100 % "associated"). With it, over 8 replay
-events at 1 %:
+**The association builds, but it is not yet an engram.** Weights grow steadily
+(1.00 → 1.10 over 12 replay events at 1 %), but every synapse moves together:
+the final weight distribution has a **single unique value**, CV = 0.0000.
 
-| event | co-active synapses | associated |
-|---|---|---|
-| 2 | 2 400 | 100 % |
-| 6 | 380 | 40 % |
-| 8 | 2 400 | **37.5 %** |
+The cause is upstream of mPFC, so lateral inhibition cannot fix it. EC LV fires
+**all-or-nothing** per SWR window — 600/600 cells or 0/600 — so every mPFC cell
+receives identical drive and the winners-take-all loop has no differences to
+amplify. mPFC correspondingly fires 120/120 or 0/120. A genuine engram needs
+pattern-specific activity to survive the CA1→EC→mPFC path so that different
+replayed sequences recruit different cortical subsets.
 
-A distinct **subset** now carries the association while mPFC stays active
-(3.6 Hz) — competition, not silencing. `--no-mpfc-lateral-inh` and
-`--no-mpfc-assoc` disable each half for controls.
+> An earlier version of this section reported "37.5 % of synapses associated"
+> as evidence of a selective engram. That was wrong: `frac_associated` compares
+> uniform weights against a threshold that moves with event count, so it can
+> report an apparent fraction while every synapse is identical. Weight CV is
+> the honest test and is now what the report and HDF5 record.
 
 ## Open items
 
-- **Engram selectivity at scale.** 37.5 % of LV→mPFC synapses associate at 1 %;
-  whether the subset sharpens further at 12 % (more cells, more competition)
-  is untested.
+- **Cortical selectivity.** EC LII/LV and mPFC fire as whole populations per
+  SWR, so the cortical association is uniform rather than a sparse engram
+  (§6). Fixing this needs pattern-specific propagation through CA1→EC, not
+  more inhibition at the mPFC end.
 - **SWR generators fire only in epoch 0.** They are created once with absolute
   times, so in an *n*-epoch run epochs 1…*n*−1 tag on background activity
   rather than on replay. Replay scoring is unaffected (it reads epoch 0).

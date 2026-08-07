@@ -1953,9 +1953,28 @@ def build_mpfc(
         MPFC_INT = nest.Create("izhikevich", N_int,
                                params=dict(a=0.10, b=0.2, c=-65.0, d=2.0,
                                            V_m=-65.0, U_m=-13.0, I_e=0.0))
-        # in-degrees clamped to the (small) cortical populations
+        # In-degrees must be SCALE-INVARIANT, like every other in-degree in this
+        # model. K_ie was originally N_int//2, which grows with the population:
+        # 12 at 1% but 144 at 12%. Because the volley is synchronous, the
+        # instantaneous hyperpolarisation is K_ie*|w_mpfc_ie| -- 84 mV at 1%
+        # (fine, mPFC 3.6 Hz) but 1008 mV at 12%, which is PATHOLOGICAL for an
+        # Izhikevich neuron: driven far enough negative the 0.04*v^2 term
+        # dominates and depolarises the cell, so excess inhibition causes
+        # runaway firing instead of silence. Measured on an isolated RS cell
+        # with no excitation, a periodic synchronous volley alone gives:
+        #     84 mV -> 0 Hz,  200 mV -> 0 Hz,  500 mV -> 49 Hz,  1008 mV -> 49 Hz
+        # and in the 12% network mPFC saturated at 302 Hz with all 1,440 cells
+        # within 3 spikes of each other. Fixed values reproduce the validated
+        # 1% configuration at every scale.
         K_ei = max(1, min(50, N_pfc))
-        K_ie = max(1, min(max(1, N_int // 2), N_int))
+        K_ie = max(1, min(12, N_int))
+        if K_ie * abs(w_mpfc_ie) > 200.0:
+            warnings.warn(
+                f"[MPFCModule] synchronous inhibitory amplitude "
+                f"K_ie*|w| = {K_ie*abs(w_mpfc_ie):.0f} mV exceeds the ~200 mV "
+                f"point where Izhikevich neurons start spiking FROM inhibition "
+                f"(quadratic term). Reduce K_ie or w_mpfc_ie.",
+                RuntimeWarning, stacklevel=2)
         fixed_connect(MPFC,     MPFC_INT, K_ei, w_mpfc_ei, 1.5)
         fixed_connect(MPFC_INT, MPFC,     K_ie, w_mpfc_ie, 1.5)
         spk_int = nest.Create("spike_recorder")
@@ -2896,6 +2915,18 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                 g_pfc.create_dataset("rate",
                     data=(counts_pfc/(bin_ms/1e3)/max(mpfc_module.N,1)).astype(np.float32))
                 h5.attrs["mpfc_present"] = True
+                # mPFC interneurons: without these the lateral-inhibition
+                # loop is invisible in the output, which is what made the
+                # 12% mPFC saturation hard to diagnose from the file alone.
+                if getattr(mpfc_module, "INT", None) is not None:
+                    t_i, s_i = _gather_spikes(*_get_spikes(mpfc_module.spk_int))
+                    g_i = h5.create_group("mpfc_int")
+                    g_i.attrs["n_cells"] = mpfc_module.N_int
+                    g_i.create_dataset("spk_times",   data=t_i.astype(np.float32), **compress)
+                    g_i.create_dataset("spk_senders", data=s_i.astype(np.int32),   **compress)
+                    c_i, _ = np.histogram(t_i, bins=edges)
+                    g_i.create_dataset("rate",
+                        data=(c_i/(bin_ms/1e3)/max(mpfc_module.N_int,1)).astype(np.float32))
 
         # --- cortical association build-up (EC LV -> mPFC) -------------------
         if mpfc_assoc_hook is not None and mpfc_assoc_hook.history:
@@ -2911,6 +2942,7 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
             for key, dt in (("n_coactive", np.int32), ("n_hetero", np.int32),
                             ("w_mean", np.float32), ("n_associated", np.int32),
                             ("frac_associated", np.float32),
+                            ("w_cv", np.float32),
                             ("t_swr_start", np.float32)):
                 ag.create_dataset(key, data=np.array([r[key] for r in hist], dtype=dt))
             ag.create_dataset("w_final", data=mpfc_assoc_hook.w.astype(np.float32),
@@ -3598,16 +3630,28 @@ Dentate gyrus (Phase 6.2):
     if mpfc_assoc_hook is not None and mpfc_assoc_hook.history:
         h = mpfc_assoc_hook.history
         print(f"\n--- Cortical association build-up (EC LV -> mPFC) ---")
-        print(f"  {'event':>6s} {'co-active':>10s} {'w_mean':>8s} {'associated':>11s}")
+        print(f"  {'event':>6s} {'co-active':>10s} {'w_mean':>8s} {'CV':>8s}")
         for i, r in enumerate(h):
             if i < 3 or i >= len(h) - 3:
                 print(f"  {i+1:6d} {r['n_coactive']:10,d} {r['w_mean']:8.4f} "
-                      f"{r['frac_associated']*100:10.1f}%")
+                      f"{r.get('w_cv', 0.0):8.4f}")
             elif i == 3:
                 print(f"  {'...':>6s}")
-        print(f"  weights {h[0]['w_mean']:.4f} -> {h[-1]['w_mean']:.4f}  "
-              f"| engram: {h[-1]['frac_associated']*100:.1f}% of LV->mPFC "
-              f"synapses associated after {len(h)} replay events")
+        cv = h[-1].get('w_cv', 0.0)
+        print(f"  weights {h[0]['w_mean']:.4f} -> {h[-1]['w_mean']:.4f} over "
+              f"{len(h)} replay events")
+        # Weight CV is the honest engram test: an engram potentiates a SUBSET,
+        # so the distribution must SPREAD. frac_associated alone is misleading --
+        # it compares uniform weights against a moving threshold and can report
+        # an apparent fraction even when every synapse is identical.
+        if cv < 0.02:
+            print(f"  [FLAG] weight CV={cv:.4f} — association is NON-SELECTIVE: every")
+            print(f"         LV->mPFC synapse moved together, so no engram subset exists.")
+            print(f"         Cause is upstream, not the mPFC: EC LV fires all-or-nothing")
+            print(f"         per SWR, so every mPFC cell receives identical drive and")
+            print(f"         lateral inhibition has no differences to amplify.")
+        else:
+            print(f"  [OK] weight CV={cv:.4f} — a distinct subset is potentiated (engram).")
 
     print_report(net, total_sim_ms, cfg["label"],
                  ec_module=ec_module, dg_module=dg_module,
