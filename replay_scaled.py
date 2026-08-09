@@ -626,6 +626,12 @@ def build_replay_network(
     # Parallel
     n_threads=8,
     seed_connect=42,  # RNG seed for V_m heterogeneity + connectivity
+    # Multi-pattern replay. n_patterns > 1 partitions the CA3 sequence groups
+    # into disjoint interleaved assemblies, one replayed per epoch, so that
+    # downstream selectivity ("engram for A but not B") becomes measurable.
+    # n_epochs/epoch_ms are needed here because SWR generators and scaffolds
+    # carry ABSOLUTE times and must be created for every epoch.
+    n_patterns=1, n_epochs=1, epoch_ms=1000.0,
     # Phase 6.2: when a real DG circuit (--dg) drives CA3 via mossy fibres,
     # the Poisson DG proxy on CA3 SUP/DEEP is suppressed so drive is not
     # double-counted. The EC and background CA3 drives are kept -- they model
@@ -793,7 +799,19 @@ def build_replay_network(
     # SWR event generators
     # -------------------------------------------------------------------------
     print("  Connecting SWR generators...")
-    for swr_s, swr_e in [(swr_fwd_start, swr_fwd_stop), (swr_rev_start, swr_rev_stop)]:
+    # NOTE: the sharp-wave/ripple BACKGROUND is created for epoch 0 only.
+    # Repeating it per epoch was tried and is prohibitively expensive: each
+    # window needs ~16k sinusoidal_poisson_generators (one per neuron across
+    # CA3+CA1), and NEST steps every generator at every one of the ~60k
+    # timesteps whether or not it is inside its start/stop window. At 6 epochs
+    # that is ~195k generators / ~1e10 node updates — a 1% run that normally
+    # takes ~7 min had not finished after 3 hours.
+    # The per-epoch REPLAY (trigger + staggered scaffold, below) is ~10x
+    # cheaper and is what carries pattern identity, so that is repeated per
+    # epoch instead. Making the ripple background per-epoch cheaply would need
+    # inhomogeneous_poisson_generator (one node, scheduled rate profile).
+    for swr_s, swr_e in [(swr_fwd_start, swr_fwd_stop),
+                         (swr_rev_start, swr_rev_stop)]:
         sw_sh_sup, sw_rip_sup = make_swr_event_generators(
             n=N_ca3_sup, start_ms=swr_s, stop_ms=swr_e,
             sharpwave_rate=swr_sharpwave_rate,
@@ -915,33 +933,64 @@ def build_replay_network(
     # ---- Replay triggers and scaffold ---------------------------------------
     print("  Connecting replay triggers and scaffold...")
 
-    # Auto-compute scaffold step so ALL n_seq_groups fit within the SWR window.
-    # We use 85% of the window so the last group still fires 15% before window end,
-    # leaving time for Schaffer → CA1 propagation.
+    # ---- Pattern definitions -------------------------------------------------
+    # An engram is only meaningful if there is more than one thing to remember:
+    # "selective" means selective for A rather than B. With a single stored
+    # sequence, uniform potentiation downstream is the CORRECT outcome, and no
+    # selectivity metric can say anything. n_patterns partitions the CA3
+    # sequence groups into that many disjoint assemblies, each replayed in its
+    # own SWR events, so cortical discrimination becomes measurable.
+    patterns = [list(range(n_seq_groups))] if n_patterns <= 1 else [
+        list(range(i, n_seq_groups, n_patterns)) for i in range(n_patterns)
+    ]
+    # Interleaved (stride) rather than contiguous blocks so the assemblies are
+    # spatially intermingled in CA3 — a contiguous split would let downstream
+    # cells discriminate on gross topography rather than on assembly identity.
+    gs_per_pattern = min(len(p) for p in patterns)
+    if n_patterns > 1:
+        print(f"    {n_patterns} patterns x ~{gs_per_pattern} groups each "
+              f"(interleaved); each SWR epoch replays one pattern in turn")
+
+    # Auto-compute scaffold step so one pattern's groups fit within the SWR
+    # window. We use 85% of the window so the last group still fires 15% before
+    # window end, leaving time for Schaffer → CA1 propagation.
     if scaffold_step_ms is None:
-        raw_step = (swr_fwd_stop - swr_fwd_start) * 0.85 / n_seq_groups
+        raw_step = (swr_fwd_stop - swr_fwd_start) * 0.85 / max(gs_per_pattern, 1)
         # Round to nearest 0.1 ms: NEST requires start times to be exact
         # multiples of the resolution.  120*0.85/35 = 2.9142... fails.
         scaffold_step_ms = round(raw_step, 1)
     print(f"    scaffold_step_ms={scaffold_step_ms:.1f}  "
-          f"(total span = {scaffold_step_ms * n_seq_groups:.1f} ms, "
+          f"(span = {scaffold_step_ms * gs_per_pattern:.1f} ms, "
           f"SWR window = {swr_fwd_stop - swr_fwd_start:.0f} ms)")
-    if trigger_on:
-        make_replay_trigger(ca3_sup_groups[0],  swr_fwd_start,
-                            trigger_dur_ms=trigger_dur_ms,
-                            trigger_rate=trigger_rate, weight=trigger_weight)
-        make_replay_trigger(ca3_sup_groups[-1], swr_rev_start,
-                            trigger_dur_ms=trigger_dur_ms,
-                            trigger_rate=trigger_rate, weight=trigger_weight)
-    if scaffold_on:
-        make_staggered_replay_drive(
-            ca3_sup_groups, swr_fwd_start, direction="forward",
-            inter_step_ms=scaffold_step_ms, drive_rate=scaffold_rate,
-            drive_dur_ms=scaffold_dur_ms, weight=scaffold_weight)
-        make_staggered_replay_drive(
-            ca3_sup_groups, swr_rev_start, direction="reverse",
-            inter_step_ms=scaffold_step_ms, drive_rate=scaffold_rate,
-            drive_dur_ms=scaffold_dur_ms, weight=scaffold_weight)
+
+    # ---- Per-epoch replay ----------------------------------------------------
+    # The replay drive IS created for every epoch (unlike the ripple background
+    # above). Previously it carried absolute times from epoch 0 only, so in an
+    # n-epoch run epochs 1..n-1 contained no replay at all and the STC hook
+    # tagged on background activity. Each epoch now replays
+    # patterns[epoch % n_patterns], which is also what lets different patterns
+    # occupy different epochs so downstream selectivity can be measured.
+    epoch_pattern = []
+    for ep in range(max(1, n_epochs)):
+        t0_ep = ep * epoch_ms
+        pat   = patterns[ep % len(patterns)]
+        epoch_pattern.append(ep % len(patterns))
+        grp   = [ca3_sup_groups[i] for i in pat]
+        f_s, r_s = t0_ep + swr_fwd_start, t0_ep + swr_rev_start
+        if trigger_on:
+            make_replay_trigger(grp[0],  f_s, trigger_dur_ms=trigger_dur_ms,
+                                trigger_rate=trigger_rate, weight=trigger_weight)
+            make_replay_trigger(grp[-1], r_s, trigger_dur_ms=trigger_dur_ms,
+                                trigger_rate=trigger_rate, weight=trigger_weight)
+        if scaffold_on:
+            make_staggered_replay_drive(
+                grp, f_s, direction="forward",
+                inter_step_ms=scaffold_step_ms, drive_rate=scaffold_rate,
+                drive_dur_ms=scaffold_dur_ms, weight=scaffold_weight)
+            make_staggered_replay_drive(
+                grp, r_s, direction="reverse",
+                inter_step_ms=scaffold_step_ms, drive_rate=scaffold_rate,
+                drive_dur_ms=scaffold_dur_ms, weight=scaffold_weight)
 
     # ---- Recorders ----------------------------------------------------------
     spk_ca1_pyr      = nest.Create("spike_recorder")
@@ -1031,6 +1080,7 @@ def build_replay_network(
         CA3_PYR=CA3_SUP, CA3_INT=CA3_INT_SUP,
         spk_ca3_pyr=spk_ca3_sup, spk_ca3_int=spk_ca3_int_sup,
         vm=vm,
+        patterns=patterns, epoch_pattern=epoch_pattern, n_patterns=len(patterns),
         ca3_seq_groups=ca3_sup_groups, ca3_sup_groups=ca3_sup_groups,
         ca3_deep_groups=ca3_deep_groups, n_seq_groups=n_seq_groups,
         swr_on=True,
@@ -2124,6 +2174,82 @@ def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
     return rec
 
 
+def pattern_discrimination(net, pops, swr_fwd, swr_rev, epoch_ms, n_epochs):
+    """Do different replayed patterns recruit different downstream cells?
+
+    This is the operational definition of an engram in this model. For each
+    population it collects the set of cells active during the SWR windows of
+    every epoch, groups those sets by which pattern that epoch replayed, and
+    reports the Jaccard overlap BETWEEN patterns against the overlap WITHIN a
+    pattern (the same pattern replayed in different epochs).
+
+        within  high  and  between  low   -> discriminating representation
+        within ~= between                 -> no pattern identity downstream
+
+    Reporting `between` alone is not enough: trial-to-trial variability alone
+    could make it low. The within-pattern baseline is the control.
+    """
+    ep_pat = net.get("epoch_pattern") or [0]
+    out = {}
+    for label, pop, rec in pops:
+        gids = np.asarray(pop.tolist(), dtype=np.int64)
+        ev   = nest.GetStatus(rec, "events")[0]
+        t    = np.asarray(ev["times"]); s = np.asarray(ev["senders"])
+        # active-cell set per epoch (union of that epoch's two SWR windows)
+        sets = []
+        for ep in range(max(1, n_epochs)):
+            t0 = ep * epoch_ms
+            m = (((t >= t0 + swr_fwd[0]) & (t <= t0 + swr_fwd[1])) |
+                 ((t >= t0 + swr_rev[0]) & (t <= t0 + swr_rev[1])))
+            sets.append(set(int(x) for x in np.unique(s[m])))
+
+        def jac(a, b):
+            u = len(a | b)
+            return (len(a & b) / u) if u else float("nan")
+
+        within, between = [], []
+        for i in range(len(sets)):
+            for j in range(i + 1, len(sets)):
+                if not sets[i] and not sets[j]:
+                    continue
+                (within if ep_pat[i] == ep_pat[j] else between).append(
+                    jac(sets[i], sets[j]))
+        act = [len(x) / max(len(gids), 1) for x in sets if x]
+        out[label] = dict(
+            n_cells=len(gids),
+            mean_active_frac=float(np.mean(act)) if act else 0.0,
+            within=float(np.mean(within)) if within else float("nan"),
+            between=float(np.mean(between)) if between else float("nan"),
+        )
+        out[label]["separation"] = out[label]["within"] - out[label]["between"]
+    return out
+
+
+def print_pattern_discrimination(disc, n_patterns):
+    print(f"\n--- Pattern discrimination ({n_patterns} patterns) ---")
+    if n_patterns < 2:
+        print("  only 1 pattern stored — selectivity is undefined; "
+              "re-run with --n-patterns 2 or more")
+        return
+    print(f"  {'population':12s} {'active':>8s} {'within':>8s} {'between':>8s} "
+          f"{'separation':>11s}")
+    for label, d in disc.items():
+        print(f"  {label:12s} {d['mean_active_frac']*100:7.1f}% "
+              f"{d['within']:8.3f} {d['between']:8.3f} {d['separation']:11.3f}")
+    tail = list(disc.values())[-1] if disc else None
+    if tail and not np.isnan(tail["separation"]):
+        if tail["separation"] > 0.2:
+            print("  [OK] cortical representation DISCRIMINATES the patterns "
+                  "(within >> between) — an engram.")
+        else:
+            print("  [FLAG] within ~= between: the same cells fire for every "
+                  "pattern, so the\n         cortical representation carries no "
+                  "pattern identity. Either the\n         assemblies are not "
+                  "separated upstream, or identity is carried in\n         "
+                  "spike TIMING, which a rate/coincidence readout cannot see "
+                  "(-> delays + STDP).")
+
+
 def build_stc_hook(ec_module, w_init_override=None) -> STCHook:
     """
     Initialise the STC hook by fetching the CA1→EC SynapseCollection.
@@ -3165,6 +3291,12 @@ Dentate gyrus (Phase 6.2):
         help="DG scale as independent percent of the rat DG reference counts "
              "(1.2M granule cells etc.). Defaults to --scale if omitted.")
     parser.add_argument(
+        "--n-patterns", type=int, default=1, metavar="P",
+        help="Number of DISTINCT replay patterns (default 1). The CA3 sequence "
+             "groups are split into P interleaved assemblies, each replayed in "
+             "its own epochs. Needed for any engram/selectivity claim: with one "
+             "pattern there is nothing to be selective ABOUT.")
+    parser.add_argument(
         "--no-ec-dg-loop", action="store_true",
         help="Keep the EC LII->DG perforant path as a Poisson stand-in even when "
              "--ec-lii is present, leaving the EC->DG->CA3->CA1->EC loop OPEN. "
@@ -3390,6 +3522,9 @@ Dentate gyrus (Phase 6.2):
         n_seq_groups   = cfg["n_seq_groups"],
         n_threads      = n_threads,
         suppress_dg_drive = args.dg,   # real DG mossy fibres replace the proxy
+        n_patterns     = args.n_patterns,
+        n_epochs       = n_epochs,
+        epoch_ms       = SIM_MS,
     )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
@@ -3624,9 +3759,19 @@ Dentate gyrus (Phase 6.2):
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
         raise SystemExit(0)
 
-    # total_sim_ms, not SIM_MS: with --stc the run is n_swr epochs long, and
-    # passing the per-epoch duration inflated every reported rate by n_swr
-    # (the HDF5 stats were always correct — they already use total_sim_ms).
+    if args.n_patterns > 1:
+        _pops = [("CA3 SUP", net["CA3_SUP"], net["spk_ca3_sup"]),
+                 ("CA1 PYR", net["PYR"],     net["spk_pyr"])]
+        if ec_module   is not None:
+            _pops.append(("EC LII", ec_module.population,   ec_module.spike_rec))
+        if eclv_module is not None:
+            _pops.append(("EC LV",  eclv_module.population, eclv_module.spike_rec))
+        if mpfc_module is not None:
+            _pops.append(("mPFC",   mpfc_module.population, mpfc_module.spike_rec))
+        _disc = pattern_discrimination(net, _pops, swr_fwd, swr_rev,
+                                       SIM_MS, n_epochs)
+        print_pattern_discrimination(_disc, args.n_patterns)
+
     if mpfc_assoc_hook is not None and mpfc_assoc_hook.history:
         h = mpfc_assoc_hook.history
         print(f"\n--- Cortical association build-up (EC LV -> mPFC) ---")

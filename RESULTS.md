@@ -131,15 +131,64 @@ replayed sequences recruit different cortical subsets.
 > report an apparent fraction while every synapse is identical. Weight CV is
 > the honest test and is now what the report and HDF5 record.
 
+## 7. Pattern discrimination — why the engram needs a temporal code
+
+An engram is only meaningful with more than one thing to remember: "selective"
+means selective for A rather than B. `--n-patterns P` splits the CA3 sequence
+groups into P interleaved assemblies, each replayed in its own epochs, making
+downstream selectivity measurable for the first time.
+
+**Cortex does not discriminate the patterns.** Jaccard overlap of the active-cell
+set, within-pattern (same pattern, different epochs) vs between-pattern:
+
+| population | active | within | between | separation |
+|---|---|---|---|---|
+| CA3 SUP | 98.3 % | 0.968 | 0.967 | 0.001 |
+| CA1 PYR | 49.3 % | 0.290 | 0.288 | 0.002 |
+| EC LII | 46.9 % | 0.145 | 0.202 | −0.057 |
+| EC LV | 71.0 % | 0.507 | 0.478 | 0.028 |
+| mPFC | 86.1 % | 0.117 | 0.226 | −0.110 |
+
+**But the patterns are strongly encoded in CA3 — in spike timing.** Correlating
+the per-group *activation-time* profile across epochs, versus the per-group
+*active-cell-count* profile:
+
+| code | within | between | separation |
+|---|---|---|---|
+| **timing** (when each group fires) | **+0.954** | **−0.114** | **+1.069** |
+| identity (how many cells fire) | +0.745 | +0.242 | +0.503 |
+
+Timing discriminates the two patterns almost perfectly and ~2× better than
+identity. The same conclusion follows from the replay score itself, which is a
+timing measure (ρ = +0.72 / −0.55) and works fine.
+
+So the information is present and temporal; what loses it is the readout. Every
+projection in the model uses a **single scalar delay** (`d_fast=1.5`,
+`d_slow=3.0`, `delay_ca1_ec=3.0`, `delay_lv_mpfc=8.0`), so all spikes arrive
+simultaneously and timing carries nothing downstream — and the association hook
+is a window-coincidence rule, which is blind to timing by construction.
+
+This is the empirical case for a **polychronization**-style temporal code
+(Izhikevich 2006): per-synapse delay heterogeneity plus STDP, so that a
+polychronous group — a directed graph of (neuron, delay) edges — becomes the
+carrier of pattern identity. It also motivates the cheaper complement: sparser,
+more topographic Schaffer connectivity so identity survives CA3→CA1.
+
 ## Open items
 
-- **Cortical selectivity.** EC LII/LV and mPFC fire as whole populations per
-  SWR, so the cortical association is uniform rather than a sparse engram
-  (§6). Fixing this needs pattern-specific propagation through CA1→EC, not
-  more inhibition at the mPFC end.
-- **SWR generators fire only in epoch 0.** They are created once with absolute
-  times, so in an *n*-epoch run epochs 1…*n*−1 tag on background activity
-  rather than on replay. Replay scoring is unaffected (it reads epoch 0).
+- **Cortical selectivity → temporal code.** Pattern identity is carried in CA3
+  spike timing but every projection uses a single fixed delay, so it cannot
+  propagate (§7). Next step: per-synapse delay heterogeneity + STDP on the
+  cortical projections (polychronization), and/or sparser Schaffer
+  connectivity.
+- **Ripple background is still epoch-0 only.** The replay drive (trigger +
+  staggered scaffold) now repeats every epoch, so epochs 1…*n*−1 do contain
+  real replay. The sharp-wave/ripple *background* does not: repeating it needs
+  ~16 k `sinusoidal_poisson_generator`s per window (one per neuron across
+  CA3+CA1), and NEST steps every generator at every timestep regardless of its
+  start/stop — at 6 epochs that is ~211 k generators and a 1 % run had not
+  finished after 3 h. Doing it cheaply needs
+  `inhomogeneous_poisson_generator` (one node, scheduled rate profile).
 - **EC LII→DG loop gain** is set by synchrony, not mean rate: EC fires in
   SWR-locked bursts, so K·w must stay well under the 20 mV granule
   rest→threshold gap or the loop saturates DG. Validated at 1 %; 12 % pending.
