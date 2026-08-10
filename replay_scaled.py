@@ -365,6 +365,27 @@ def _preflight_conn_check(pre_size: int, post_size: int, indegree: int, label: s
     _conn_count_per_vp["static_synapse"] = after
 
 
+def jittered_delay(base, jitter, lo=0.5):
+    """Per-synapse delay: scalar when jitter<=0, else uniform(base-j, base+j).
+
+    Axonal conduction delays are heterogeneous in reality, and the homogeneity
+    here is load-bearing: with one delay per projection every downstream neuron
+    integrates its inputs with ZERO temporal differentiation, so the timing
+    structure that carries pattern identity in CA3 averages out at each hop
+    (measured cell-level separation CA3 +0.143 -> CA1 +0.063 -> EC ~0).
+    Heterogeneous delays make different post neurons sensitive to different
+    input timings, which is the substrate a polychronous group needs
+    (Izhikevich 2006).
+
+    Applied only to FEEDFORWARD readout projections. The CA3 sequence chain
+    keeps its scalar d_seq: that delay is tuned against the scaffold step and
+    randomising it would break replay itself rather than test transmission.
+    """
+    if jitter is None or jitter <= 0:
+        return float(base)
+    return nest.random.uniform(min=max(lo, base - jitter), max=base + jitter)
+
+
 def fixed_connect(pre, post, indegree, weight, delay):
     """
     NEST native fixed_indegree — C++, fully MPI-parallel.
@@ -382,7 +403,10 @@ def fixed_connect(pre, post, indegree, weight, delay):
     nest.Connect(
         pre_nc, post_nc,
         conn_spec={"rule": "fixed_indegree", "indegree": int(indegree)},
-        syn_spec={"weight": float(weight), "delay": float(delay)},
+        # delay may be a scalar OR a NEST parameter (e.g. nest.random.uniform)
+        # for per-synapse heterogeneity -- see jittered_delay().
+        syn_spec={"weight": float(weight),
+                  "delay": float(delay) if isinstance(delay, (int, float)) else delay},
     )
 
 
@@ -632,6 +656,10 @@ def build_replay_network(
     # n_epochs/epoch_ms are needed here because SWR generators and scaffolds
     # carry ABSOLUTE times and must be created for every epoch.
     n_patterns=1, n_epochs=1, epoch_ms=1000.0,
+    # Phase C: per-synapse delay jitter (ms) on the FEEDFORWARD readout
+    # projections (Schaffer, and the cortical hops in the modules). 0 = the
+    # original single-scalar delays. See jittered_delay().
+    delay_jitter=0.0,
     # Phase 6.2: when a real DG circuit (--dg) drives CA3 via mossy fibres,
     # the Poisson DG proxy on CA3 SUP/DEEP is suppressed so drive is not
     # double-counted. The EC and background CA3 drives are kept -- they model
@@ -914,8 +942,9 @@ def build_replay_network(
     print("  Wiring Schaffer collaterals (fixed_indegree)...")
     t_sch = time.perf_counter()
 
-    fixed_connect(CA3_SUP,  CA1_PYR,    K("schaffer_sup_pyr",     N_ca3_sup),  w_schaffer_sup_pyr,    d_slow)
-    fixed_connect(CA3_DEEP, CA1_PYR,    K("schaffer_deep_pyr",    N_ca3_deep), w_schaffer_deep_pyr,   d_slow)
+    _d_sch = jittered_delay(d_slow, delay_jitter)
+    fixed_connect(CA3_SUP,  CA1_PYR,    K("schaffer_sup_pyr",     N_ca3_sup),  w_schaffer_sup_pyr,    _d_sch)
+    fixed_connect(CA3_DEEP, CA1_PYR,    K("schaffer_deep_pyr",    N_ca3_deep), w_schaffer_deep_pyr,   _d_sch)
     fixed_connect(CA3_SUP,  CA1_BASKET, K("schaffer_sup_basket",  N_ca3_sup),  w_schaffer_sup_basket, d_fast)
     fixed_connect(CA3_DEEP, CA1_BASKET, K("schaffer_deep_basket", N_ca3_deep), w_schaffer_deep_basket,d_fast)
     print(f"    done in {time.perf_counter()-t_sch:.1f}s")
@@ -1665,6 +1694,7 @@ def build_ec_lii(
     K_ca1_ec     : int   = 50,
     w_ca1_ec     : float = 1.0,
     delay_ca1_ec : float = 3.0,   # axonal conduction delay CA1→EC [ms]
+    delay_jitter : float = 0.0,   # per-synapse jitter (Phase C); 0 = scalar
     rate_bg      : float = 0.0,   # EC background Poisson drive set to ZERO.
                                    # CA1→EC K=50 inputs at 7.5 Hz provides 375 Hz
                                    # of drive → EC fires at ~5-8 Hz from CA1 alone.
@@ -1746,7 +1776,7 @@ def build_ec_lii(
         conn_spec={"rule": "fixed_indegree", "indegree": K},
         syn_spec={"synapse_model": "static_synapse",
                   "weight": float(w_ca1_ec),
-                  "delay":  float(delay_ca1_ec)},
+                  "delay":  jittered_delay(delay_ca1_ec, delay_jitter)},
     )
     dt_conn = time.perf_counter() - t_conn
 
@@ -1866,6 +1896,7 @@ def build_ec_lv(
     delay_ca1  : float = 3.0,   # ms  — CA1→EC conduction
     delay_eclii: float = 2.0,   # ms  — within-EC
     delay_ca3  : float = 5.0,   # ms  — EC→CA3 feedback (longer, angular bundle)
+    delay_jitter: float = 0.0,  # per-synapse jitter (Phase C); 0 = scalar
 ) -> "ECLVModule":
     """
     Build EC Layer V population and wire it into the hippocampo-cortical loop.
@@ -1908,7 +1939,7 @@ def build_ec_lv(
     nest.Connect(ca1_pyr, EC_LV,
                  conn_spec={"rule": "fixed_indegree", "indegree": K1},
                  syn_spec={"synapse_model": "static_synapse",
-                           "weight": float(w_ca1_lv), "delay": float(delay_ca1)})
+                           "weight": float(w_ca1_lv), "delay": jittered_delay(delay_ca1, delay_jitter)})
     print(f"  [ECLVModule] CA1→LV: {N_lv*K1:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
     # EC LII → EC LV  (within-EC feedforward)
@@ -1917,7 +1948,7 @@ def build_ec_lv(
     nest.Connect(ec_lii_pop, EC_LV,
                  conn_spec={"rule": "fixed_indegree", "indegree": K2},
                  syn_spec={"synapse_model": "static_synapse",
-                           "weight": float(w_eclii_lv), "delay": float(delay_eclii)})
+                           "weight": float(w_eclii_lv), "delay": jittered_delay(delay_eclii, delay_jitter)})
     print(f"  [ECLVModule] ECLII→LV: {N_lv*K2:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
     # EC LV → CA3 SUP feedback  (closes the hippocampo-cortical loop)
@@ -1949,6 +1980,7 @@ def build_mpfc(
     K_eclv_mpfc  : int   = 20,     # EC LV → mPFC in-degree
     w_eclv_mpfc  : float = 1.0,    # mV
     delay_lv_mpfc: float = 8.0,    # ms — longer cortico-cortical delay
+    delay_jitter : float = 0.0,    # per-synapse jitter (Phase C); 0 = scalar
     # Lateral inhibition — the same k-winners-take-all motif the DG uses
     # (GC->basket->GC) to turn dense input into a sparse code. Without it every
     # mPFC cell fires on every SWR, so every EC LV->mPFC synapse co-activates
@@ -1993,7 +2025,8 @@ def build_mpfc(
     nest.Connect(ec_lv_pop, MPFC,
                  conn_spec={"rule": "fixed_indegree", "indegree": K},
                  syn_spec={"synapse_model": "static_synapse",
-                           "weight": float(w_eclv_mpfc), "delay": float(delay_lv_mpfc)})
+                           "weight": float(w_eclv_mpfc),
+                           "delay": jittered_delay(delay_lv_mpfc, delay_jitter)})
     print(f"  [MPFCModule] LV→mPFC: {N_pfc*K:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
     # ---- Lateral inhibition: mPFC <-> FS interneurons --------------------
@@ -2215,11 +2248,54 @@ def pattern_discrimination(net, pops, swr_fwd, swr_rev, epoch_ms, n_epochs):
                 (within if ep_pat[i] == ep_pat[j] else between).append(
                     jac(sets[i], sets[j]))
         act = [len(x) / max(len(gids), 1) for x in sets if x]
+
+        # --- TIMING code -------------------------------------------------
+        # Identity (which cells fired) and timing (WHEN each cell fired) are
+        # different codes and must be measured separately: a successful
+        # temporal code is invisible to the set-overlap readout above. Per-cell
+        # mean spike time within each epoch's SWR windows, correlated across
+        # epochs, within-pattern vs between-pattern.
+        # Score each SWR window SEPARATELY and average. Pooling both windows
+        # into one per-cell mean mixes two events ~300 ms apart, and that offset
+        # dominates the correlation -- it diluted CA3's separation from +0.14 to
+        # +0.03 when first implemented that way.
+        act_gids = np.unique(s) if len(s) else np.array([], dtype=np.int64)
+        tw_in, tw_bt = [], []
+        for win in (swr_fwd, swr_rev):
+            tprofs = []
+            for ep in range(max(1, n_epochs)):
+                a_ms, b_ms = ep * epoch_ms + win[0], ep * epoch_ms + win[1]
+                v = np.full(len(act_gids), np.nan)
+                m = (t >= a_ms) & (t <= b_ms)
+                tw, sw = t[m], s[m]
+                if len(tw):
+                    o = np.argsort(sw, kind="stable"); sw_s, tw_s = sw[o], tw[o]
+                    uq, idx = np.unique(sw_s, return_index=True)
+                    ends = list(idx[1:]) + [len(sw_s)]
+                    for g, st, en in zip(uq, idx, ends):
+                        k = np.searchsorted(act_gids, g)
+                        if k < len(act_gids) and act_gids[k] == g:
+                            # relative to WINDOW onset, so windows are comparable
+                            v[k] = tw_s[st:en].mean() - a_ms
+                tprofs.append(v)
+            for i in range(len(tprofs)):
+                for j in range(i + 1, len(tprofs)):
+                    x, y = tprofs[i], tprofs[j]
+                    ok = np.isfinite(x) & np.isfinite(y)
+                    if ok.sum() < 4 or np.std(x[ok]) == 0 or np.std(y[ok]) == 0:
+                        continue
+                    c = float(np.corrcoef(x[ok], y[ok])[0, 1])
+                    (tw_in if ep_pat[i] == ep_pat[j] else tw_bt).append(c)
+        t_within  = float(np.mean(tw_in)) if tw_in else float("nan")
+        t_between = float(np.mean(tw_bt)) if tw_bt else float("nan")
+
         out[label] = dict(
             n_cells=len(gids),
             mean_active_frac=float(np.mean(act)) if act else 0.0,
             within=float(np.mean(within)) if within else float("nan"),
             between=float(np.mean(between)) if between else float("nan"),
+            t_within=t_within, t_between=t_between,
+            t_separation=t_within - t_between,
         )
         out[label]["separation"] = out[label]["within"] - out[label]["between"]
     return out
@@ -2231,23 +2307,33 @@ def print_pattern_discrimination(disc, n_patterns):
         print("  only 1 pattern stored — selectivity is undefined; "
               "re-run with --n-patterns 2 or more")
         return
-    print(f"  {'population':12s} {'active':>8s} {'within':>8s} {'between':>8s} "
-          f"{'separation':>11s}")
+    print(f"  {'':12s} {'':>8s} {'-- IDENTITY (which cells) --':>30s}   "
+          f"{'-- TIMING (when) --':>26s}")
+    print(f"  {'population':12s} {'active':>8s} {'within':>9s} {'between':>9s} "
+          f"{'sep':>9s}   {'within':>8s} {'between':>8s} {'sep':>8s}")
     for label, d in disc.items():
         print(f"  {label:12s} {d['mean_active_frac']*100:7.1f}% "
-              f"{d['within']:8.3f} {d['between']:8.3f} {d['separation']:11.3f}")
-    tail = list(disc.values())[-1] if disc else None
-    if tail and not np.isnan(tail["separation"]):
-        if tail["separation"] > 0.2:
-            print("  [OK] cortical representation DISCRIMINATES the patterns "
-                  "(within >> between) — an engram.")
-        else:
-            print("  [FLAG] within ~= between: the same cells fire for every "
-                  "pattern, so the\n         cortical representation carries no "
-                  "pattern identity. Either the\n         assemblies are not "
-                  "separated upstream, or identity is carried in\n         "
-                  "spike TIMING, which a rate/coincidence readout cannot see "
-                  "(-> delays + STDP).")
+              f"{d['within']:9.3f} {d['between']:9.3f} {d['separation']:9.3f}   "
+              f"{d.get('t_within', float('nan')):8.3f} "
+              f"{d.get('t_between', float('nan')):8.3f} "
+              f"{d.get('t_separation', float('nan')):8.3f}")
+    # Where does pattern information survive to? Report the deepest population
+    # that still discriminates by EITHER code -- the transmission question.
+    def _ok(d, key):
+        v = d.get(key, float("nan"))
+        return (not np.isnan(v)) and v > 0.10
+    deepest_id = [k for k, d in disc.items() if _ok(d, "separation")]
+    deepest_t  = [k for k, d in disc.items() if _ok(d, "t_separation")]
+    print(f"  discriminates by identity : {', '.join(deepest_id) if deepest_id else 'NONE'}")
+    print(f"  discriminates by timing   : {', '.join(deepest_t)  if deepest_t  else 'NONE'}")
+    cortical = {"EC LII", "EC LV", "mPFC"}
+    if cortical & (set(deepest_id) | set(deepest_t)):
+        print("  [OK] pattern information reaches CORTEX — an engram substrate exists.")
+    elif deepest_id or deepest_t:
+        print("  [FLAG] pattern information exists upstream but DIES before cortex.")
+        print("         Transmission, not encoding, is the bottleneck.")
+    else:
+        print("  [FLAG] no population discriminates the patterns by either code.")
 
 
 def build_stc_hook(ec_module, w_init_override=None) -> STCHook:
@@ -3291,6 +3377,14 @@ Dentate gyrus (Phase 6.2):
         help="DG scale as independent percent of the rat DG reference counts "
              "(1.2M granule cells etc.). Defaults to --scale if omitted.")
     parser.add_argument(
+        "--delay-jitter", type=float, default=0.0, metavar="MS",
+        help="Per-synapse axonal delay jitter (ms) on the feedforward readout "
+             "projections: Schaffer, CA1->EC LII/LV, EC LII->LV, EC LV->mPFC. "
+             "0 (default) keeps the original single scalar delay per projection. "
+             "Heterogeneous delays are the substrate for a temporal/polychronous "
+             "code; the CA3 sequence chain and EC LV->CA3 feedback stay scalar "
+             "because those delays are load-bearing for replay itself.")
+    parser.add_argument(
         "--n-patterns", type=int, default=1, metavar="P",
         help="Number of DISTINCT replay patterns (default 1). The CA3 sequence "
              "groups are split into P interleaved assemblies, each replayed in "
@@ -3525,6 +3619,7 @@ Dentate gyrus (Phase 6.2):
         n_patterns     = args.n_patterns,
         n_epochs       = n_epochs,
         epoch_ms       = SIM_MS,
+        delay_jitter   = args.delay_jitter,
     )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
@@ -3539,6 +3634,7 @@ Dentate gyrus (Phase 6.2):
             ca1_spike_rec = net["spk_pyr"],
             N_ec_lii      = N_ec_lii,
             K_ca1_ec      = args.ec_lii_k,
+            delay_jitter  = args.delay_jitter,
         )
 
     # ---- Optional Phase 6.2: dentate gyrus -----------------------------------
@@ -3570,12 +3666,14 @@ Dentate gyrus (Phase 6.2):
             ca1_pyr    = net["PYR"],
             ec_lii_pop = ec_module.population,
             ca3_sup    = net["CA3_SUP"],
+            delay_jitter = args.delay_jitter,
         )
         if args.mpfc:
             print(">>> Building mPFC module (Phase 3)...")
             mpfc_module = build_mpfc(
                 ec_lv_pop = eclv_module.population,
                 lateral_inhibition = not args.no_mpfc_lateral_inh,
+                delay_jitter = args.delay_jitter,
             )
 
     # ---- Plasticity hooks: after ALL populations are wired -------------------
