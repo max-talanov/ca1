@@ -666,6 +666,12 @@ def build_replay_network(
     # discrimination comparison. Scaling the jittered weights restores drive
     # so the two conditions can be compared at matched firing rates.
     delay_jitter_wcomp=1.0,
+    # Schaffer in-degree override. The default (3000, clamped to the CA3 SUP
+    # size) makes every CA1 cell sample essentially ALL of CA3 at small
+    # scales -- density 1.0 at 1% -- so every CA1 cell sees the same input
+    # and 12.1M synapses make a Python-side plasticity hook impractical.
+    # Weights are scaled by K_default/K so mean CA1 drive is preserved.
+    schaffer_k=None,
     # Phase 6.2: when a real DG circuit (--dg) drives CA3 via mossy fibres,
     # the Poisson DG proxy on CA3 SUP/DEEP is suppressed so drive is not
     # double-counted. The EC and background CA3 drives are kept -- they model
@@ -950,8 +956,21 @@ def build_replay_network(
 
     _d_sch = jittered_delay(d_slow, delay_jitter)
     _wc = delay_jitter_wcomp if delay_jitter > 0 else 1.0
-    fixed_connect(CA3_SUP,  CA1_PYR,    K("schaffer_sup_pyr",     N_ca3_sup),  w_schaffer_sup_pyr*_wc,  _d_sch)
-    fixed_connect(CA3_DEEP, CA1_PYR,    K("schaffer_deep_pyr",    N_ca3_deep), w_schaffer_deep_pyr*_wc, _d_sch)
+    _K_sup_def  = K("schaffer_sup_pyr",  N_ca3_sup)
+    _K_deep_def = K("schaffer_deep_pyr", N_ca3_deep)
+    if schaffer_k is not None:
+        _K_sup  = max(1, min(int(schaffer_k), N_ca3_sup))
+        _K_deep = max(1, min(int(round(schaffer_k * _K_deep_def / max(_K_sup_def, 1))),
+                             N_ca3_deep))
+        # preserve mean drive: fewer inputs, proportionally stronger
+        _sc_sup  = _K_sup_def  / _K_sup
+        _sc_deep = _K_deep_def / _K_deep
+        print(f"    Schaffer in-degree override: SUP {_K_sup_def}->{_K_sup} "
+              f"(w x{_sc_sup:.1f})  DEEP {_K_deep_def}->{_K_deep} (w x{_sc_deep:.1f})")
+    else:
+        _K_sup, _K_deep, _sc_sup, _sc_deep = _K_sup_def, _K_deep_def, 1.0, 1.0
+    fixed_connect(CA3_SUP,  CA1_PYR, _K_sup,  w_schaffer_sup_pyr*_wc*_sc_sup,   _d_sch)
+    fixed_connect(CA3_DEEP, CA1_PYR, _K_deep, w_schaffer_deep_pyr*_wc*_sc_deep, _d_sch)
     fixed_connect(CA3_SUP,  CA1_BASKET, K("schaffer_sup_basket",  N_ca3_sup),  w_schaffer_sup_basket, d_fast)
     fixed_connect(CA3_DEEP, CA1_BASKET, K("schaffer_deep_basket", N_ca3_deep), w_schaffer_deep_basket,d_fast)
     print(f"    done in {time.perf_counter()-t_sch:.1f}s")
@@ -2217,6 +2236,115 @@ def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
     return rec
 
 
+# ============================================================================
+# Schaffer STDP  (Phase C step 2 — selecting delay-matched paths)
+# ============================================================================
+#
+# Phase C step 1 showed that delay heterogeneity ALONE does not carry the CA3
+# timing code downstream (CA3 separation +0.20, everything cortical within
+# +/-0.06, across a +/-60% range of cortical firing rate). That is the expected
+# result: in Izhikevich (2006) it is STDP that SELECTS delay-matched paths --
+# delays are the substrate, STDP is the mechanism.
+#
+# This hook applies pair-based STDP to the Schaffer collateral, using each
+# synapse's OWN delay:
+#
+#     dt = (t_post - t_pre) - delay_ij
+#
+# A synapse is potentiated when its delay MATCHES the pre->post interval, i.e.
+# when its spike arrived just in time to help fire the postsynaptic cell. Since
+# every CA1 cell has a different random draw of delays, different cells come to
+# favour different temporal input patterns -- which is how a timing code gets
+# converted into a cell-identity code that downstream rate-based readouts can
+# actually see. This is the polychronous-group selection rule.
+#
+# It is applied at CA3->CA1 rather than at EC LV->mPFC because that is where
+# the signal still exists: the timing code is strong in CA3 (+0.20) and already
+# gone by CA1 (-0.06), so plasticity further downstream would have nothing to
+# learn from.
+
+@dataclass
+class SchafferSTDPHook:
+    conns    : object
+    w        : np.ndarray
+    delay    : np.ndarray     # per-synapse delay (ms) — the polychronization term
+    pre_g    : np.ndarray
+    post_g   : np.ndarray
+    w_init   : float
+    n_calls  : int = 0
+    history  : list = None
+
+
+def build_schaffer_stdp_hook(net) -> SchafferSTDPHook:
+    """Cache the CA3 SUP -> CA1 synapses, their weights AND their delays."""
+    import nest
+    t0 = time.perf_counter()
+    print("\n  [SchafferSTDP] Fetching CA3->CA1 synapses (weights + delays)...")
+    conns = nest.GetConnections(source=net["CA3_SUP"], target=net["PYR"])
+    n = len(conns)
+    w = np.array(nest.GetStatus(conns, "weight"), dtype=np.float32)
+    d = np.array(nest.GetStatus(conns, "delay"),  dtype=np.float32)
+    pg = np.array(nest.GetStatus(conns, "source"), dtype=np.int64)
+    qg = np.array(nest.GetStatus(conns, "target"), dtype=np.int64)
+    print(f"  [SchafferSTDP] {n:,} synapses in {time.perf_counter()-t0:.1f}s  "
+          f"delay {d.min():.1f}-{d.max():.1f} ms (spread is what STDP selects on)")
+    return SchafferSTDPHook(conns=conns, w=w, delay=d, pre_g=pg, post_g=qg,
+                            w_init=float(w.mean()) if n else 0.0, history=[])
+
+
+def run_schaffer_stdp_hook(hook, net, t_start, t_end,
+                           A_plus=0.008, A_minus=0.0055, tau=20.0,
+                           w_min=0.001, w_max=None):
+    """Delay-aware pair STDP over one SWR window."""
+    import nest
+    if w_max is None:
+        w_max = 5.0 * max(hook.w_init, 1e-6)
+
+    def last_spike(rec):
+        ev = nest.GetStatus(rec, "events")[0]
+        t = np.asarray(ev["times"]); s = np.asarray(ev["senders"])
+        m = (t >= t_start) & (t <= t_end)
+        t, s = t[m], s[m]
+        if not len(t):
+            return {}
+        o = np.argsort(s, kind="stable"); s, t = s[o], t[o]
+        uq, idx = np.unique(s, return_index=True)
+        ends = list(idx[1:]) + [len(s)]
+        # last spike in the window, matching the STC hook's convention
+        return {int(g): float(t[st:en].max()) for g, st, en in zip(uq, idx, ends)}
+
+    pre_t  = last_spike(net["spk_ca3_sup"])
+    post_t = last_spike(net["spk_pyr"])
+    if not pre_t or not post_t:
+        hook.n_calls += 1
+        hook.history.append(dict(n_pot=0, n_dep=0, w_mean=float(hook.w.mean()),
+                                 w_cv=float(hook.w.std()/max(hook.w.mean(),1e-9))))
+        return hook.history[-1]
+
+    tp = np.array([pre_t.get(int(g),  np.nan) for g in hook.pre_g],  dtype=np.float32)
+    tq = np.array([post_t.get(int(g), np.nan) for g in hook.post_g], dtype=np.float32)
+    ok = np.isfinite(tp) & np.isfinite(tq)
+
+    dw = np.zeros(len(hook.w), dtype=np.float32)
+    # THE polychronization term: subtract each synapse's own conduction delay,
+    # so dt is the arrival-vs-firing mismatch, not the raw soma-to-soma interval.
+    dt = (tq[ok] - tp[ok]) - hook.delay[ok]
+    pot = dt >= 0
+    d_ok = np.zeros(ok.sum(), dtype=np.float32)
+    d_ok[pot]  =  A_plus  * np.exp(-dt[pot] / tau)
+    d_ok[~pot] = -A_minus * np.exp( dt[~pot] / tau)
+    dw[ok] = d_ok
+    hook.w = np.clip(hook.w + dw, w_min, w_max)
+    nest.SetStatus(hook.conns, "weight", hook.w.tolist())
+
+    hook.n_calls += 1
+    rec = dict(n_pot=int((dw > 0).sum()), n_dep=int((dw < 0).sum()),
+               w_mean=float(hook.w.mean()),
+               w_cv=float(hook.w.std() / max(hook.w.mean(), 1e-9)))
+    hook.history.append(rec)
+    return rec
+
+
 def pattern_discrimination(net, pops, swr_fwd, swr_rev, epoch_ms, n_epochs):
     """Do different replayed patterns recruit different downstream cells?
 
@@ -3402,6 +3530,20 @@ Dentate gyrus (Phase 6.2):
              "comparison against the unjittered condition; this restores drive "
              "so the two can be compared at matched firing rates.")
     parser.add_argument(
+        "--schaffer-k", type=int, default=None, metavar="K",
+        help="Override the CA3->CA1 Schaffer in-degree. Weights are scaled by "
+             "K_default/K so mean CA1 drive is preserved. The default (3000, "
+             "clamped to CA3 size) gives density 1.0 at small scales -- every "
+             "CA1 cell sees all of CA3 -- and makes a plasticity hook on 12M "
+             "synapses impractical.")
+    parser.add_argument(
+        "--schaffer-stdp", action="store_true",
+        help="Apply delay-aware pair STDP to CA3->CA1 between SWR events "
+             "(Phase C step 2). dt = (t_post - t_pre) - delay_ij, so synapses "
+             "whose own delay MATCHES the pre->post interval are potentiated. "
+             "This is the mechanism that selects delay-matched paths; pair with "
+             "--delay-jitter, which supplies the delay spread to select on.")
+    parser.add_argument(
         "--n-patterns", type=int, default=1, metavar="P",
         help="Number of DISTINCT replay patterns (default 1). The CA3 sequence "
              "groups are split into P interleaved assemblies, each replayed in "
@@ -3638,6 +3780,7 @@ Dentate gyrus (Phase 6.2):
         epoch_ms       = SIM_MS,
         delay_jitter   = args.delay_jitter,
         delay_jitter_wcomp = args.delay_jitter_wcomp,
+        schaffer_k     = args.schaffer_k,
     )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
@@ -3655,6 +3798,11 @@ Dentate gyrus (Phase 6.2):
             delay_jitter  = args.delay_jitter,
             delay_jitter_wcomp = args.delay_jitter_wcomp,
         )
+
+    # ---- Phase C step 2: Schaffer STDP --------------------------------------
+    schaffer_hook = None
+    if args.schaffer_stdp:
+        schaffer_hook = build_schaffer_stdp_hook(net)
 
     # ---- Optional Phase 6.2: dentate gyrus -----------------------------------
     dg_module = None
@@ -3738,6 +3886,11 @@ Dentate gyrus (Phase 6.2):
                 current_t_ms  = current_t,
                 PRP_threshold = args.prp_threshold,
             )
+
+        if schaffer_hook is not None:
+            for _ws, _we in ((swr_fwd[0], swr_fwd[1]), (swr_rev[0], swr_rev[1])):
+                run_schaffer_stdp_hook(schaffer_hook, net,
+                                       epoch_t0 + _ws, epoch_t0 + _we)
 
         # Cortical association build-up: same two SWR windows, EC LV -> mPFC
         if mpfc_assoc_hook is not None:
@@ -3877,6 +4030,20 @@ Dentate gyrus (Phase 6.2):
     if rank != 0:
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
         raise SystemExit(0)
+
+    if schaffer_hook is not None and schaffer_hook.history:
+        h = schaffer_hook.history
+        print("\n--- Schaffer STDP (CA3->CA1, delay-aware) ---")
+        print(f"  {'event':>6s} {'potentiated':>12s} {'depressed':>10s} "
+              f"{'w_mean':>9s} {'w_CV':>8s}")
+        for i, r in enumerate(h):
+            if i < 2 or i >= len(h) - 2:
+                print(f"  {i+1:6d} {r['n_pot']:12,d} {r['n_dep']:10,d} "
+                      f"{r['w_mean']:9.4f} {r['w_cv']:8.4f}")
+            elif i == 2:
+                print(f"  {'...':>6s}")
+        print(f"  weight CV {h[0]['w_cv']:.4f} -> {h[-1]['w_cv']:.4f}  "
+              f"(rising CV = synapses differentiating, i.e. paths being selected)")
 
     if args.n_patterns > 1:
         _pops = [("CA3 SUP", net["CA3_SUP"], net["spk_ca3_sup"]),
