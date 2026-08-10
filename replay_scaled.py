@@ -2271,6 +2271,7 @@ class SchafferSTDPHook:
     pre_g    : np.ndarray
     post_g   : np.ndarray
     w_init   : float
+    mask     : np.ndarray = None   # True where source is CA3 SUP (the Schaffer subset)
     n_calls  : int = 0
     history  : list = None
 
@@ -2279,17 +2280,29 @@ def build_schaffer_stdp_hook(net) -> SchafferSTDPHook:
     """Cache the CA3 SUP -> CA1 synapses, their weights AND their delays."""
     import nest
     t0 = time.perf_counter()
-    print("\n  [SchafferSTDP] Fetching CA3->CA1 synapses (weights + delays)...")
-    conns = nest.GetConnections(source=net["CA3_SUP"], target=net["PYR"])
-    n = len(conns)
+    print("\n  [SchafferSTDP] Fetching CA1-incoming synapses...", flush=True)
+    # target= ONLY. Passing BOTH source and target makes NEST scan every synapse
+    # in the kernel to find matching pairs -- the same trap documented in
+    # build_stc_hook, and it did not finish in 10 min here. Scanning CA1's
+    # incoming slots is bounded by CA1's in-degree instead. The CA3->CA1 subset
+    # is then masked in numpy, and SetStatus writes the full collection back
+    # with unchanged values off-mask (the homeostasis hook does the same).
+    conns = nest.GetConnections(target=net["PYR"])
+    n_all = len(conns)
     w = np.array(nest.GetStatus(conns, "weight"), dtype=np.float32)
     d = np.array(nest.GetStatus(conns, "delay"),  dtype=np.float32)
     pg = np.array(nest.GetStatus(conns, "source"), dtype=np.int64)
     qg = np.array(nest.GetStatus(conns, "target"), dtype=np.int64)
-    print(f"  [SchafferSTDP] {n:,} synapses in {time.perf_counter()-t0:.1f}s  "
-          f"delay {d.min():.1f}-{d.max():.1f} ms (spread is what STDP selects on)")
+    ca3 = np.array(net["CA3_SUP"].tolist(), dtype=np.int64)
+    mask = np.isin(pg, ca3)
+    dm = d[mask]
+    print(f"  [SchafferSTDP] {n_all:,} CA1-incoming, {int(mask.sum()):,} from CA3 SUP "
+          f"in {time.perf_counter()-t0:.1f}s  delay {dm.min():.1f}-{dm.max():.1f} ms "
+          f"(the spread STDP selects on)", flush=True)
     return SchafferSTDPHook(conns=conns, w=w, delay=d, pre_g=pg, post_g=qg,
-                            w_init=float(w.mean()) if n else 0.0, history=[])
+                            mask=mask,
+                            w_init=float(w[mask].mean()) if mask.any() else 0.0,
+                            history=[])
 
 
 def run_schaffer_stdp_hook(hook, net, t_start, t_end,
@@ -2301,29 +2314,49 @@ def run_schaffer_stdp_hook(hook, net, t_start, t_end,
         w_max = 5.0 * max(hook.w_init, 1e-6)
 
     def last_spike(rec):
+        """(gids, last_spike_time) as sorted arrays, for vectorised lookup."""
         ev = nest.GetStatus(rec, "events")[0]
-        t = np.asarray(ev["times"]); s = np.asarray(ev["senders"])
+        t = np.asarray(ev["times"]); s = np.asarray(ev["senders"], dtype=np.int64)
         m = (t >= t_start) & (t <= t_end)
         t, s = t[m], s[m]
         if not len(t):
-            return {}
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
         o = np.argsort(s, kind="stable"); s, t = s[o], t[o]
         uq, idx = np.unique(s, return_index=True)
-        ends = list(idx[1:]) + [len(s)]
+        ends = np.append(idx[1:], len(s))
         # last spike in the window, matching the STC hook's convention
-        return {int(g): float(t[st:en].max()) for g, st, en in zip(uq, idx, ends)}
+        vals = np.array([t[st:en].max() for st, en in zip(idx, ends)],
+                        dtype=np.float32)
+        return uq, vals
 
-    pre_t  = last_spike(net["spk_ca3_sup"])
-    post_t = last_spike(net["spk_pyr"])
-    if not pre_t or not post_t:
+    def lookup(gids, vals, want):
+        """Vectorised gid -> value; NaN where the gid did not spike.
+
+        Must NOT be a Python dict comprehension over `want`: that is ~1M
+        interpreter-level lookups per population per SWR event, which dominated
+        the whole run when this hook was first written.
+        """
+        out = np.full(len(want), np.nan, dtype=np.float32)
+        if len(gids):
+            pos = np.searchsorted(gids, want)
+            pos_c = np.clip(pos, 0, len(gids) - 1)
+            hit = gids[pos_c] == want
+            out[hit] = vals[pos_c[hit]]
+        return out
+
+    pre_g_arr,  pre_v  = last_spike(net["spk_ca3_sup"])
+    post_g_arr, post_v = last_spike(net["spk_pyr"])
+    if not len(pre_g_arr) or not len(post_g_arr):
         hook.n_calls += 1
         hook.history.append(dict(n_pot=0, n_dep=0, w_mean=float(hook.w.mean()),
                                  w_cv=float(hook.w.std()/max(hook.w.mean(),1e-9))))
         return hook.history[-1]
 
-    tp = np.array([pre_t.get(int(g),  np.nan) for g in hook.pre_g],  dtype=np.float32)
-    tq = np.array([post_t.get(int(g), np.nan) for g in hook.post_g], dtype=np.float32)
+    tp = lookup(pre_g_arr,  pre_v,  hook.pre_g)
+    tq = lookup(post_g_arr, post_v, hook.post_g)
     ok = np.isfinite(tp) & np.isfinite(tq)
+    if hook.mask is not None:
+        ok &= hook.mask          # only the CA3->CA1 subset is plastic
 
     dw = np.zeros(len(hook.w), dtype=np.float32)
     # THE polychronization term: subtract each synapse's own conduction delay,
@@ -2338,9 +2371,11 @@ def run_schaffer_stdp_hook(hook, net, t_start, t_end,
     nest.SetStatus(hook.conns, "weight", hook.w.tolist())
 
     hook.n_calls += 1
+    _m = hook.mask if hook.mask is not None else slice(None)
+    _wm = hook.w[_m]
     rec = dict(n_pot=int((dw > 0).sum()), n_dep=int((dw < 0).sum()),
-               w_mean=float(hook.w.mean()),
-               w_cv=float(hook.w.std() / max(hook.w.mean(), 1e-9)))
+               w_mean=float(_wm.mean()),
+               w_cv=float(_wm.std() / max(abs(_wm.mean()), 1e-9)))
     hook.history.append(rec)
     return rec
 
