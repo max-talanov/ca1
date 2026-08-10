@@ -174,6 +174,43 @@ polychronous group — a directed graph of (neuron, delay) edges — becomes the
 carrier of pattern identity. It also motivates the cheaper complement: sparser,
 more topographic Schaffer connectivity so identity survives CA3→CA1.
 
+## 8. Phase C step 1 — delay heterogeneity alone is not sufficient
+
+`--delay-jitter MS` gives each synapse on the feedforward readout projections
+(Schaffer, CA1→EC LII/LV, EC LII→LV, EC LV→mPFC) its own delay, drawn uniformly
+around the projection's base value. The CA3 sequence chain and EC LV→CA3
+feedback stay scalar: those delays are load-bearing for replay *generation*, so
+jittering them would perturb the thing being measured.
+
+Controlled test at 1 %, 2 patterns × 4 replays (12 within-pattern pairs).
+`--delay-jitter-wcomp` scales the jittered weights, because spreading arrival
+times reduces coincident summation and lowers downstream rates — a confound
+that has to be controlled rather than ignored.
+
+| condition | CA3 | CA1 | EC LII | EC LV | mPFC |
+|---|---|---|---|---|---|
+| base, jitter 0 | **+0.200** | −0.057 | −0.033 | +0.052 | −0.037 |
+| jitter 4 ms, w×1.0 | **+0.210** | +0.032 | −0.024 | −0.060 | — |
+| jitter 4 ms, w×1.5 | **+0.206** | +0.001 | +0.025 | −0.014 | +0.032 |
+
+(timing separation = within-pattern minus between-pattern correlation)
+
+CA3 is unchanged across all three (+0.200 / +0.210 / +0.206), confirming the
+manipulation is correctly targeted — replay generation is untouched. But no
+condition produces downstream discrimination: every cortical value sits in
+±0.06, i.e. noise.
+
+The rate confound is **bracketed** rather than exactly matched: w×1.0 leaves
+cortex at 87–89 % of baseline and w×1.5 overshoots to 128–163 %. Since the two
+straddle 100 % and neither shows the effect, the negative result holds across a
+±60 % range of cortical firing rate and is not a rate artifact.
+
+This is the expected outcome from polychronization theory: in Izhikevich (2006)
+it is **STDP that selects delay-matched paths**. Heterogeneous delays are the
+substrate; without a mechanism that potentiates the delay-matched combinations,
+jitter only smears arrival times. Delays are necessary but not sufficient —
+so the informative next experiment is delays **plus** STDP, not delays alone.
+
 ## Open items
 
 - **Cortical selectivity → temporal code.** Pattern identity is carried in CA3

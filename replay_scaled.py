@@ -660,6 +660,12 @@ def build_replay_network(
     # projections (Schaffer, and the cortical hops in the modules). 0 = the
     # original single-scalar delays. See jittered_delay().
     delay_jitter=0.0,
+    # Weight compensation for the jittered projections. Spreading arrival
+    # times reduces coincident summation, so jitter alone LOWERS downstream
+    # rates (measured: EC LII -51%, mPFC -61%) and that drop confounds any
+    # discrimination comparison. Scaling the jittered weights restores drive
+    # so the two conditions can be compared at matched firing rates.
+    delay_jitter_wcomp=1.0,
     # Phase 6.2: when a real DG circuit (--dg) drives CA3 via mossy fibres,
     # the Poisson DG proxy on CA3 SUP/DEEP is suppressed so drive is not
     # double-counted. The EC and background CA3 drives are kept -- they model
@@ -943,8 +949,9 @@ def build_replay_network(
     t_sch = time.perf_counter()
 
     _d_sch = jittered_delay(d_slow, delay_jitter)
-    fixed_connect(CA3_SUP,  CA1_PYR,    K("schaffer_sup_pyr",     N_ca3_sup),  w_schaffer_sup_pyr,    _d_sch)
-    fixed_connect(CA3_DEEP, CA1_PYR,    K("schaffer_deep_pyr",    N_ca3_deep), w_schaffer_deep_pyr,   _d_sch)
+    _wc = delay_jitter_wcomp if delay_jitter > 0 else 1.0
+    fixed_connect(CA3_SUP,  CA1_PYR,    K("schaffer_sup_pyr",     N_ca3_sup),  w_schaffer_sup_pyr*_wc,  _d_sch)
+    fixed_connect(CA3_DEEP, CA1_PYR,    K("schaffer_deep_pyr",    N_ca3_deep), w_schaffer_deep_pyr*_wc, _d_sch)
     fixed_connect(CA3_SUP,  CA1_BASKET, K("schaffer_sup_basket",  N_ca3_sup),  w_schaffer_sup_basket, d_fast)
     fixed_connect(CA3_DEEP, CA1_BASKET, K("schaffer_deep_basket", N_ca3_deep), w_schaffer_deep_basket,d_fast)
     print(f"    done in {time.perf_counter()-t_sch:.1f}s")
@@ -1695,6 +1702,7 @@ def build_ec_lii(
     w_ca1_ec     : float = 1.0,
     delay_ca1_ec : float = 3.0,   # axonal conduction delay CA1→EC [ms]
     delay_jitter : float = 0.0,   # per-synapse jitter (Phase C); 0 = scalar
+    delay_jitter_wcomp: float = 1.0,  # weight scale when jitter>0 (rate matching)
     rate_bg      : float = 0.0,   # EC background Poisson drive set to ZERO.
                                    # CA1→EC K=50 inputs at 7.5 Hz provides 375 Hz
                                    # of drive → EC fires at ~5-8 Hz from CA1 alone.
@@ -1775,7 +1783,7 @@ def build_ec_lii(
         EC_LII,
         conn_spec={"rule": "fixed_indegree", "indegree": K},
         syn_spec={"synapse_model": "static_synapse",
-                  "weight": float(w_ca1_ec),
+                  "weight": float(w_ca1_ec) * (delay_jitter_wcomp if delay_jitter>0 else 1.0),
                   "delay":  jittered_delay(delay_ca1_ec, delay_jitter)},
     )
     dt_conn = time.perf_counter() - t_conn
@@ -1897,6 +1905,7 @@ def build_ec_lv(
     delay_eclii: float = 2.0,   # ms  — within-EC
     delay_ca3  : float = 5.0,   # ms  — EC→CA3 feedback (longer, angular bundle)
     delay_jitter: float = 0.0,  # per-synapse jitter (Phase C); 0 = scalar
+    delay_jitter_wcomp: float = 1.0,  # weight scale when jitter>0 (rate matching)
 ) -> "ECLVModule":
     """
     Build EC Layer V population and wire it into the hippocampo-cortical loop.
@@ -1939,7 +1948,7 @@ def build_ec_lv(
     nest.Connect(ca1_pyr, EC_LV,
                  conn_spec={"rule": "fixed_indegree", "indegree": K1},
                  syn_spec={"synapse_model": "static_synapse",
-                           "weight": float(w_ca1_lv), "delay": jittered_delay(delay_ca1, delay_jitter)})
+                           "weight": float(w_ca1_lv) * (delay_jitter_wcomp if delay_jitter>0 else 1.0), "delay": jittered_delay(delay_ca1, delay_jitter)})
     print(f"  [ECLVModule] CA1→LV: {N_lv*K1:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
     # EC LII → EC LV  (within-EC feedforward)
@@ -1948,7 +1957,7 @@ def build_ec_lv(
     nest.Connect(ec_lii_pop, EC_LV,
                  conn_spec={"rule": "fixed_indegree", "indegree": K2},
                  syn_spec={"synapse_model": "static_synapse",
-                           "weight": float(w_eclii_lv), "delay": jittered_delay(delay_eclii, delay_jitter)})
+                           "weight": float(w_eclii_lv) * (delay_jitter_wcomp if delay_jitter>0 else 1.0), "delay": jittered_delay(delay_eclii, delay_jitter)})
     print(f"  [ECLVModule] ECLII→LV: {N_lv*K2:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
     # EC LV → CA3 SUP feedback  (closes the hippocampo-cortical loop)
@@ -1981,6 +1990,7 @@ def build_mpfc(
     w_eclv_mpfc  : float = 1.0,    # mV
     delay_lv_mpfc: float = 8.0,    # ms — longer cortico-cortical delay
     delay_jitter : float = 0.0,    # per-synapse jitter (Phase C); 0 = scalar
+    delay_jitter_wcomp: float = 1.0,  # weight scale when jitter>0 (rate matching)
     # Lateral inhibition — the same k-winners-take-all motif the DG uses
     # (GC->basket->GC) to turn dense input into a sparse code. Without it every
     # mPFC cell fires on every SWR, so every EC LV->mPFC synapse co-activates
@@ -2025,7 +2035,7 @@ def build_mpfc(
     nest.Connect(ec_lv_pop, MPFC,
                  conn_spec={"rule": "fixed_indegree", "indegree": K},
                  syn_spec={"synapse_model": "static_synapse",
-                           "weight": float(w_eclv_mpfc),
+                           "weight": float(w_eclv_mpfc) * (delay_jitter_wcomp if delay_jitter>0 else 1.0),
                            "delay": jittered_delay(delay_lv_mpfc, delay_jitter)})
     print(f"  [MPFCModule] LV→mPFC: {N_pfc*K:,} synapses in {_time.perf_counter()-t_c:.2f}s")
 
@@ -3385,6 +3395,13 @@ Dentate gyrus (Phase 6.2):
              "code; the CA3 sequence chain and EC LV->CA3 feedback stay scalar "
              "because those delays are load-bearing for replay itself.")
     parser.add_argument(
+        "--delay-jitter-wcomp", type=float, default=1.0, metavar="X",
+        help="Weight scale applied to the jittered projections when "
+             "--delay-jitter > 0. Spreading arrival times reduces coincident "
+             "summation and lowers downstream rates, which confounds any "
+             "comparison against the unjittered condition; this restores drive "
+             "so the two can be compared at matched firing rates.")
+    parser.add_argument(
         "--n-patterns", type=int, default=1, metavar="P",
         help="Number of DISTINCT replay patterns (default 1). The CA3 sequence "
              "groups are split into P interleaved assemblies, each replayed in "
@@ -3620,6 +3637,7 @@ Dentate gyrus (Phase 6.2):
         n_epochs       = n_epochs,
         epoch_ms       = SIM_MS,
         delay_jitter   = args.delay_jitter,
+        delay_jitter_wcomp = args.delay_jitter_wcomp,
     )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
@@ -3635,6 +3653,7 @@ Dentate gyrus (Phase 6.2):
             N_ec_lii      = N_ec_lii,
             K_ca1_ec      = args.ec_lii_k,
             delay_jitter  = args.delay_jitter,
+            delay_jitter_wcomp = args.delay_jitter_wcomp,
         )
 
     # ---- Optional Phase 6.2: dentate gyrus -----------------------------------
@@ -3667,6 +3686,7 @@ Dentate gyrus (Phase 6.2):
             ec_lii_pop = ec_module.population,
             ca3_sup    = net["CA3_SUP"],
             delay_jitter = args.delay_jitter,
+            delay_jitter_wcomp = args.delay_jitter_wcomp,
         )
         if args.mpfc:
             print(">>> Building mPFC module (Phase 3)...")
@@ -3674,6 +3694,7 @@ Dentate gyrus (Phase 6.2):
                 ec_lv_pop = eclv_module.population,
                 lateral_inhibition = not args.no_mpfc_lateral_inh,
                 delay_jitter = args.delay_jitter,
+                delay_jitter_wcomp = args.delay_jitter_wcomp,
             )
 
     # ---- Plasticity hooks: after ALL populations are wired -------------------
