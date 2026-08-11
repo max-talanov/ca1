@@ -211,6 +211,44 @@ substrate; without a mechanism that potentiates the delay-matched combinations,
 jitter only smears arrival times. Delays are necessary but not sufficient —
 so the informative next experiment is delays **plus** STDP, not delays alone.
 
+## 9. Phase C step 2 — delay-aware STDP, with the drive confound controlled
+
+Pair-based STDP on the Schaffer collateral using each synapse's **own** delay,
+`dt = (t_post − t_pre) − delay_ij`, so a synapse is potentiated when its delay
+*matches* the pre→post interval — the polychronous selection rule. Applied at
+CA3→CA1 because that is where the signal still exists.
+
+The mechanism operates: Schaffer weight **CV rises 0.0008 → 0.0388** over 16
+replay events — synapses differentiate rather than drift together.
+
+STDP also raised cortical rates 28–68 %, which is the same confound as step 1.
+Two static controls (`--schaffer-w-scale`, which scales Schaffer only, unlike
+`--delay-jitter-wcomp`) **bracket** the STDP condition's drive:
+
+| condition | CA1 | EC LII | EC LV | mPFC | EC LV timing sep |
+|---|---|---|---|---|---|
+| no STDP | 4.48 | 4.61 | 9.78 | 3.48 | 0.012 |
+| static ×1.5 | 5.66 | 5.68 | 11.72 | 4.32 | 0.010 |
+| **STDP** | 7.54 | 7.14 | 13.40 | 4.47 | **0.120** |
+| static ×2.5 | 7.93 | 7.16 | 13.72 | 4.68 | −0.006 |
+
+The ×2.5 control **exceeds** STDP on every population yet shows no
+discrimination. EC LV separation appears only in the STDP condition — **drive
+does not explain it.** Full timing separations:
+
+| condition | CA3 | CA1 | EC LII | EC LV | mPFC |
+|---|---|---|---|---|---|
+| no STDP | 0.186 | 0.016 | 0.030 | 0.012 | 0.008 |
+| static ×1.5 | 0.195 | −0.030 | 0.047 | 0.010 | 0.066 |
+| **STDP** | 0.143 | 0.025 | 0.067 | **0.120** | 0.048 |
+| static ×2.5 | 0.195 | −0.000 | −0.010 | −0.006 | −0.071 |
+
+**Limits, stated plainly.** The effect is modest (0.120 against a 0.10
+threshold); it does **not** clearly extend to mPFC (STDP 0.048 vs 0.066 in a
+control); STDP slightly *degraded* the CA3 source signal (0.143 vs ~0.19); and
+each condition is a single run at 1 %. This is a controlled positive at EC LV,
+not a demonstrated cortical engram.
+
 ## Open items
 
 - **Cortical selectivity → temporal code.** Pattern identity is carried in CA3

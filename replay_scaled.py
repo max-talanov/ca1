@@ -672,6 +672,13 @@ def build_replay_network(
     # and 12.1M synapses make a Python-side plasticity hook impractical.
     # Weights are scaled by K_default/K so mean CA1 drive is preserved.
     schaffer_k=None,
+    # Static multiplier on the Schaffer weights ONLY. This is the control for
+    # the Schaffer-STDP experiment: STDP raised cortical rates 28-68%, so a
+    # static run at the same elevated Schaffer drive isolates 'did the
+    # SELECTION of delay-matched paths matter' from 'did the drive go up'.
+    # Using delay_jitter_wcomp for this would be wrong -- that also scales
+    # CA1->EC and EC->mPFC, which STDP never touched.
+    schaffer_w_scale=1.0,
     # Phase 6.2: when a real DG circuit (--dg) drives CA3 via mossy fibres,
     # the Poisson DG proxy on CA3 SUP/DEEP is suppressed so drive is not
     # double-counted. The EC and background CA3 drives are kept -- they model
@@ -969,8 +976,13 @@ def build_replay_network(
               f"(w x{_sc_sup:.1f})  DEEP {_K_deep_def}->{_K_deep} (w x{_sc_deep:.1f})")
     else:
         _K_sup, _K_deep, _sc_sup, _sc_deep = _K_sup_def, _K_deep_def, 1.0, 1.0
-    fixed_connect(CA3_SUP,  CA1_PYR, _K_sup,  w_schaffer_sup_pyr*_wc*_sc_sup,   _d_sch)
-    fixed_connect(CA3_DEEP, CA1_PYR, _K_deep, w_schaffer_deep_pyr*_wc*_sc_deep, _d_sch)
+    if schaffer_w_scale != 1.0:
+        print(f"    Schaffer static weight scale x{schaffer_w_scale:.2f} "
+              f"(STDP control)")
+    fixed_connect(CA3_SUP,  CA1_PYR, _K_sup,
+                  w_schaffer_sup_pyr*_wc*_sc_sup*schaffer_w_scale,   _d_sch)
+    fixed_connect(CA3_DEEP, CA1_PYR, _K_deep,
+                  w_schaffer_deep_pyr*_wc*_sc_deep*schaffer_w_scale, _d_sch)
     fixed_connect(CA3_SUP,  CA1_BASKET, K("schaffer_sup_basket",  N_ca3_sup),  w_schaffer_sup_basket, d_fast)
     fixed_connect(CA3_DEEP, CA1_BASKET, K("schaffer_deep_basket", N_ca3_deep), w_schaffer_deep_basket,d_fast)
     print(f"    done in {time.perf_counter()-t_sch:.1f}s")
@@ -3572,6 +3584,11 @@ Dentate gyrus (Phase 6.2):
              "CA1 cell sees all of CA3 -- and makes a plasticity hook on 12M "
              "synapses impractical.")
     parser.add_argument(
+        "--schaffer-w-scale", type=float, default=1.0, metavar="X",
+        help="Static multiplier on the Schaffer weights only. Control for "
+             "--schaffer-stdp: STDP raises cortical rates, so a static run at "
+             "matched drive separates path SELECTION from raw drive.")
+    parser.add_argument(
         "--schaffer-stdp", action="store_true",
         help="Apply delay-aware pair STDP to CA3->CA1 between SWR events "
              "(Phase C step 2). dt = (t_post - t_pre) - delay_ij, so synapses "
@@ -3816,6 +3833,7 @@ Dentate gyrus (Phase 6.2):
         delay_jitter   = args.delay_jitter,
         delay_jitter_wcomp = args.delay_jitter_wcomp,
         schaffer_k     = args.schaffer_k,
+        schaffer_w_scale = args.schaffer_w_scale,
     )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
