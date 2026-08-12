@@ -650,6 +650,10 @@ def build_replay_network(
     # Parallel
     n_threads=8,
     seed_connect=42,  # RNG seed for V_m heterogeneity + connectivity
+    # NEST kernel RNG (Poisson drive, connectivity draws, delay jitter).
+    # Separate from seed_connect, which drives the numpy side (V_m spread,
+    # DG wiring). Replication must vary BOTH or runs differ only partially.
+    master_seed=20260111,
     # Multi-pattern replay. n_patterns > 1 partitions the CA3 sequence groups
     # into disjoint interleaved assemblies, one replayed per epoch, so that
     # downstream selectivity ("engram for A but not B") becomes measurable.
@@ -719,7 +723,7 @@ def build_replay_network(
             RuntimeWarning, stacklevel=2,
         )
 
-    safe_set_seeds()
+    safe_set_seeds(master_seed)
 
     try:
         available = list(nest.node_models)
@@ -3584,6 +3588,12 @@ Dentate gyrus (Phase 6.2):
              "CA1 cell sees all of CA3 -- and makes a plasticity hook on 12M "
              "synapses impractical.")
     parser.add_argument(
+        "--seed", type=int, default=None, metavar="S",
+        help="Master RNG seed. Sets BOTH the NEST kernel RNG (Poisson drive, "
+             "connectivity, delay jitter) and the numpy seed (V_m spread, DG "
+             "wiring); varying only one leaves runs partially identical. Use to "
+             "replicate an effect across independent networks.")
+    parser.add_argument(
         "--schaffer-w-scale", type=float, default=1.0, metavar="X",
         help="Static multiplier on the Schaffer weights only. Control for "
              "--schaffer-stdp: STDP raises cortical rates, so a static run at "
@@ -3834,6 +3844,8 @@ Dentate gyrus (Phase 6.2):
         delay_jitter_wcomp = args.delay_jitter_wcomp,
         schaffer_k     = args.schaffer_k,
         schaffer_w_scale = args.schaffer_w_scale,
+        **({} if args.seed is None else
+           dict(master_seed=args.seed, seed_connect=args.seed)),
     )
 
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
