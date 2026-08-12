@@ -211,51 +211,60 @@ substrate; without a mechanism that potentiates the delay-matched combinations,
 jitter only smears arrival times. Delays are necessary but not sufficient —
 so the informative next experiment is delays **plus** STDP, not delays alone.
 
-## 9. Phase C step 2 — delay-aware STDP, with the drive confound controlled
+## 9. Phase C step 2 — delay-aware STDP: **does not replicate**
 
 Pair-based STDP on the Schaffer collateral using each synapse's **own** delay,
-`dt = (t_post − t_pre) − delay_ij`, so a synapse is potentiated when its delay
-*matches* the pre→post interval — the polychronous selection rule. Applied at
+`dt = (t_post − t_pre) − delay_ij` — the polychronous selection rule, applied at
 CA3→CA1 because that is where the signal still exists.
 
-The mechanism operates: Schaffer weight **CV rises 0.0008 → 0.0388** over 16
-replay events — synapses differentiate rather than drift together.
+The **mechanism** demonstrably operates: Schaffer weight **CV rises
+0.0008 → 0.0388** over 16 replay events, so synapses differentiate rather than
+drift together.
 
-STDP also raised cortical rates 28–68 %, which is the same confound as step 1.
-Two static controls (`--schaffer-w-scale`, which scales Schaffer only, unlike
-`--delay-jitter-wcomp`) **bracket** the STDP condition's drive:
+A first run showed EC LV timing separation **+0.120**, surviving two static
+controls that bracketed (and exceeded) its firing rates. That looked like a
+controlled positive. **It does not survive replication.**
 
-| condition | CA1 | EC LII | EC LV | mPFC | EC LV timing sep |
+Three independent seeds (`--seed` sets both the NEST kernel RNG and the numpy
+RNG; varying only one leaves runs partially identical):
+
+| run | CA3 | CA1 | EC LII | EC LV | mPFC |
 |---|---|---|---|---|---|
-| no STDP | 4.48 | 4.61 | 9.78 | 3.48 | 0.012 |
-| static ×1.5 | 5.66 | 5.68 | 11.72 | 4.32 | 0.010 |
-| **STDP** | 7.54 | 7.14 | 13.40 | 4.47 | **0.120** |
-| static ×2.5 | 7.93 | 7.16 | 13.72 | 4.68 | −0.006 |
+| original | 0.143 | 0.025 | 0.067 | **+0.120** | 0.048 |
+| seed 101 | 0.159 | 0.021 | 0.012 | −0.037 | −0.035 |
+| seed 202 | 0.171 | 0.018 | **0.556** | −0.029 | −0.002 |
+| seed 303 | 0.195 | 0.046 | **0.135** | −0.006 | 0.042 |
 
-The ×2.5 control **exceeds** STDP on every population yet shows no
-discrimination. EC LV separation appears only in the STDP condition — **drive
-does not explain it.** Full timing separations:
+EC LV across the three new seeds: mean **−0.024**, sd 0.016. The original
++0.120 sits ~9 sd above that — an outlier, not an effect.
 
-| condition | CA3 | CA1 | EC LII | EC LV | mPFC |
-|---|---|---|---|---|---|
-| no STDP | 0.186 | 0.016 | 0.030 | 0.012 | 0.008 |
-| static ×1.5 | 0.195 | −0.030 | 0.047 | 0.010 | 0.066 |
-| **STDP** | 0.143 | 0.025 | 0.067 | **0.120** | 0.048 |
-| static ×2.5 | 0.195 | −0.000 | −0.010 | −0.006 | −0.071 |
+Two further signs it is noise rather than signal:
 
-**Limits, stated plainly.** The effect is modest (0.120 against a 0.10
-threshold); it does **not** clearly extend to mPFC (STDP 0.048 vs 0.066 in a
-control); STDP slightly *degraded* the CA3 source signal (0.143 vs ~0.19); and
-each condition is a single run at 1 %. This is a controlled positive at EC LV,
-not a demonstrated cortical engram.
+- The population that "discriminates" **flips between runs**: CA3+EC LV, then
+  CA3 only, then CA3+EC LII twice. A real effect lands on the same population
+  each time.
+- EC LII swings from 0.012 to 0.556 across seeds — a range no mechanism explains.
+
+What *is* robust is the source: **CA3 timing separation 0.167 ± 0.022** across
+all four runs. The encoding is real and reproducible; the downstream
+transmission is not.
+
+**Conclusion.** Delay heterogeneity alone does not carry the timing code to
+cortex (§8), and delay-aware Schaffer STDP does not either. Polychronization
+remains a plausible route — the substrate and the selection mechanism are now
+both implemented and the mechanism verifiably runs — but at this scale, epoch
+count and connectivity it produces no reproducible cortical discrimination.
+Candidate next factors: far longer training (Izhikevich ran ~24 h simulated for
+polychronous groups to form; these runs are 8 s), recurrent rather than
+feedforward cortical targets, and larger populations.
 
 ## Open items
 
-- **Cortical selectivity → temporal code.** Pattern identity is carried in CA3
-  spike timing but every projection uses a single fixed delay, so it cannot
-  propagate (§7). Next step: per-synapse delay heterogeneity + STDP on the
-  cortical projections (polychronization), and/or sparser Schaffer
-  connectivity.
+- **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
+  CA3 spike timing (0.167 ± 0.022) but does not reach cortex. Neither delay
+  heterogeneity (§8) nor delay-aware Schaffer STDP (§9) transmits it; the one
+  apparent positive failed to replicate across three seeds. Untested factors:
+  much longer training, recurrent cortical targets, larger scale.
 - **Ripple background is still epoch-0 only.** The replay drive (trigger +
   staggered scaffold) now repeats every epoch, so epochs 1…*n*−1 do contain
   real replay. The sharp-wave/ripple *background* does not: repeating it needs
