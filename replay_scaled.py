@@ -1741,7 +1741,7 @@ def build_ec_lii(
     ca1_spike_rec,           # spike_recorder for CA1 PYR (net["spk_pyr"])
     N_ec_lii     : int,
     K_ca1_ec     : int   = 50,
-    w_ca1_ec     : float = 1.0,
+    w_ca1_ec     : float = 0.30,   # K=50 -> 15 mV volley (0.75x threshold)
     delay_ca1_ec : float = 3.0,   # axonal conduction delay CA1→EC [ms]
     delay_jitter : float = 0.0,   # per-synapse jitter (Phase C); 0 = scalar
     delay_jitter_wcomp: float = 1.0,  # weight scale when jitter>0 (rate matching)
@@ -1809,6 +1809,22 @@ def build_ec_lii(
     EC_LII = nest.Create("izhikevich", N_ec_lii,
                          params=dict(a=0.02, b=0.2, c=-65.0, d=6.0,
                                      V_m=-65.0, U_m=-13.0, I_e=0.0))
+    # Graded excitability, as every hippocampal population already has. With a
+    # uniform V_m every cell is identical, so a synchronous volley fires all of
+    # them or none -- nothing for lateral inhibition to select between, and no
+    # sparse code can form however strong that inhibition is.
+    nest.SetStatus(EC_LII, "V_m",
+                   np.random.default_rng(11).normal(-65.0, 4.0, N_ec_lii)
+                   .clip(-75, -55).tolist())
+    # PERSISTENT excitability spread. V_m heterogeneity above is only a
+    # transient -- every initial condition relaxes to the same rest (-70), which
+    # is why adding it left EC LII at 87% active. I_e shifts the rest/threshold
+    # gap itself (gap = 25*sqrt(0.64 - 0.16*I_e)), so with I_e ~ N(0.0, 1.5) the
+    # gap spans ~15-24 mV and a near-threshold volley recruits only the
+    # excitable tail.
+    nest.SetStatus(EC_LII, "I_e",
+                   np.random.default_rng(21).normal(0.0, 1.5, len(EC_LII))
+                   .clip(-3.0, 3.0).tolist())
 
     # ---- Tonic background drive --------------------------------------------
     bg = nest.Create("poisson_generator", N_ec_lii, params={"rate": float(rate_bg)})
@@ -1924,6 +1940,9 @@ class STCHook:
     struct_done   : np.ndarray = None  # [n_syn] bool  — structurally potentiated
     n_calls       : int = 0
     history       : list = None
+    # baseline weight, so the L-LTP ceiling can be expressed RELATIVE to it
+    # (an absolute ceiling re-saturates the cortex whenever w_ca1_ec is rescaled)
+    w_init        : float = 1.0
 
     def __post_init__(self):
         if self.history is None:
@@ -1940,7 +1959,7 @@ def build_ec_lv(
     K_ca1_lv  : int   = 30,     # CA1 → EC LV in-degree (dense, Köhler 1985)
     K_eclii_lv: int   = 20,     # EC LII → EC LV in-degree (feedforward)
     K_lv_ca3  : int   = 5,      # EC LV → CA3 SUP in-degree (feedback)
-    w_ca1_lv  : float = 1.2,    # mV  — CA1→LV stronger than CA1→LII
+    w_ca1_lv  : float = 0.45,   # K=30 -> 13.5 mV volley (0.68x threshold)
     w_eclii_lv: float = 0.8,    # mV  — within-EC feedforward
     w_lv_ca3  : float = 0.6,    # mV  — feedback to CA3 (modest; avoids runaway)
     delay_ca1  : float = 3.0,   # ms  — CA1→EC conduction
@@ -1983,6 +2002,18 @@ def build_ec_lv(
     EC_LV = nest.Create("izhikevich", N_lv,
                         params=dict(a=0.02, b=0.2, c=-55.0, d=4.0,
                                     V_m=-64.7, U_m=-13.0, I_e=3.0))
+    nest.SetStatus(EC_LV, "V_m",
+                   np.random.default_rng(12).normal(-64.7, 4.0, N_lv)
+                   .clip(-75, -55).tolist())
+    # PERSISTENT excitability spread. V_m heterogeneity above is only a
+    # transient -- every initial condition relaxes to the same rest (-70), which
+    # is why adding it left EC LII at 87% active. I_e shifts the rest/threshold
+    # gap itself (gap = 25*sqrt(0.64 - 0.16*I_e)), so with I_e ~ N(3.0, 1.5) the
+    # gap spans ~15-24 mV and a near-threshold volley recruits only the
+    # excitable tail.
+    nest.SetStatus(EC_LV, "I_e",
+                   np.random.default_rng(22).normal(3.0, 1.5, len(EC_LV))
+                   .clip(0.0, 6.0).tolist())
 
     # CA1 → EC LV  (fixed_indegree, static — fast connect)
     K1 = min(K_ca1_lv, N_ca1)
@@ -2029,7 +2060,14 @@ def build_mpfc(
     ec_lv_pop,
     N_mpfc       : int   = None,   # defaults to 20% of EC LV size
     K_eclv_mpfc  : int   = 20,     # EC LV → mPFC in-degree
-    w_eclv_mpfc  : float = 1.0,    # mV
+    # A synchronous EC LV volley must be SUBTHRESHOLD on its own: K=20 x 1.0 =
+    # 20 mV was exactly the rest->threshold gap, so every mPFC cell fired ~1.5 ms
+    # before feedback inhibition could arbitrate, and no subset could ever be
+    # selected. At 0.5 the volley is ~10 mV, so only cells whose V_m
+    # heterogeneity or recurrent input carries them over will fire -- the same
+    # recipe that makes the DG sparse (pp_weight subthreshold + feedback
+    # inhibition + graded V_m).
+    w_eclv_mpfc  : float = 0.85,   # K=20 -> 17 mV (0.5 silenced mPFC)
     delay_lv_mpfc: float = 8.0,    # ms — longer cortico-cortical delay
     delay_jitter : float = 0.0,    # per-synapse jitter (Phase C); 0 = scalar
     delay_jitter_wcomp: float = 1.0,  # weight scale when jitter>0 (rate matching)
@@ -2079,6 +2117,18 @@ def build_mpfc(
     MPFC = nest.Create("izhikevich", N_pfc,
                        params=dict(a=0.02, b=0.2, c=-65.0, d=8.0,
                                    V_m=-65.0, U_m=-13.0, I_e=0.0))
+    nest.SetStatus(MPFC, "V_m",
+                   np.random.default_rng(13).normal(-65.0, 4.0, N_pfc)
+                   .clip(-75, -55).tolist())
+    # PERSISTENT excitability spread. V_m heterogeneity above is only a
+    # transient -- every initial condition relaxes to the same rest (-70), which
+    # is why adding it left EC LII at 87% active. I_e shifts the rest/threshold
+    # gap itself (gap = 25*sqrt(0.64 - 0.16*I_e)), so with I_e ~ N(0.0, 1.5) the
+    # gap spans ~15-24 mV and a near-threshold volley recruits only the
+    # excitable tail.
+    nest.SetStatus(MPFC, "I_e",
+                   np.random.default_rng(23).normal(0.0, 1.5, len(MPFC))
+                   .clip(-3.0, 3.0).tolist())
 
     # EC LV → mPFC
     t_c = _time.perf_counter()
@@ -2252,7 +2302,10 @@ def build_mpfc_recurrent_hook(mpfc_module) -> MPFCAssocHook:
 def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
                         t_swr_start, t_swr_end,
                         A_assoc=0.02, A_hetero=0.004,
-                        w_max=2.0, w_min=0.05):
+                        # w_max caps the volley below threshold: at K=20 a weight
+                        # of 2.0 would reach 40 mV and undo the sparsening that
+                        # the reduced w_eclv_mpfc buys. 0.8 -> at most ~16 mV.
+                        w_max=1.1, w_min=0.05):
     """Strengthen EC LV -> mPFC where replay co-activated both ends.
 
     Called once per SWR event, after nest.Simulate() for that epoch.
@@ -2668,6 +2721,7 @@ def build_stc_hook(ec_module, w_init_override=None) -> STCHook:
     return STCHook(
         conns        = conns,
         w            = w_arr,
+        w_init       = float(w_arr.mean()) if len(w_arr) else 1.0,
         tag          = np.zeros(n_syn, dtype=np.float32),
         tag_time_ms  = np.full(n_syn, -1e9, dtype=np.float32),
         prp_pool     = np.zeros(ec_module.N, dtype=np.float32),
@@ -2708,8 +2762,13 @@ def run_stc_hook(
                                    # of neurons per SWR vs 100% before), threshold
                                    # of 6 events produces a gradual staircase
                                    # matching Frey & Morris 1997 consolidation data.
-    w_max         : float = 1.5,  # max weight after L-LTP capture
-    w_min         : float = 0.1,  # min weight after LTD
+    # RELATIVE to w_init, not absolute. These were 1.5 / 0.1 against a w_init of
+    # 1.0; with the cortical weights rescaled to keep volleys subthreshold
+    # (w_ca1_ec 1.0 -> 0.30), an absolute ceiling of 1.5 would let consolidation
+    # grow the volley back to 3.75x threshold and undo the sparsening within a
+    # few epochs -- the same trap already hit with the mPFC assoc hook's w_max.
+    w_max_rel     : float = 1.5,  # ceiling as a multiple of w_init
+    w_min_rel     : float = 0.1,  # floor as a multiple of w_init
     # Structural plasticity parameters
     struct_threshold : int   = 5,    # L-LTP epochs needed for spine enlargement
                                       # biology: ~3-7 LTP induction events (weeks)
@@ -2818,7 +2877,9 @@ def run_stc_hook(
 
     # ---- 5. E-LTP (immediate) and L-LTP capture (threshold-gated) -----------
     # E-LTP: apply Δw immediately (reversible, will decay without L-LTP)
-    stc.w = np.clip(stc.w + delta_w, w_min, w_max)
+    _wmax = w_max_rel * stc.w_init
+    _wmin = w_min_rel * stc.w_init
+    stc.w = np.clip(stc.w + delta_w, _wmin, _wmax)
 
     # L-LTP: capture if PRP sufficient AND tag alive AND not already captured
     tag_alive   = stc.tag > 1e-4
@@ -2826,7 +2887,7 @@ def run_stc_hook(
     new_capture = tag_alive & prp_above & ~stc.ltp_done
     if new_capture.any():
         # Permanent weight consolidation: boost by 30% capped at w_max
-        stc.w[new_capture] = np.minimum(stc.w[new_capture] * 1.3, w_max)
+        stc.w[new_capture] = np.minimum(stc.w[new_capture] * 1.3, _wmax)
         stc.ltp_done |= new_capture
 
     # ---- 5b. Structural plasticity — 3rd timescale (spine enlargement) -------
@@ -3710,6 +3771,17 @@ Dentate gyrus (Phase 6.2):
              "CA1 cell sees all of CA3 -- and makes a plasticity hook on 12M "
              "synapses impractical.")
     parser.add_argument(
+        "--cortical-recall", action="store_true",
+        help="Test 3: consolidate, then LESION the hippocampus (zero CA1->EC), "
+             "cue part of the cortical assembly and measure how much of the rest "
+             "revives. This is the systems-consolidation test -- remote memory "
+             "should survive hippocampal removal. Requires --mpfc; forces "
+             "recurrent mPFC collaterals, without which cortex has nothing to "
+             "complete a pattern with and the test is a guaranteed null.")
+    parser.add_argument(
+        "--cr-cue-frac", type=float, default=0.4, metavar="F",
+        help="Fraction of the cortical assembly to cue in --cortical-recall.")
+    parser.add_argument(
         "--train-pattern", type=int, default=None, metavar="P",
         help="Replay ONLY pattern P (keeping the --n-patterns partition) instead "
              "of alternating. Train A-only and B-only on the same seed to test "
@@ -4034,6 +4106,7 @@ Dentate gyrus (Phase 6.2):
             mpfc_module = build_mpfc(
                 ec_lv_pop = eclv_module.population,
                 lateral_inhibition = not args.no_mpfc_lateral_inh,
+                recurrent = args.cortical_recall,
                 delay_jitter = args.delay_jitter,
                 delay_jitter_wcomp = args.delay_jitter_wcomp,
             )
@@ -4045,9 +4118,14 @@ Dentate gyrus (Phase 6.2):
         stc_hook = build_stc_hook(ec_module)
 
     mpfc_assoc_hook = None
+    mpfc_rec_hook   = None
     if mpfc_module is not None and eclv_module is not None and not args.no_mpfc_assoc:
         print(">>> Initialising mPFC association hook...")
         mpfc_assoc_hook = build_mpfc_assoc_hook(mpfc_module, eclv_module)
+        if args.cortical_recall:
+            # the recurrent collaterals are what a hippocampus-independent
+            # memory is actually stored in, so they must learn too
+            mpfc_rec_hook = build_mpfc_recurrent_hook(mpfc_module)
 
     # ---- Simulation: single epoch or multi-epoch STC loop -------------------
     swr_fwd = net["swr_fwd"]
@@ -4085,6 +4163,12 @@ Dentate gyrus (Phase 6.2):
                 run_schaffer_stdp_hook(schaffer_hook, net,
                                        epoch_t0 + _ws, epoch_t0 + _we)
 
+        if mpfc_rec_hook is not None:
+            for _ws, _we in ((swr_fwd[0], swr_fwd[1]), (swr_rev[0], swr_rev[1])):
+                run_mpfc_assoc_hook(mpfc_rec_hook, mpfc_module, mpfc_module,
+                                    t_swr_start=epoch_t0 + _ws,
+                                    t_swr_end=epoch_t0 + _we)
+
         # Cortical association build-up: same two SWR windows, EC LV -> mPFC
         if mpfc_assoc_hook is not None:
             for _ws, _we in ((swr_fwd[0], swr_fwd[1]), (swr_rev[0], swr_rev[1])):
@@ -4099,6 +4183,56 @@ Dentate gyrus (Phase 6.2):
                   f"({time.perf_counter()-t_sim:.1f}s elapsed)")
 
     print(f"    Total simulation done in {time.perf_counter()-t_sim:.1f}s")
+
+    # ---- Test 3: hippocampus-independent cortical recall --------------------
+    if args.cortical_recall and mpfc_module is not None:
+        print(f"\n{'='*72}")
+        print("CORTICAL RECALL AFTER HIPPOCAMPAL LESION (Test 3)")
+        print(f"{'='*72}")
+        _t_all = total_sim_ms
+
+        # 1. the cortical assembly = mPFC cells the consolidated pattern drives
+        _ev = nest.GetStatus(mpfc_module.spike_rec, "events")[0]
+        _t, _s = np.asarray(_ev["times"]), np.asarray(_ev["senders"])
+        _m = np.zeros(len(_t), dtype=bool)
+        for _e in range(n_epochs):
+            _o = _e * SIM_MS
+            _m |= (((_t >= _o + swr_fwd[0]) & (_t <= _o + swr_fwd[1])) |
+                   ((_t >= _o + swr_rev[0]) & (_t <= _o + swr_rev[1])))
+        _assembly = np.unique(_s[_m])
+        print(f"  cortical assembly: {len(_assembly)}/{mpfc_module.N} mPFC cells "
+              f"active during replay")
+        if len(_assembly) < 8:
+            print("  [SKIP] assembly too small to cue and score")
+        else:
+            # 2. lesion: hippocampal output to cortex is severed
+            lesion_hippocampus(net, ec_module, eclv_module)
+            # 3. partial cue, well clear of the last replay
+            _cue_t = _t_all + 200.0
+            _cued, _un = cortical_recall_probe(
+                mpfc_module, _assembly, args.cr_cue_frac, _cue_t,
+                rng=np.random.default_rng(7))
+            nest.Simulate(500.0)
+            _ev2 = nest.GetStatus(mpfc_module.spike_rec, "events")[0]
+            _t2, _s2 = np.asarray(_ev2["times"]), np.asarray(_ev2["senders"])
+            _r = completion_index(_t2, _s2, _cued, _un, _cue_t, _cue_t + 80.0)
+            # baseline: an equal window BEFORE the cue, post-lesion, no stimulus
+            _b = completion_index(_t2, _s2, _cued, _un, _t_all + 100.0, _t_all + 180.0)
+            print(f"  cue {args.cr_cue_frac*100:.0f}% of assembly "
+                  f"({_r['n_cued']} cued, {_r['n_uncued']} to recover)")
+            print(f"  cue_recall      {_r['cue_recall']:.3f}   (sanity: cued cells did fire)")
+            print(f"  COMPLETION      {_r['completion']:.3f}")
+            print(f"  pre-cue baseline{_b['completion']:8.3f}   "
+                  f"(post-lesion spontaneous)")
+            _net_c = _r['completion'] - _b['completion']
+            print(f"  completion above baseline = {_net_c:+.3f}")
+            if _net_c > 0.25:
+                print("  [OK] cortex reactivates the pattern WITHOUT the hippocampus")
+                print("       -> the memory has become hippocampus-independent.")
+            else:
+                print("  [FLAG] no cortical recall above baseline: the trace exists in")
+                print("         weights but cannot reconstruct the pattern on its own.")
+        print(f"{'='*72}")
 
     # ---- Phase 4: Synaptic Homeostasis (after all SWR epochs) ---------------
     # Supports both single-alpha (--homeo-alpha) and sweep (--alpha-sweep) modes.
