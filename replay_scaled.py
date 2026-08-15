@@ -2067,7 +2067,13 @@ def build_mpfc(
     # heterogeneity or recurrent input carries them over will fire -- the same
     # recipe that makes the DG sparse (pp_weight subthreshold + feedback
     # inhibition + graded V_m).
-    w_eclv_mpfc  : float = 0.85,   # K=20 -> 17 mV (0.5 silenced mPFC)
+    # Raised once EC LV became sparse. The volley arithmetic (K x w vs the 20 mV
+    # gap) only applies to SYNCHRONOUS arrival; with EC LV at 6.3 Hz and 62%
+    # active the ~15 spikes a cell receives are spread over the 120 ms window and
+    # each EPSP decays before the next lands, so peak depolarisation is far below
+    # K x w. Empirically mPFC sat at 2% active / 0.12 Hz with mpfc_int at 0.00 Hz
+    # -- excitation-starved, not inhibition-crushed.
+    w_eclv_mpfc  : float = 1.8,    # mV
     delay_lv_mpfc: float = 8.0,    # ms — longer cortico-cortical delay
     delay_jitter : float = 0.0,    # per-synapse jitter (Phase C); 0 = scalar
     delay_jitter_wcomp: float = 1.0,  # weight scale when jitter>0 (rate matching)
@@ -2086,10 +2092,18 @@ def build_mpfc(
     # because of its sup_local collaterals; this is the cortical equivalent, and
     # it is what a hippocampus-independent (remote) memory would have to use.
     recurrent: bool = False,
-    K_rec: int = 20, w_rec: float = 0.6, delay_rec: float = 4.0,
+    # Recurrent excitation must be able to sustain activity with the
+    # hippocampus removed (Test 3). At 0.6 the volley is 12 mV against a 20 mV
+    # gap -- subthreshold even before inhibition. 0.9 gives 18 mV, near enough
+    # that the I_e-excitable tail can carry a reactivation.
+    K_rec: int = 20, w_rec: float = 0.9, delay_rec: float = 4.0,
     int_frac     : float = 0.20,   # FS interneurons as a fraction of mPFC
     w_mpfc_ei    : float = 2.5,    # mPFC -> INT   (mirrors w_gc_basket)
-    w_mpfc_ie    : float = -7.0,   # INT -> mPFC   (mirrors w_basket_gc)
+    # Rebalanced for the sparse-cortex regime. At -7.0 the feedback volley was
+    # 84 mV against 29 mV of total excitation (2.9x), which drove mPFC to 2%
+    # active / 0.12 Hz once EC LV became sparse -- ~2 cells, too few to form an
+    # assembly. -3.5 gives 42 mV, still dominant but leaving a workable subset.
+    w_mpfc_ie    : float = -3.5,   # INT -> mPFC   (mirrors w_basket_gc)
 ) -> "MPFCModule":
     """
     Build mPFC population receiving EC LV input.
@@ -2305,7 +2319,7 @@ def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
                         # w_max caps the volley below threshold: at K=20 a weight
                         # of 2.0 would reach 40 mV and undo the sparsening that
                         # the reduced w_eclv_mpfc buys. 0.8 -> at most ~16 mV.
-                        w_max=1.1, w_min=0.05):
+                        w_max=2.4, w_min=0.05):
     """Strengthen EC LV -> mPFC where replay co-activated both ends.
 
     Called once per SWR event, after nest.Simulate() for that epoch.
