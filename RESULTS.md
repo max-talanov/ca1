@@ -258,6 +258,60 @@ Candidate next factors: far longer training (Izhikevich ran ~24 h simulated for
 polychronous groups to form; these runs are 8 s), recurrent rather than
 feedforward cortical targets, and larger populations.
 
+## 10. Cortical sparsity, and a first readable Test 3 (PRELIMINARY)
+
+Test 3 (hippocampal lesion -> cortical recall) was previously unaskable: mPFC
+fired 120/120 cells, so there was no assembly to cue, and cortex had no
+recurrent excitation to complete a pattern with. Three fixes, in order:
+
+**Sparsity.** Cortical volleys were suprathreshold (CA1->EC LII at 2.5x), so
+every cell fired ~1.5 ms before feedback inhibition could arbitrate. Rescaling
+each stage to just below threshold AND adding `I_e` heterogeneity gives graded
+recruitment. Both were needed: subthreshold volleys with uniform `I_e` fired
+nobody, and `V_m` heterogeneity alone did nothing — every initial potential
+relaxes to the same rest (−70), so V_m spread is a transient, not a standing
+excitability difference.
+
+| population | before | after |
+|---|---|---|
+| EC LII | 87.3 % | **9.5 %** |
+| EC LV | 99.9 % | **62.5 %** |
+| mPFC | 100 % | **9.8 %** |
+| mPFC assembly | 120/120 | **23/120** |
+
+**E/I balance.** mPFC interneurons were at 0.00 Hz, so the winners-take-all loop
+was inert and halving its weight was a no-op (2.0 % -> 2.3 %). mPFC was
+excitation-starved; raising EC LV->mPFC brought it to 9.8 % with `mpfc_int` at
+0.29 Hz.
+
+**Post-lesion priming.** After the lesion mPFC has no input at all, so the test
+otherwise asks cortex to self-ignite from silence. A subthreshold tonic drive
+holds cells near threshold; the pre-cue baseline is the guard that it is not
+firing them itself.
+
+Result at 1 %, 40 % cue of a 23-cell assembly, hippocampus lesioned:
+
+| condition | completion | baseline |
+|---|---|---|
+| consolidated (plasticity on) | **0.214** | 0.000 |
+| control (no plasticity) | 0.071 | 0.000 |
+| priming 60 Hz (too weak) | 0.000 | 0.000 |
+
+Directionally this is what systems consolidation predicts — 3x more recall when
+the recurrent weights were shaped by replay, against a proper unconsolidated
+control and a zero baseline.
+
+**It is not yet evidence.** Those fractions are **3 cells versus 1 cell**, from a
+single seed. Poisson noise on counts that small is comparable to the effect, and
+this is the same profile as the EC LV result in §9 that failed to replicate
+across three seeds. Cortex also still shows no pattern discrimination by
+identity, so even a solid positive would show *an* assembly reactivating rather
+than *a specific memory* transferring.
+
+Settling it needs 12 % scale, where mPFC is 1440 cells and an assembly ~250, so
+recovered counts are ~30 vs ~10 — measurable rather than anecdotal — plus
+several seeds.
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in

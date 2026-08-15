@@ -3793,6 +3793,15 @@ Dentate gyrus (Phase 6.2):
              "recurrent mPFC collaterals, without which cortex has nothing to "
              "complete a pattern with and the test is a guaranteed null.")
     parser.add_argument(
+        "--cr-prime-rate", type=float, default=250.0, metavar="HZ",
+        help="Tonic Poisson drive to mPFC after the lesion, holding cells near "
+             "threshold so recurrent collaterals can propagate. Without it the "
+             "test asks cortex to self-ignite from silence. Keep it "
+             "subthreshold: the pre-cue baseline must stay ~0.")
+    parser.add_argument(
+        "--cr-prime-weight", type=float, default=1.5, metavar="W",
+        help="Weight of the post-lesion mPFC priming drive.")
+    parser.add_argument(
         "--cr-cue-frac", type=float, default=0.4, metavar="F",
         help="Fraction of the cortical assembly to cue in --cortical-recall.")
     parser.add_argument(
@@ -4221,6 +4230,23 @@ Dentate gyrus (Phase 6.2):
         else:
             # 2. lesion: hippocampal output to cortex is severed
             lesion_hippocampus(net, ec_module, eclv_module)
+            # 3. tonic priming. After the lesion mPFC has NO input at all -- EC
+            # LV is silent, so the only remaining excitation is the recurrent
+            # collaterals, which cannot start from nothing. The CA3 completion
+            # probe needed exactly this (a sharp-wave-like depolarised state)
+            # before it could complete anything; without it the recall test
+            # measures whether cortex can self-ignite from silence, which no
+            # memory would pass. Subthreshold on its own -- it holds cells near
+            # threshold, it does not fire them (verified by the pre-cue
+            # baseline, which must stay ~0).
+            if args.cr_prime_rate > 0:
+                _pg = nest.Create("poisson_generator", mpfc_module.N,
+                                  params={"rate": float(args.cr_prime_rate)})
+                nest.Connect(_pg, mpfc_module.population, conn_spec="one_to_one",
+                             syn_spec={"weight": float(args.cr_prime_weight),
+                                       "delay": 1.0})
+                print(f"  [prime] mPFC tonic drive {args.cr_prime_rate:.0f} Hz "
+                      f"@ w={args.cr_prime_weight} (subthreshold; baseline check below)")
             # 3. partial cue, well clear of the last replay
             _cue_t = _t_all + 200.0
             _cued, _un = cortical_recall_probe(
