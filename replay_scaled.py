@@ -660,6 +660,11 @@ def build_replay_network(
     # n_epochs/epoch_ms are needed here because SWR generators and scaffolds
     # carry ABSOLUTE times and must be created for every epoch.
     n_patterns=1, n_epochs=1, epoch_ms=1000.0,
+    # Restrict replay to ONE pattern index while keeping the n_patterns
+    # partition. Needed to ask whether the cortical trace is pattern-
+    # SPECIFIC: train A-only and B-only on the SAME network (same seed, so
+    # the same synapses exist) and compare the resulting weight changes.
+    train_pattern=None,
     # Phase C: per-synapse delay jitter (ms) on the FEEDFORWARD readout
     # projections (Schaffer, and the cortical hops in the modules). 0 = the
     # original single-scalar delays. See jittered_delay().
@@ -1044,8 +1049,10 @@ def build_replay_network(
     epoch_pattern = []
     for ep in range(max(1, n_epochs)):
         t0_ep = ep * epoch_ms
-        pat   = patterns[ep % len(patterns)]
-        epoch_pattern.append(ep % len(patterns))
+        pat   = (patterns[ep % len(patterns)] if train_pattern is None
+                 else patterns[train_pattern % len(patterns)])
+        epoch_pattern.append(ep % len(patterns) if train_pattern is None
+                             else train_pattern % len(patterns))
         grp   = [ca3_sup_groups[i] for i in pat]
         f_s, r_s = t0_ep + swr_fwd_start, t0_ep + swr_rev_start
         if trigger_on:
@@ -3154,7 +3161,7 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                      ec_module=None, stc_hook=None,
                      eclv_module=None, mpfc_module=None,
                      homeo_stats=None, homeo_results=None, dg_module=None,
-                     mpfc_assoc_hook=None):
+                     mpfc_assoc_hook=None, schaffer_hook=None):
     """
     Save all simulation results to an HDF5 file for offline plotting.
 
@@ -3328,6 +3335,22 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                     c_i, _ = np.histogram(t_i, bins=edges)
                     g_i.create_dataset("rate",
                         data=(c_i/(bin_ms/1e3)/max(mpfc_module.N_int,1)).astype(np.float32))
+
+        # --- Schaffer STDP weights -------------------------------------------
+        # Exported so the CONSOLIDATED TRACE can be compared across runs: train
+        # pattern A only vs pattern B only on the same seed, then ask whether the
+        # potentiated synapses trace back to that pattern's CA3 cells. Source
+        # gids are needed for that attribution, not just the weights.
+        if schaffer_hook is not None:
+            sg2 = h5.create_group("schaffer_stdp")
+            m = schaffer_hook.mask
+            sg2.attrs["n_all"]    = int(len(schaffer_hook.w))
+            sg2.attrs["n_ca3_ca1"]= int(m.sum())
+            sg2.attrs["w_init"]   = float(schaffer_hook.w_init)
+            sg2.create_dataset("w_final", data=schaffer_hook.w[m].astype(np.float32), **compress)
+            sg2.create_dataset("pre_gid", data=schaffer_hook.pre_g[m].astype(np.int64), **compress)
+            sg2.create_dataset("post_gid",data=schaffer_hook.post_g[m].astype(np.int64), **compress)
+            sg2.create_dataset("delay",  data=schaffer_hook.delay[m].astype(np.float32), **compress)
 
         # --- cortical association build-up (EC LV -> mPFC) -------------------
         if mpfc_assoc_hook is not None and mpfc_assoc_hook.history:
@@ -3588,6 +3611,11 @@ Dentate gyrus (Phase 6.2):
              "CA1 cell sees all of CA3 -- and makes a plasticity hook on 12M "
              "synapses impractical.")
     parser.add_argument(
+        "--train-pattern", type=int, default=None, metavar="P",
+        help="Replay ONLY pattern P (keeping the --n-patterns partition) instead "
+             "of alternating. Train A-only and B-only on the same seed to test "
+             "whether the consolidated cortical trace is pattern-specific.")
+    parser.add_argument(
         "--seed", type=int, default=None, metavar="S",
         help="Master RNG seed. Sets BOTH the NEST kernel RNG (Poisson drive, "
              "connectivity, delay jitter) and the numpy seed (V_m spread, DG "
@@ -3838,6 +3866,7 @@ Dentate gyrus (Phase 6.2):
         n_threads      = n_threads,
         suppress_dg_drive = args.dg,   # real DG mossy fibres replace the proxy
         n_patterns     = args.n_patterns,
+        train_pattern  = args.train_pattern,
         n_epochs       = n_epochs,
         epoch_ms       = SIM_MS,
         delay_jitter   = args.delay_jitter,
@@ -4090,7 +4119,8 @@ Dentate gyrus (Phase 6.2):
                      ec_module=ec_module, stc_hook=stc_hook,
                      eclv_module=eclv_module, mpfc_module=mpfc_module,
                      homeo_stats=homeo_stats, homeo_results=homeo_results,
-                     dg_module=dg_module, mpfc_assoc_hook=mpfc_assoc_hook)
+                     dg_module=dg_module, mpfc_assoc_hook=mpfc_assoc_hook,
+                     schaffer_hook=schaffer_hook)
 
     if rank != 0:
         print(f">>> [rank {rank}] Done (non-root rank exiting).")
