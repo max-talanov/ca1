@@ -2041,6 +2041,14 @@ def build_mpfc(
     # With it, only the most-driven mPFC cells win each replay event, so
     # different replayed patterns recruit different mPFC subsets.
     lateral_inhibition: bool = True,
+    # Recurrent EXCITATORY mPFC->mPFC collaterals. Without these the cortex is
+    # purely feedforward (EC LV -> mPFC, plus an inhibitory mPFC<->INT loop), so
+    # a partial cortical cue can never reactivate the rest of a pattern -- there
+    # is nothing to complete it with. CA3 passes the completion test only
+    # because of its sup_local collaterals; this is the cortical equivalent, and
+    # it is what a hippocampus-independent (remote) memory would have to use.
+    recurrent: bool = False,
+    K_rec: int = 20, w_rec: float = 0.6, delay_rec: float = 4.0,
     int_frac     : float = 0.20,   # FS interneurons as a fraction of mPFC
     w_mpfc_ei    : float = 2.5,    # mPFC -> INT   (mirrors w_gc_basket)
     w_mpfc_ie    : float = -7.0,   # INT -> mPFC   (mirrors w_basket_gc)
@@ -2120,6 +2128,12 @@ def build_mpfc(
         print("  [MPFCModule] lateral inhibition DISABLED — mPFC will fire as a "
               "whole population (no sparse code, no selective engram)")
 
+    if recurrent:
+        Kr = max(1, min(K_rec, N_pfc - 1))
+        fixed_connect(MPFC, MPFC, Kr, w_rec, delay_rec)
+        print(f"  [MPFCModule] recurrent mPFC->mPFC: K={Kr} w={w_rec} "
+              f"delay={delay_rec} ms  (substrate for cortical pattern completion)")
+
     spk_mpfc = nest.Create("spike_recorder")
     nest.Connect(MPFC, spk_mpfc)
     print(f"  [MPFCModule] Total build: {_time.perf_counter()-t0:.1f}s")
@@ -2197,6 +2211,41 @@ def build_mpfc_assoc_hook(mpfc_module, eclv_module) -> MPFCAssocHook:
           f"{time.perf_counter()-t0:.2f}s (excluded {n_drop:,} non-EC-LV inputs, "
           f"incl. lateral inhibition)")
     return MPFCAssocHook(conns=conns, w=w, w_init=float(w[0]) if n else 1.0,
+                         pre_idx=pre_idx, post_idx=post_idx, history=[])
+
+
+def build_mpfc_recurrent_hook(mpfc_module) -> MPFCAssocHook:
+    """Cache the recurrent mPFC->mPFC synapses so they can learn.
+
+    These are what a hippocampus-independent memory would actually be stored
+    IN: after the hippocampus is removed, only intra-cortical weights remain to
+    reactivate a pattern from a partial cue. Runs through the same Hebbian rule
+    as the feedforward hook by passing mPFC as BOTH pre and post.
+
+    Masking is essential: GetConnections(target=mPFC) also returns EC LV inputs
+    and the INHIBITORY INT->mPFC synapses. Letting the depression branch touch
+    the inhibitory ones would clamp them to w_min and flip them positive,
+    destroying the lateral inhibition (the bug already fixed once for the
+    feedforward hook).
+    """
+    import nest
+    t0 = time.perf_counter()
+    print("\n  [mPFCRec] Fetching recurrent mPFC->mPFC synapses...", flush=True)
+    conns_all = nest.GetConnections(target=mpfc_module.population)
+    src_all = np.array(nest.GetStatus(conns_all, "source"), dtype=np.int64)
+    tgt_all = np.array(nest.GetStatus(conns_all, "target"), dtype=np.int64)
+    w_all   = np.array(nest.GetStatus(conns_all, "weight"), dtype=np.float32)
+    pfc_ids = np.array(mpfc_module.population.tolist(), dtype=np.int64)
+    keep    = np.isin(src_all, pfc_ids)          # mPFC -> mPFC only
+    pfc_map = {int(g): i for i, g in enumerate(pfc_ids)}
+    pre_idx  = np.array([pfc_map.get(int(g), -1) for g in src_all], dtype=np.int32)
+    post_idx = np.array([pfc_map.get(int(g), -1) for g in tgt_all], dtype=np.int32)
+    pre_idx[~keep] = -1                          # gate updates off non-recurrent
+    post_idx[~keep] = -1
+    print(f"  [mPFCRec] {int(keep.sum()):,} recurrent of {len(src_all):,} "
+          f"mPFC-incoming in {time.perf_counter()-t0:.1f}s", flush=True)
+    return MPFCAssocHook(conns=conns_all, w=w_all,
+                         w_init=float(w_all[keep].mean()) if keep.any() else 1.0,
                          pre_idx=pre_idx, post_idx=post_idx, history=[])
 
 
@@ -2401,6 +2450,53 @@ def run_schaffer_stdp_hook(hook, net, t_start, t_end,
                w_cv=float(_wm.std() / max(abs(_wm.mean()), 1e-9)))
     hook.history.append(rec)
     return rec
+
+
+def lesion_hippocampus(net, ec_module, eclv_module):
+    """Silence hippocampal output to cortex — the systems-consolidation lesion.
+
+    Zeroes CA1 -> EC LII and CA1 -> EC LV. Everything cortical (EC LII, EC LV,
+    mPFC, and the consolidated intra-cortical weights) is left intact, so what
+    remains is exactly what a "remote" memory would have to run on
+    (Frankland & Bontempi 2005: remote memory survives hippocampal lesion).
+
+    Zeroing the projection rather than deleting neurons keeps the network
+    topology and all cached synapse handles valid.
+    """
+    import nest
+    n = 0
+    for tgt in [m.population for m in (ec_module, eclv_module) if m is not None]:
+        c = nest.GetConnections(source=net["PYR"], target=tgt)
+        if len(c):
+            nest.SetStatus(c, "weight", [0.0] * len(c))
+            n += len(c)
+    print(f"  [lesion] CA1->cortex silenced: {n:,} synapses zeroed "
+          f"(cortex intact, hippocampus disconnected)")
+    return n
+
+
+def cortical_recall_probe(mpfc_module, pattern_cells, cue_frac,
+                          t_start, dur_ms=16.0, rate=2600.0, weight=2.5,
+                          win_ms=80.0, rng=None):
+    """Cue part of a cortical assembly; measure how much of the REST revives.
+
+    Same logic as the CA3 completion probe, applied to mPFC after the
+    hippocampus is gone. Returns (cued, uncued) so the caller can score with
+    completion_index() once the simulation has run.
+    """
+    import nest
+    rng = rng or np.random.default_rng(0)
+    cells = np.asarray([int(c) for c in pattern_cells], dtype=np.int64)
+    n_cue = max(1, int(round(cue_frac * len(cells))))
+    cued = np.sort(rng.choice(cells, size=n_cue, replace=False))
+    uncued = np.setdiff1d(cells, cued)
+    gens = nest.Create("poisson_generator", len(cued), params={
+        "rate": float(rate), "start": float(t_start),
+        "stop": float(t_start + dur_ms)})
+    nest.Connect(gens, nest.NodeCollection([int(c) for c in cued]),
+                 conn_spec="one_to_one",
+                 syn_spec={"weight": float(weight), "delay": 1.0})
+    return cued, uncued
 
 
 def pattern_discrimination(net, pops, swr_fwd, swr_rev, epoch_ms, n_epochs):
