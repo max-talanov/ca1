@@ -2286,7 +2286,10 @@ def run_mpfc_assoc_hook(hook, eclv_module, mpfc_module,
     hetero = valid & post_a & ~pre_a   # post without pre -> weak depression
     hook.w[both]   = np.minimum(hook.w[both]   + A_assoc,  w_max)
     hook.w[hetero] = np.maximum(hook.w[hetero] - A_hetero, w_min)
-    nest.SetStatus(hook.conns, "weight", hook.w.tolist())
+    # .tolist() here allocated ~1.5M Python floats per call, 64 calls per run --
+    # this, not the (already vectorised) spike lookup, was the dominant cost.
+    # NEST accepts a numpy array directly.
+    nest.SetStatus(hook.conns, "weight", hook.w)
 
     hook.n_calls += 1
     # "associated" = potentiated in at least half the replay events so far.
