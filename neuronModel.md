@@ -20,3 +20,5 @@ junction that automotically blocks the rest of
 the neuibhours synaptic - dendritic spikes 
 convolving the dimenstions of the input 
 inforamtion to 1 (spike times).
+
+
