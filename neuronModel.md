@@ -1,24 +1,47 @@
 # Dendritic convolution 
 
+Let's discuss the organisation of dendritic 
+tree processing in the Associative Cortex (AC) 
+and Hippocampal system (HS) as highly dynamic 
+and integrative systems. 
+
 ## Post synaptic dendritic spike
 
-Imagine the excitatory synaptic area that just 
+**First level of convolution**. 
+If excitatory synaptic area that just 
 got the neurotransmission and now based on the 
-W of the synapse the postsynaptic membraine 
+W of the synapse the postsynaptic membrane 
 potential reaches the threshold that triggers 
 the dendritic spike.
 
-This way the **W** of the synapse value collapses 
+This way the synaptic value of **W** convolve 
 to the boolean influence over the dendritic spike.
 
 ## Junction
 
-Dendritic junction blocks the passing through 
-spikes during the refractory period.
-This way the first spike goes through the 
-junction that automotically blocks the rest of 
-the neuibhours synaptic - dendritic spikes 
-convolving the dimenstions of the input 
-inforamtion to 1 (spike times).
+**The second level of convolution.**
+
+Dendritic junction lets through only first 
+spike coming through during the refractory 
+period of the first spike.
+
+This way the first spike going through the 
+junction that blocks the rest of 
+the dendritic spikes of neighbours 
+convolving dimensions of the neural input 
+inforamtion.
+
+### Clustering of the synapses
+
+The input synapses of one neuron 
+morphologically are clustering, this way the 
+inputs from the close sources are closer in the 
+dendritic tree. 
+Thus dendritic tree convolution convolve the 
+closer information sources more effectively.
+The other output of the input clustering - the 
+higher the importance of the input channel the 
+higher number of projections into AC and HS.
+
 
 
