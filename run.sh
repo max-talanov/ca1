@@ -34,6 +34,27 @@
 # JOB C — full integrated stack WITH the real DG (run only after A+B look good)
 #  sbatch --export=ALL,SCALE=12,DG=1,N_SWR=14 run.sh
 
+# ---- Test 3 at 12% : hippocampus-independent cortical recall ---------------
+# The 1% result (consolidated 0.214 vs control 0.071) is 3 cells vs 1 cell on
+# one seed -- too small to trust. At 12% mPFC is 1440 cells and an assembly
+# ~250, so recovered counts are ~30 vs ~10.
+#
+# JOB F — sanity: does the core still hold after the cortical sparsity retune?
+#   Run FIRST. EC LII/LV/mPFC weights, I_e and E/I were all changed and have
+#   never been seen at 12%. Check replay rho, DG 2-4%, L-LTP staircase.
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14 run.sh
+#
+# JOB D — Test 3, consolidated (repeat for SEED=101,202,303)
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,TRAIN_PATTERN=0,N_SWR=16,\
+#SCHAFFER_K=200,DELAY_JITTER=4.0,SCHAFFER_STDP=1,CORTICAL_RECALL=1,SEED=101 run.sh
+#
+# JOB E — Test 3 control, no cortical plasticity (same seeds as D)
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,TRAIN_PATTERN=0,N_SWR=16,\
+#SCHAFFER_K=200,DELAY_JITTER=4.0,SCHAFFER_STDP=1,CORTICAL_RECALL=1,NO_MPFC_ASSOC=1,SEED=101 run.sh
+#
+# CHECK BEFORE BELIEVING ANY RECALL NUMBER: the printed pre-cue baseline must be
+# ~0. If it is not, the priming is firing cells by itself and completion is
+# meaningless -- lower CR_PRIME_RATE (120 works at 1%; 250 did not).
 
 SCALE=${SCALE:-25}
 EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)
@@ -53,6 +74,18 @@ DG_SCALE=${DG_SCALE:-$SCALE}   # DG scale %; defaults to SCALE
 PATTERN_COMPLETION=${PATTERN_COMPLETION:-0}  # 1=run the CA3 completion probe INSTEAD
 PC_CUE_FRACS=${PC_CUE_FRACS:-0.1,0.2,0.3,0.5,0.7,1.0}
 PC_CUE_WEIGHT=${PC_CUE_WEIGHT:-2.5}
+# ---- multi-pattern / temporal-code / Test-3 knobs -------------------------
+N_PATTERNS=${N_PATTERNS:-1}        # >1 splits CA3 groups into interleaved assemblies
+TRAIN_PATTERN=${TRAIN_PATTERN:-}   # replay ONLY this pattern index (A-only vs B-only)
+SEED=${SEED:-}                     # sets BOTH the NEST kernel and numpy seeds
+SCHAFFER_K=${SCHAFFER_K:-}         # CA3->CA1 in-degree override (weights auto-scaled)
+SCHAFFER_STDP=${SCHAFFER_STDP:-0}  # 1 = delay-aware STDP on CA3->CA1
+DELAY_JITTER=${DELAY_JITTER:-0}    # per-synapse axonal delay jitter (ms)
+NO_MPFC_ASSOC=${NO_MPFC_ASSOC:-0}  # 1 = no cortical plasticity (Test-3 control)
+CORTICAL_RECALL=${CORTICAL_RECALL:-0}   # 1 = lesion + cue + measure (Test 3)
+CR_CUE_FRAC=${CR_CUE_FRAC:-0.4}
+CR_PRIME_RATE=${CR_PRIME_RATE:-120}     # keep subthreshold: baseline must stay ~0
+CR_PRIME_WEIGHT=${CR_PRIME_WEIGHT:-1.0}
 OUTDIR="results"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -118,6 +151,11 @@ if [ "$HOMEOSTASIS" = "1" ]; then
   fi
 fi
 
+[ "$SCHAFFER_STDP" = "1" ]  && PHASE_TAG="${PHASE_TAG}_stdp"
+[ "$CORTICAL_RECALL" = "1" ] && PHASE_TAG="${PHASE_TAG}_recall"
+[ "$NO_MPFC_ASSOC" = "1" ]   && PHASE_TAG="${PHASE_TAG}_noplast"
+[ -n "$TRAIN_PATTERN" ]      && PHASE_TAG="${PHASE_TAG}_p${TRAIN_PATTERN}"
+[ -n "$SEED" ]               && PHASE_TAG="${PHASE_TAG}_s${SEED}"
 OUTFILE="${OUTDIR}/replay_${SCALE}pct_stc${PHASE_TAG}.h5"
 echo "[Slurm] output → $OUTFILE"
 
@@ -127,6 +165,17 @@ echo "[Slurm] output → $OUTFILE"
 # Build optional flag list
 OPTIONAL_FLAGS=""
 [ "$EC_LII" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lii --ec-lii-k $EC_LII_K"
+[ "$N_PATTERNS" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --n-patterns $N_PATTERNS"
+[ -n "$TRAIN_PATTERN" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --train-pattern $TRAIN_PATTERN"
+[ -n "$SEED" ]          && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --seed $SEED"
+[ -n "$SCHAFFER_K" ]    && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --schaffer-k $SCHAFFER_K"
+[ "$SCHAFFER_STDP" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --schaffer-stdp"
+[ "$DELAY_JITTER" != "0" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --delay-jitter $DELAY_JITTER"
+[ "$NO_MPFC_ASSOC" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --no-mpfc-assoc"
+if [ "$CORTICAL_RECALL" = "1" ]; then
+  OPTIONAL_FLAGS="$OPTIONAL_FLAGS --cortical-recall --cr-cue-frac $CR_CUE_FRAC"
+  OPTIONAL_FLAGS="$OPTIONAL_FLAGS --cr-prime-rate $CR_PRIME_RATE --cr-prime-weight $CR_PRIME_WEIGHT"
+fi
 [ "$DG"     = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg --dg-scale $DG_SCALE"
 [ "$NO_STC" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --stc --n-swr $N_SWR --epoch-ms $EPOCH_MS --prp-threshold $PRP_THRESHOLD"
 [ "$EC_LV"  = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lv"
