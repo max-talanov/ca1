@@ -59,4 +59,6 @@ This way the compromise between effectiveness
 of convolution and the information needed for 
 system processing.
 
-
+This ideas could influence the electronic 
+implementation of the SNNs pawing the 
+optimisation way on the level of network.  
