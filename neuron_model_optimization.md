@@ -356,3 +356,161 @@ still testing the network-level hypothesis — that dendrite-level
 convolution reduces the information reaching the soma without collapsing
 the network into non-functional over-simplification — that motivates the
 whole proposal.
+
+## 5. Continuous time as the gap between a pure digital solution and the proposed approach
+
+Every implementation choice discussed in §§1–4 is compatible, in principle,
+with a purely synchronous digital realization: quantize time into fixed
+ticks, represent `W` as a multi-bit register, evaluate the stage-1
+threshold once per tick, resolve the stage-2 junction with a clocked
+priority encoder, and accumulate stage-3 sums in a digital adder. This is,
+in fact, how most existing digital neuromorphic silicon (Loihi/Loihi 2,
+TrueNorth-class cores) and the tinyHippo NEST simulation itself already
+operate — NEST's default solver advances the network in fixed simulation
+steps (commonly sub-millisecond, e.g. 0.1 ms) and evaluates neuron and
+synapse dynamics at those steps rather than continuously. It is worth
+being explicit about what is lost by that choice, because it is precisely
+the gap that a continuous-time, event-driven analog or mixed-signal
+realization of the dendritic-convolution pipeline is proposed to close.
+
+### 5.1 What "continuous time" means for each stage
+
+- **Stage 1 (threshold crossing).** The dendritic spike is triggered at
+  the instant the membrane potential crosses threshold, a continuous,
+  real-valued event time. A clocked digital evaluator only observes the
+  membrane state at tick boundaries, so the reported crossing time is
+  quantized to the tick period `Δt` and carries an expected timing error
+  of up to `Δt`/2. Sub-threshold CMOS or translinear analog circuits
+  (the classical Mead-style neuromorphic approach) instead implement the
+  membrane state as a genuinely continuous voltage or current governed by
+  an RC-like differential equation, and the comparator fires
+  asynchronously, exactly when threshold is crossed, with a hardware
+  latency set by transistor bandwidth (typically nanoseconds to low
+  microseconds) rather than by a simulation tick.
+- **Stage 2 (junction arbitration).** The "first spike wins" rule is only
+  meaningful if the hardware can actually resolve which of several
+  candidate spikes arrived first. In continuous time this is a
+  well-posed question with probability zero of an exact tie (for
+  independent, continuously distributed arrival times). Under a
+  fixed-tick digital clock, two dSpikes that cross threshold within the
+  same tick are indistinguishable in arrival order and require an
+  arbitrary tie-breaking rule (e.g., fixed priority by row address),
+  which silently and systematically biases which branch "wins" — a
+  digitally-induced artifact with no biological counterpart. The finer
+  the tick, the rarer this collision, but it is never eliminated by
+  clocking alone; a genuinely asynchronous, self-timed (clockless)
+  arbitration circuit — of the kind already used in TrueNorth's
+  asynchronous crossbar fabric or in classical mutual-exclusion (metastability-
+  resolving) arbiter circuits — removes the artifact by construction.
+- **Stage 3 (somatic integration).** The excitatory/inhibitory balance is
+  integrated over a leak time constant that is itself continuous; how
+  finely a digital implementation must sample it depends on how fast that
+  time constant is relative to `Δt`. This stage is the least sensitive of
+  the three, because summation is a linear, low-pass operation that
+  tolerates modest time-quantization without qualitative error — consistent
+  with §4.4's assessment that stage 3 is already adequately served by
+  existing digital/mixed-signal somatic circuits.
+
+### 5.2 Quantifying the gap against the tinyHippo timing regime
+
+The bidirectional-replay simulations already in this project provide a
+concrete scale against which to size the required timing precision.
+Sequence groups activate roughly 3.8 ms apart during an SWR at 10% network
+scale, and the STDP window used for tagging is ±20 ms with a forward axonal
+delay of about 3 ms. Two implications follow directly:
+
+1. A digital tick coarser than roughly a few hundred microseconds begins
+   to erode the ability to resolve which of two closely spaced sequence
+   groups produced the earlier dendritic spike, which is exactly the
+   ordering information the stage-2 junction is meant to preserve; a
+   tick on the order of the 3.8 ms inter-group spacing (or coarser, as is
+   typical of default 0.1–1 ms digital-SNN and NEST time steps once
+   several tick periods of latency are added by synchronous pipeline
+   stages) is adequate for network-level replay-order statistics (the
+   Spearman-ρ metric already used to score replay quality) but is not
+   adequate for preserving fine-grained relative timing *within* a single
+   SWR event at the resolution the biological circuit appears to use.
+2. The forward/reverse LTP/LTD asymmetry in the STC mechanism depends on
+   the sign of a millisecond-scale timing difference (+3 ms vs. −3 ms).
+   Any digital implementation whose effective tick or pipeline latency
+   approaches that few-millisecond scale risks collapsing the sign
+   distinction that separates consolidating from de-potentiating synapses
+   — turning a designed asymmetry into noise.
+
+In short: the network-level, statistical claims this project already
+validates in simulation (replay quality, consolidation curves) are
+tick-tolerant at typical digital-SNN/NEST time steps; the synapse- and
+dendrite-level timing claims that motivate the dendritic-convolution
+proposal in §§1–3 are not, and are the specific place where a purely
+digital, clocked implementation departs furthest from the biological (and
+simulated) target.
+
+### 5.3 Cost side of the gap: why "just use a finer clock" is not free
+
+Shrinking `Δt` to close the timing gap does not come for free in a
+synchronous digital design: doubling clock frequency to halve `Δt`
+roughly doubles dynamic switching power (power scales approximately
+linearly with clock frequency in CMOS, all else equal) and requires every
+neuron and synapse in the array to be re-evaluated on every tick whether
+or not it has anything to do — an `O(N)` per-tick cost regardless of how
+sparse the actual spiking activity is. This is the well-known
+event-driven-vs-clocked trade-off in neuromorphic engineering: a clocked
+digital design pays a fixed per-tick tax on the entire array to buy
+timing resolution, while an asynchronous, continuous-time analog design
+pays energy only when a threshold is actually crossed (current flows in a
+comparator only around a transition) and its timing resolution is set by
+device physics rather than by a clock budget. For a sparse hippocampal
+replay-style workload — a small fraction of neurons active per SWR
+event — this favors continuous-time, event-driven circuits on energy
+grounds as well as on timing-fidelity grounds, which reinforces rather
+than competes with the wiring-reduction argument made in §4.5.
+
+### 5.4 What continuous time costs in return
+
+The gap does not close for free on the analog side either, and it is
+important to state the reciprocal cost precisely rather than treat
+continuous-time analog circuits as a strictly dominant option:
+
+- **No natural notion of a global "simulation state."** A clocked digital
+  design can be paused, checkpointed, and stepped deterministically —
+  useful for debugging and for reproducing the exact `bidirectional_replay.py`-
+  style trace-by-trace comparisons this project already relies on.
+  Continuous-time analog circuits are intrinsically real-time and
+  free-running; extracting a reproducible, inspectable trace requires
+  additional instrumentation (fast ADCs on monitored nodes) that
+  reintroduces some of the sampling/quantization question the analog
+  approach was meant to avoid, just moved to the measurement layer.
+- **Device-level noise and drift are continuous too.** The same
+  continuous physics that gives an analog comparator its sub-microsecond
+  timing precision also lets thermal noise, flicker noise, and
+  memristor conductance drift (§4.1) act continuously on the threshold,
+  so timing precision in the abstract does not automatically translate
+  into timing *accuracy* without calibration.
+- **Verification and yield.** A digital tie-breaking rule, however
+  biologically inexact, is at least fully specified and reproducible
+  across chips; a self-timed arbiter's behavior near true coincidence is
+  governed by circuit metastability, which is a well-understood but
+  non-trivial design discipline (bounded, not eliminated, resolution
+  time) and complicates functional verification relative to a
+  synchronous design.
+
+### 5.5 Recommended position
+
+Given §§5.1–5.4, the pragmatic reading is that continuous time is not an
+all-or-nothing architectural choice but a resource that should be spent
+where the biological claim actually needs it. Stages 1 and 2 — where the
+proposal's own argument rests on exact threshold-crossing time and
+arrival order — are where a continuous-time, asynchronous analog or
+mixed-signal front end earns its cost. Stage 3, and all network-level,
+routing-layer logic (spike packet transport between neurons, the digital
+bookkeeping already well served by existing crossbar/router architectures
+in Loihi-class chips), can remain clocked digital without materially
+weakening the timing claims of §§1–3, because summation over a leak time
+constant is the one stage in this pipeline that is genuinely tolerant of
+tick-scale quantization. This mixed strategy — continuous-time analog at
+the synapse/dendrite boundary, clocked digital everywhere else — is also
+the strategy already implicit in the feasibility ranking of §4.5 (stages 1
+and 2 rated highest feasibility for custom analog/mixed-signal circuits;
+stage 3 rated highest feasibility precisely because existing digital
+somatic designs already suffice), so the continuous-time discussion in
+this section sharpens, rather than revises, the conclusions reached there.
