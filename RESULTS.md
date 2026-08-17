@@ -312,6 +312,65 @@ Settling it needs 12 % scale, where mPFC is 1440 cells and an assembly ~250, so
 recovered counts are ~30 vs ~10 — measurable rather than anecdotal — plus
 several seeds.
 
+## 11. The sparsity retune at 12 % — consolidation becomes selective (Job F)
+
+The cortical sparsity retune of §10 changed EC LII/LV and mPFC weights, `I_e`
+heterogeneity and E/I balance, and had only ever been run at 1 %. Job F
+(`res/2026-08-17/`, `SCALE=12 DG=1 N_PATTERNS=2 N_SWR=14`) is the sanity run at
+12 %. The core holds:
+
+| | pre-retune (08-05) | post-retune (08-17) |
+|---|---|---|
+| replay ρ_fwd / ρ_rev | +0.70 / −0.54 | **+0.63 / −0.66** (both p<0.001) |
+| DG granule active per window | 2.16 % | 1.55 % fwd, 1.60 % rev |
+| CA1 PYR | ~5 Hz | 4.82 Hz |
+| mPFC | 5.73 Hz (302 Hz in 08-07) | **1.19 Hz** |
+| EC LII | 6.12 Hz, 12005/12005 firing | 0.40 Hz, 1847/12005 firing |
+| L-LTP | 98.0 % of synapses | **7.0 %** |
+
+The L-LTP drop looks like a regression and is the opposite. In the dense regime
+*every* EC cell fired in *every* SWR window, so the PRP pool was just an event
+counter — `prp_mean` tracked the event index exactly, everything crossed the
+threshold of 14 together at event 14, and the final weights had CV 0.003 pinned
+at the ceiling. That is the same non-selective saturation that produced the
+retracted "engram" claim, seen from the consolidation side.
+
+With a sparse cortex only ~9 % of EC cells fire per window, PRP accumulates at
+0.075/event on average, and the cells that cross are the ones that reliably
+participate:
+
+```
+                consolidated (862 cells)   rest (11,143)
+  final PRP           24.0                     0.0        threshold 14
+  weight               0.486                   0.305      1.59x
+```
+
+862 of 12 005 EC cells (7.2 %) end up consolidated, weight CV 0.170 spread over
+0.29–0.74 — a differentiated trace rather than a saturated one. Consolidation is
+also **all-or-none per postsynaptic cell**: consolidated cells have ~49.9 of
+their ~51 incoming synapses captured. That is what STC predicts, since the PRP
+pool is somatic — and it is a property the dense regime could not have revealed.
+
+So the sparsity retune did not cost consolidation; it made consolidation
+selective. Whether that 7.2 % assembly is *pattern*-selective is Test 3, which
+has not yet run at 12 % (see below).
+
+### Job D timed out — in the lesion, not the simulation
+
+Job D (Test 3 consolidated) hit the 20 h limit, so Job E was never started. The
+simulation was not the problem: all 16 epochs finished in **10 758 s (3.0 h)**,
+close to the estimate. It then spent >9 h inside `lesion_hippocampus()`, which
+called `nest.GetConnections(source=CA1, target=EC)`. Filtering on `source` makes
+NEST scan the entire kernel connection table — ~19 M synapses at 12 % once the
+Schaffer STDP set exists. `build_ec_lii()` and `build_stc_hook()` both carry
+comments warning about exactly this; the lesion path was written later and
+missed it.
+
+Fixed by reusing the connection handles the STC hook already fetched (cost zero)
+and falling back to `GetConnections(target=)` with numpy source-filtering, which
+touches only that population's incoming slots. No parameter changes are needed —
+the run fits comfortably in 20 h once the scan is gone.
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in

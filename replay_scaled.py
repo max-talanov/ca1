@@ -1708,6 +1708,15 @@ class ECLVModule:
     K_ca1_lv    : int     # in-degree from CA1 PYR
     K_eclii_lv  : int     # in-degree from EC LII
     w_init      : float
+    # Incoming SynapseCollection + boolean mask marking the CA1-sourced
+    # entries, both captured at build time. lesion_hippocampus() needs exactly
+    # this and cannot afford to look it up later: GetConnections cost grows
+    # with total kernel size (30k incoming took 2.8 s on a bare kernel and
+    # 47.9 s once DG and the Schaffer STDP set existed), so the same scan at
+    # 12% after training is unbounded. Fetching here costs the same scan while
+    # the kernel is still small.
+    in_conns    : object = None
+    ca1_mask    : object = None
 
 
 @dataclass
@@ -2044,6 +2053,17 @@ def build_ec_lv(
 
     spk_lv = nest.Create("spike_recorder")
     nest.Connect(EC_LV, spk_lv)
+
+    # Cache the incoming synapses now, for lesion_hippocampus() (see the
+    # ECLVModule docstring: this scan gets dramatically more expensive once DG
+    # and the Schaffer STDP set are in the kernel).
+    t_c = _time.perf_counter()
+    in_conns = nest.GetConnections(target=EC_LV)
+    _src = np.asarray(in_conns.get("source"), dtype=np.int64)
+    ca1_mask = np.isin(_src, np.asarray(ca1_pyr.tolist(), dtype=np.int64))
+    print(f"  [ECLVModule] cached {len(_src):,} incoming for lesion "
+          f"({int(ca1_mask.sum()):,} from CA1) in {_time.perf_counter()-t_c:.2f}s")
+
     print(f"  [ECLVModule] Total build: {_time.perf_counter()-t0:.1f}s")
 
     return ECLVModule(
@@ -2053,6 +2073,8 @@ def build_ec_lv(
         K_ca1_lv    = K1,
         K_eclii_lv  = K2,
         w_init      = w_ca1_lv,
+        in_conns    = in_conns,
+        ca1_mask    = ca1_mask,
     )
 
 
@@ -2522,7 +2544,7 @@ def run_schaffer_stdp_hook(hook, net, t_start, t_end,
     return rec
 
 
-def lesion_hippocampus(net, ec_module, eclv_module):
+def lesion_hippocampus(net, ec_module, eclv_module, stc=None):
     """Silence hippocampal output to cortex — the systems-consolidation lesion.
 
     Zeroes CA1 -> EC LII and CA1 -> EC LV. Everything cortical (EC LII, EC LV,
@@ -2532,14 +2554,45 @@ def lesion_hippocampus(net, ec_module, eclv_module):
 
     Zeroing the projection rather than deleting neurons keeps the network
     topology and all cached synapse handles valid.
+
+    NEVER call GetConnections(source=, target=) here: filtering on source makes
+    NEST scan the whole kernel connection table, which at 12% with the Schaffer
+    STDP set present is ~19M+ synapses and took >9 h (it is what killed the
+    first Test-3 job). GetConnections(target=) hits only that population's
+    incoming slots -- the same fast path build_stc_hook() documents -- and the
+    source filtering is then done in numpy. Better still, reuse the handles the
+    STC hook already fetched: cost zero.
     """
     import nest
     n = 0
-    for tgt in [m.population for m in (ec_module, eclv_module) if m is not None]:
-        c = nest.GetConnections(source=net["PYR"], target=tgt)
-        if len(c):
-            nest.SetStatus(c, "weight", [0.0] * len(c))
-            n += len(c)
+    ca1 = np.asarray(net["PYR"].tolist(), dtype=np.int64)
+    for m in (ec_module, eclv_module):
+        if m is None:
+            continue
+        if stc is not None and m is ec_module and getattr(stc, "conns", None) is not None:
+            c = stc.conns                       # already fetched, all CA1->EC
+            if len(c):
+                nest.SetStatus(c, "weight", np.zeros(len(c)))
+                n += len(c)
+            continue
+        if getattr(m, "in_conns", None) is not None and getattr(m, "ca1_mask", None) is not None:
+            c, keep = m.in_conns, m.ca1_mask    # cached at build time
+        else:
+            t0 = time.perf_counter()
+            c = nest.GetConnections(target=m.population)
+            src = np.asarray(c.get("source"), dtype=np.int64)
+            keep = np.isin(src, ca1)
+            print(f"  [lesion] scanned {len(src):,} incoming in "
+                  f"{time.perf_counter()-t0:.1f}s, {int(keep.sum()):,} from CA1")
+        if not keep.any():
+            continue
+        # A SynapseCollection cannot be sub-indexed by an array, so rewrite the
+        # whole weight vector with the CA1 entries zeroed and everything else
+        # left at its current value.
+        w = np.asarray(c.get("weight"), dtype=float)
+        w[keep] = 0.0
+        nest.SetStatus(c, "weight", w)
+        n += int(keep.sum())
     print(f"  [lesion] CA1->cortex silenced: {n:,} synapses zeroed "
           f"(cortex intact, hippocampus disconnected)")
     return n
@@ -4229,7 +4282,7 @@ Dentate gyrus (Phase 6.2):
             print("  [SKIP] assembly too small to cue and score")
         else:
             # 2. lesion: hippocampal output to cortex is severed
-            lesion_hippocampus(net, ec_module, eclv_module)
+            lesion_hippocampus(net, ec_module, eclv_module, stc=stc_hook)
             # 3. tonic priming. After the lesion mPFC has NO input at all -- EC
             # LV is silent, so the only remaining excitation is the recurrent
             # collaterals, which cannot start from nothing. The CA3 completion

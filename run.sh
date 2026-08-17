@@ -39,12 +39,16 @@
 # one seed -- too small to trust. At 12% mPFC is 1440 cells and an assembly
 # ~250, so recovered counts are ~30 vs ~10.
 #
-# JOB F — sanity: does the core still hold after the cortical sparsity retune?
-#   Run FIRST. EC LII/LV/mPFC weights, I_e and E/I were all changed and have
-#   never been seen at 12%. Check replay rho, DG 2-4%, L-LTP staircase.
+# JOB F — sanity after the cortical sparsity retune.  DONE, PASSED (2026-08-17):
+#   replay +0.63/-0.66, DG 1.55%, mPFC 1.19 Hz, and consolidation is now
+#   SELECTIVE (862/12005 EC cells, weight CV 0.17) instead of saturated at 98%.
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14 run.sh
 #
 # JOB D — Test 3, consolidated (repeat for SEED=101,202,303)
+#   The 2026-08-17 attempt hit the 20 h wall AFTER finishing all 16 epochs in
+#   3.0 h: >9 h went into lesion_hippocampus()'s GetConnections(source=,target=),
+#   a whole-kernel scan over ~19M synapses. Fixed (the lesion now reuses the STC
+#   hook's handles), so these settings are unchanged and now fit in ~4 h.
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,TRAIN_PATTERN=0,N_SWR=16,\
 #SCHAFFER_K=200,DELAY_JITTER=4.0,SCHAFFER_STDP=1,CORTICAL_RECALL=1,SEED=101 run.sh
 #
