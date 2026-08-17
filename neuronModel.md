@@ -43,6 +43,58 @@ design:
    analogue multiply-accumulate at every synapse with a local
    compare-to-threshold operation whose output is a single wire.
 
+### 1.1 Neuromodulation of the synaptic weight
+
+`W` in the description above should not be read as a fixed, purely
+Hebbian-set parameter. In the biological system it is under continuous,
+time-varying gain control by ascending neuromodulatory afferents, and this
+gain control is a principal mechanism by which memory consolidation and
+temporal (state- and salience-dependent) weight update are implemented on
+top of, and largely independently of, spike-timing-dependent plasticity
+(STDP) itself:
+
+- **Dopamine (DA)** — acting largely through D1/D2-class receptors — gates
+  the transition from early- to late-phase potentiation. In the
+  synaptic-tagging-and-capture (STC) framework this project already uses
+  for CA1→EC consolidation, DA is the most direct biological analogue of
+  the plasticity-related-protein (PRP) capture signal: a synapse can be
+  tagged by coincident pre/post activity, but whether that tag is
+  *captured* into a stable weight change is conditioned on a
+  DA-dependent permissive signal, closely mirroring the `PRP_threshold`
+  gate in the existing consolidation model.
+- **Serotonin (5-HT)** modulates the sign and threshold of plasticity at
+  many hippocampal and cortical synapses, and interacts with network
+  excitability/inhibition balance, effectively shifting where the stage-1
+  threshold sits without touching `W` directly.
+- **Noradrenaline (NA)**, released under arousal and novelty, transiently
+  raises gain and lowers the effective threshold for potentiation,
+  consistent with its role in prioritizing salient or unexpected input for
+  consolidation — a time-locked, arousal-gated multiplier on the
+  otherwise activity-only weight update.
+- **Acetylcholine (ACh)** shifts the hippocampal circuit between
+  encoding-favoring and consolidation/replay-favoring regimes (high ACh
+  during active exploration suppresses recurrent/feedback transmission and
+  favors afferent-driven encoding; low ACh during quiet wakefulness and
+  slow-wave sleep favors the recurrent replay this project's SWR
+  simulations model), and thereby indirectly gates *when* stage-1
+  thresholding is allowed to translate into lasting weight change.
+- **Oxytocin (Oxt)** modulates interneuron excitability and social/
+  salience-tagged plasticity in hippocampal and related circuits, acting
+  as a further context-dependent multiplier on effective synaptic gain
+  for specific classes of input.
+
+Functionally, each of these neuromodulators acts on a slower timescale
+than the millisecond-scale dSpike threshold crossing itself, so the
+correct way to model their effect at stage 1 is as a **multiplicative,
+slowly-varying gain term on `W`** (or, equivalently, a slow shift of the
+local threshold), rather than as an additional fast synaptic input. This
+distinction matters for the network-level claim of §0: it means the
+"convolution" performed by the dendritic spike is not applied to a static
+weight but to a weight that itself carries a second, slower time constant
+set by neuromodulatory tone — which is exactly the mechanism needed to
+implement selective, state-dependent memory consolidation without
+requiring every synapse to be re-evaluated by STDP timing alone.
+
 **Optimization idea.** Implement each synapse as a two-terminal memristive
 element whose conductance encodes `W`, feeding a local comparator (or a
 sub-threshold CMOS integrate-and-fire node) shared by a small cluster of
@@ -53,7 +105,16 @@ This converts an O(N) analogue fan-in problem into an O(N) local threshold
 problem followed by an O(1) digital wire per segment — a substantial
 reduction in wiring and in analogue-to-digital conversion (ADC) load, which
 is typically the dominant area and power cost in mixed-signal neuromorphic
-chips.
+chips. Neuromodulation can be added to this circuit cheaply because it is
+slow: rather than a per-synapse fast input, a small number of global or
+regional bias lines (one per modeled neuromodulator, analogous to DA, 5-HT,
+NA, ACh and Oxt) can modulate either the memristor's write-enable
+threshold (gating whether a coincidence-driven SET/RESET pulse is allowed
+to change the stored conductance — the direct hardware analogue of tag
+capture) or the comparator's reference voltage (shifting the effective
+stage-1 threshold). Both mechanisms reuse existing circuit elements and
+add only a handful of shared analogue bias wires per dendritic region,
+rather than new circuitry per synapse.
 
 ## 2. Second-level convolution: the dendritic junction as a temporal winner-take-all gate
 
