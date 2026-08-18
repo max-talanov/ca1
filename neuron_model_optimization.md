@@ -2,14 +2,6 @@
 
 ## 0. Scope and framing
 
-This note extends the original *Dendritic convolution* draft into a structured
-account of how the dendritic-tree processing observed in the Associative
-Cortex (AC) and Hippocampal system (HS) can be read as a three-stage
-information-reduction (convolution) pipeline, and it closes with a feasibility
-assessment of implementing that pipeline in electronic — specifically
-memristive/CMOS mixed-signal — spiking neural network (SNN) hardware, in the
-context of the tinyHippo project's NEST-based CA3/CA1 model.
-
 The word "convolution" is used here in its information-theoretic sense — a
 progressive folding-down of a high-dimensional input space onto a
 lower-dimensional decision variable — rather than in the discrete-signal-
