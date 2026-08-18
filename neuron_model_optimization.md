@@ -116,44 +116,104 @@ stage-1 threshold). Both mechanisms reuse existing circuit elements and
 add only a handful of shared analogue bias wires per dendritic region,
 rather than new circuitry per synapse.
 
-## 2. Second-level convolution: the dendritic junction as a temporal winner-take-all gate
+## 2. Second-level convolution: the dendritic junction as an OR-gated refractory generator
 
 A dendritic junction — the point where several dendritic branches converge
-onto a parent branch or the soma — passes through only the *first* dSpike
-that arrives, and then blocks further spikes from sibling branches for the
-duration of that first spike's refractory period.
+onto a parent branch or the soma — responds to the *first* dSpike that
+arrives while it is idle, and then blocks further spikes from sibling
+branches for the duration of that first spike's refractory period.
 
-This is a **first-past-the-post, time-domain convolution**: among several
-branches that convolved their own inputs to a boolean value in stage 1, the
-junction convolves *those* booleans down to a single winning branch,
-selected purely by arrival time. Two things follow:
+The functionally important point, worth stating precisely because it
+determines the circuit that implements it, is that the junction does not
+need to identify *which* branch fired first. Its contract is: if the OR of
+its input branches is asserted while the junction is idle, enter a
+refractory state for a fixed duration `τ_rf` and emit exactly one output
+event (the junction spike, jSpike) marking that transition. Which branch
+happened to trigger it is discarded along with everything else the
+junction does not pass on. This makes the junction, functionally, a
+coincidence-OR feeding a leaky-integrate-and-fire node with a hard
+refractory period — the same circuit primitive as a spiking neuron, just
+with "OR of upstream dSpikes" in place of a weighted synaptic sum, and
+reusable at every level of the dendritic hierarchy (and, with different
+fan-in and thresholds, at the soma itself).
 
-1. The junction performs sparsification "for free," using only relative
-   timing rather than an explicit comparison-of-magnitudes circuit. This is
-   cheaper than a conventional winner-take-all (WTA) network, which normally
-   requires lateral inhibition wired across all competing units.
-2. Because the criterion is temporal precedence, not amplitude, the
-   junction is intrinsically compatible with spike-timing-dependent
-   information coding: whichever input arrived because it was most strongly
-   or most reliably driven (highest `W`, most correlated presynaptic burst)
-   tends to win, so amplitude information is implicitly translated into
-   latency and preserved through the gate even though the gate itself only
-   ever looks at *order*.
+This is a **coincidence-detection, time-domain convolution**: among
+several branches that convolved their own inputs to a boolean value in
+stage 1, the junction convolves *those* booleans down to a single "an
+event occurred here" bit, gated by a fixed dead-time. Two things follow:
 
-**Optimization idea.** A junction can be realized as a monostable
-(refractory) latch per dendritic node: the first incoming digital dSpike
-edge sets the latch, the latch output enables a fixed-width refractory
-timer, and any dSpike arriving inside that window is simply discarded by
-gating it against the latch state. This is a few-transistor digital circuit
-per junction (one flip-flop, one timer), dramatically cheaper than an
-analogue lateral-inhibition WTA circuit of the classical Lazzaro/Mead type,
-at the cost of encoding competition in time rather than in current
-amplitude. The trade-off is worth stating precisely: analogue WTA circuits
-give a continuous, graded notion of "winning margin," while the
-refractory-junction implementation gives a binary winner with no margin
-information — this is a deliberate loss of information that mirrors the
-biological original and should be treated as a modeling choice, not an
-implementation artifact.
+1. The junction performs sparsification "for free," using only a dead-time
+   after the first qualifying input rather than an explicit
+   comparison-of-magnitudes circuit. This is cheaper than a conventional
+   winner-take-all (WTA) network, which normally requires lateral
+   inhibition wired across all competing units — and it is cheaper still
+   than a WTA that also has to resolve *which* input won, since the
+   junction described here never computes that.
+2. Because no arrival-order decision is ever made, the junction carries no
+   risk of an arbitration artifact (a digitally-induced tie-break bias, or
+   an analog metastability event) of the kind that a true first-past-the-post
+   arbiter would have to resolve. What is preserved through the gate is
+   coarser than order — only "something happened, no earlier than the last
+   jSpike plus `τ_rf`" — which is a deliberately weaker guarantee than the
+   original framing implied, and should be read as a simplification of the
+   biological picture rather than a loss relative to it: the sparsification
+   and dead-time behavior are preserved, the (unused) information about
+   which branch won is simply never computed.
+
+**Optimization idea — digital/mixed-signal ASIC.** Realize the junction as
+a wired-OR of the branch dSpike lines (open-drain pull-downs onto a shared
+rail — no OR-gate tree, and fan-in scales without added logic depth) into
+a two-state finite-state machine (IDLE / REFRACTORY) built from standard
+cells: on the wired-OR asserting while IDLE, load a down-counter with
+`τ_rf / t_tick`, emit one jSpike pulse, and transition to REFRACTORY;
+decrement the counter each tick; re-enter IDLE at zero. Because the
+junction never needs to know which input arrived first, the counter only
+has to resolve `τ_rf` to within a tick — it does not need to resolve *when
+within a tick* the triggering input arrived — so this FSM can run on a
+clock far coarser than the analog signal it is gating (see §5). The one
+place fast logic is still required is input capture: a brief wired-OR
+pulse can occur at any phase relative to a slow FSM clock, so a small
+asynchronous edge-catcher (an SR latch set by the OR line, cleared
+synchronously once the FSM has sampled it — a standard clock-domain-crossing
+pattern) must sit between the fast dSpike lines and the slow FSM to avoid
+dropping a brief triggering event. This is a well-understood, foundry-
+qualified digital design pattern, not a research risk.
+
+**Optimization idea — memristive/analog.** The same behavior can be
+realized directly in device physics using a *volatile* (diffusive or
+threshold-switching) memristor — two-terminal devices, reported in the
+neuromorphic-device literature in material systems such as Ag- or
+Cu-filament threshold switches and NbOₓ-type Mott-insulator switches, that
+transition to a low-resistance ON state once a current or voltage pulse
+crosses a SET threshold and then spontaneously relax back to the
+high-resistance OFF state over an intrinsic retention time, with no
+separate timing capacitor or digital counter needed. Each branch's dSpike
+delivers a current pulse to a shared node through a diode-OR-like element
+(a threshold/maximum detector, not a precision summer, which relaxes the
+linearity requirements on the analog front end considerably relative to a
+true summing amplifier); the first pulse to cross the device's SET
+threshold switches it ON, a downstream comparator sensing the ON state
+emits the jSpike, and the device's own relaxation dynamics *are* the
+refractory period, with the ON-state I–V characteristic making the device
+insensitive to further input pulses while it recovers. This folds "OR +
+threshold + refractory timer" into a single device rather than three
+circuit blocks, which is attractive for area and power at the density a
+biologically-faithful dendritic tree would require (potentially thousands
+of junctions per neuron). It should be stated precisely, in keeping with
+not overselling device readiness: reported relaxation/retention times for
+volatile memristors span a wide range in the literature — roughly
+microseconds to seconds — depending on material system, filament
+geometry, and operating conditions, so reliably targeting a specific
+`τ_rf` in the low-to-mid millisecond range is a device-engineering and
+characterization problem, not something the technology class guarantees
+by default. Cell-to-cell and cycle-to-cycle variability in that relaxation
+time would need to be characterized and, if excessive, compensated (design
+margining, or a hybrid device-plus-CMOS trim) before this could be relied
+on as the sole source of `τ_rf` in a production design. A pragmatic
+near-term path is therefore the CMOS FSM described above (foundry-standard,
+low risk, immediately tapeable), with the volatile-memristor realization
+treated as a higher-payoff, higher-risk path for a later design iteration
+once device retention statistics for the target `τ_rf` are characterized.
 
 ### 2.1 Clustering of synapses
 
@@ -250,36 +310,54 @@ synapses per die); production-scale reliability engineering (drift
 compensation, per-cell calibration) is incremental, not fundamental,
 research.
 
-### 4.2 Stage 2 (junction / refractory winner-take-all): moderate feasibility
+### 4.2 Stage 2 (junction / OR-gated refractory generator): high feasibility
 
-The refractory-latch implementation proposed in §2 is circuit-trivial in
-digital CMOS (a set-reset latch plus a one-shot timer is a handful of
-transistors) and there is no serious feasibility obstacle to building it.
-The open questions are architectural rather than device-level:
+The OR-plus-refractory-FSM implementation proposed in §2 is circuit-trivial
+in digital CMOS (a wired-OR, an edge-catcher latch, and a two-state
+down-counter FSM is a handful of standard cells) and, because the junction
+never has to resolve *which* input arrived first, there is no arbitration
+or metastability-management circuitry to design or verify — this raises
+the feasibility of this stage relative to a true first-past-the-post
+arbiter. The open questions are architectural/parametric rather than
+device-level:
 
 - **Fan-in topology.** Biological dendritic trees have a branching junction
   structure (many small local junctions feeding progressively fewer, larger
   junctions toward the soma). Replicating a multi-level junction hierarchy
   in silicon means routing binary dSpike wires through several logic levels
-  per neuron rather than a single flat OR/priority gate, which multiplies
-  the per-neuron logic footprint roughly linearly with the number of
-  hierarchy levels chosen. A shallow (one- or two-level) approximation is
-  cheap; a biologically faithful multi-level tree is a larger but still
-  bounded digital design problem, well within reach of a standard-cell ASIC
-  flow.
+  per neuron rather than a single flat OR gate, which multiplies the
+  per-neuron logic footprint roughly linearly with the number of hierarchy
+  levels chosen. A shallow (one- or two-level) approximation is cheap; a
+  biologically faithful multi-level tree is a larger but still bounded
+  digital design problem, well within reach of a standard-cell ASIC flow —
+  and because each level is the same reusable OR-plus-refractory leaf cell
+  (§2), adding levels is a replication cost, not a new design.
 - **Refractory window matching.** The refractory period must be tuned
-  relative to the expected inter-spike arrival jitter of competing
-  branches; too short a window fails to suppress legitimate late arrivals
+  relative to the expected inter-spike arrival rate of competing branches;
+  too short a window fails to suppress legitimate closely-spaced arrivals
   from the same event, too long a window under-utilizes the junction's
-  temporal bandwidth. This is a parameter-tuning problem addressable by
+  temporal bandwidth and, at high input rates, risks folding together
+  events that a downstream consumer (e.g., a replay-order metric) would
+  need distinguished. This is a parameter-tuning problem addressable by
   simulation (e.g., against the tinyHippo NEST model's own inter-group
   timing, which in the SWR replay experiments already documented in
   `bidirectional_replay.py` runs on a millisecond scale — ~3.8 ms between
   sequence groups at 10% network scale), not an open research question.
+- **Volatile-memristor realization specifically.** If `τ_rf` is implemented
+  as a memristor's intrinsic relaxation time rather than a digital counter
+  (§2), device retention variability becomes the dominant risk, per §4.1's
+  discussion of conductance drift — here affecting a *timing* parameter
+  rather than a stored weight, which is a less-studied failure mode and
+  should be treated as the higher-risk of the two implementation options
+  in §2 until characterized.
 
-Verdict: feasible with a straightforward digital design; the work is in
-tuning the hierarchy depth and refractory constants against a target
-biological timing regime rather than in inventing new devices.
+Verdict: feasible with a straightforward digital design (the CMOS FSM
+option in §2), and this is now the more clearly "solved" of the two
+custom-circuit stages precisely because it does not need to arbitrate
+order; the volatile-memristor option is feasible in principle but carries
+device-characterization risk specific to hitting a target `τ_rf`, similar
+in kind to (though distinct in mechanism from) the conductance-drift risk
+already flagged for stage 1.
 
 ### 4.3 Clustering / topology-aware routing: the binding constraint
 
@@ -332,7 +410,7 @@ Verdict: fully feasible with existing, deployed circuit techniques.
 | Stage | Core electronic primitive | Feasibility | Dominant risk |
 |---|---|---|---|
 | Postsynaptic dSpike | Memristor + local comparator | High (prototype-ready) | Conductance drift shifting the threshold |
-| Junction / refractory WTA | Digital latch + one-shot timer | High–moderate | Hierarchy depth vs. logic footprint trade-off |
+| Junction / OR-refractory generator | Wired-OR + edge-catcher + counter FSM (or volatile memristor) | High | Hierarchy depth (digital) / `τ_rf` retention variability (memristive) |
 | Synaptic clustering | Non-uniform crossbar floorplan / reconfigurable interconnect | Moderate | Requires 3D or application-specific fabric to be biologically faithful |
 | Somatic E/I summation | Differential integrate-and-fire | High (already standard) | None specific to this proposal |
 
@@ -387,21 +465,17 @@ realization of the dendritic-convolution pipeline is proposed to close.
   asynchronously, exactly when threshold is crossed, with a hardware
   latency set by transistor bandwidth (typically nanoseconds to low
   microseconds) rather than by a simulation tick.
-- **Stage 2 (junction arbitration).** The "first spike wins" rule is only
-  meaningful if the hardware can actually resolve which of several
-  candidate spikes arrived first. In continuous time this is a
-  well-posed question with probability zero of an exact tie (for
-  independent, continuously distributed arrival times). Under a
-  fixed-tick digital clock, two dSpikes that cross threshold within the
-  same tick are indistinguishable in arrival order and require an
-  arbitrary tie-breaking rule (e.g., fixed priority by row address),
-  which silently and systematically biases which branch "wins" — a
-  digitally-induced artifact with no biological counterpart. The finer
-  the tick, the rarer this collision, but it is never eliminated by
-  clocking alone; a genuinely asynchronous, self-timed (clockless)
-  arbitration circuit — of the kind already used in TrueNorth's
-  asynchronous crossbar fabric or in classical mutual-exclusion (metastability-
-  resolving) arbiter circuits — removes the artifact by construction.
+- **Stage 2 (junction OR-detection).** With the junction specified as in
+  §2 — OR the inputs, and if asserted while idle, block for `τ_rf` and
+  emit one jSpike — there is no arrival-order decision to make, and
+  therefore no arbitration-artifact risk of the kind an earlier draft of
+  this section attributed to this stage. What remains genuinely
+  timing-sensitive is narrower: (a) not missing a brief OR-assertion that
+  falls between two ticks of a slow digital clock, which is solved by the
+  asynchronous edge-catcher described in §2, not by clocking the whole
+  junction faster; and (b) sizing `τ_rf` correctly relative to the
+  clock, which §5.6 works through quantitatively. Continuous time still
+  matters here, but for input capture, not for resolving competition.
 - **Stage 3 (somatic integration).** The excitatory/inhibitory balance is
   integrated over a leak time constant that is itself continuous; how
   finely a digital implementation must sample it depends on how fast that
@@ -420,16 +494,20 @@ scale, and the STDP window used for tagging is ±20 ms with a forward axonal
 delay of about 3 ms. Two implications follow directly:
 
 1. A digital tick coarser than roughly a few hundred microseconds begins
-   to erode the ability to resolve which of two closely spaced sequence
-   groups produced the earlier dendritic spike, which is exactly the
-   ordering information the stage-2 junction is meant to preserve; a
-   tick on the order of the 3.8 ms inter-group spacing (or coarser, as is
-   typical of default 0.1–1 ms digital-SNN and NEST time steps once
-   several tick periods of latency are added by synchronous pipeline
-   stages) is adequate for network-level replay-order statistics (the
-   Spearman-ρ metric already used to score replay quality) but is not
-   adequate for preserving fine-grained relative timing *within* a single
-   SWR event at the resolution the biological circuit appears to use.
+   to risk folding two closely-spaced sequence-group-driven dSpikes into
+   the same junction tick, which — given the corrected junction spec of
+   §2 — does not corrupt an arrival-order decision (there is none to
+   corrupt) but can still cost network-level replay-order fidelity if the
+   tick is coarse enough to merge dSpikes from *different* sequence
+   groups into the *same* jSpike or the same refractory window; a tick on
+   the order of the 3.8 ms inter-group spacing (or coarser, as is typical
+   of default 0.1–1 ms digital-SNN and NEST time steps once several tick
+   periods of latency are added by synchronous pipeline stages) is
+   adequate for network-level replay-order statistics (the Spearman-ρ
+   metric already used to score replay quality) but is not adequate for
+   preserving fine-grained relative timing *within* a single SWR event at
+   the resolution the biological circuit appears to use. §5.6 works out
+   the specific bound this places on the junction's own tick size.
 2. The forward/reverse LTP/LTD asymmetry in the STC mechanism depends on
    the sign of a millisecond-scale timing difference (+3 ms vs. −3 ms).
    Any digital implementation whose effective tick or pipeline latency
@@ -486,13 +564,19 @@ continuous-time analog circuits as a strictly dominant option:
   memristor conductance drift (§4.1) act continuously on the threshold,
   so timing precision in the abstract does not automatically translate
   into timing *accuracy* without calibration.
-- **Verification and yield.** A digital tie-breaking rule, however
-  biologically inexact, is at least fully specified and reproducible
-  across chips; a self-timed arbiter's behavior near true coincidence is
-  governed by circuit metastability, which is a well-understood but
-  non-trivial design discipline (bounded, not eliminated, resolution
-  time) and complicates functional verification relative to a
-  synchronous design.
+- **Verification and yield.** With the corrected junction spec of §2 this
+  point no longer applies to stage 2's core function (there is no
+  arrival-order arbiter to characterize near coincidence), but it
+  resurfaces for the volatile-memristor realization of `τ_rf`: a digital
+  counter's dead-time is fully specified and reproducible across chips,
+  while a device-physics relaxation time carries cycle-to-cycle and
+  cell-to-cell variability that must be characterized before it can be
+  trusted as a production timing reference (§2, §4.2). The general
+  point — that moving a function into continuous-time device physics
+  trades deterministic, easily verified digital behavior for a
+  distribution that must be measured and margined — still holds; it is
+  just not, in this corrected version of the proposal, a metastability
+  problem specifically.
 
 ### 5.5 Recommended position
 
@@ -507,10 +591,74 @@ bookkeeping already well served by existing crossbar/router architectures
 in Loihi-class chips), can remain clocked digital without materially
 weakening the timing claims of §§1–3, because summation over a leak time
 constant is the one stage in this pipeline that is genuinely tolerant of
-tick-scale quantization. This mixed strategy — continuous-time analog at
-the synapse/dendrite boundary, clocked digital everywhere else — is also
-the strategy already implicit in the feasibility ranking of §4.5 (stages 1
-and 2 rated highest feasibility for custom analog/mixed-signal circuits;
-stage 3 rated highest feasibility precisely because existing digital
-somatic designs already suffice), so the continuous-time discussion in
-this section sharpens, rather than revises, the conclusions reached there.
+tick-scale quantization. This mixed strategy — continuous-time analog (or a fast asynchronous
+edge-catcher) at the synapse/dendrite boundary, clocked digital everywhere
+else — is also the strategy already implicit in the feasibility ranking of
+§4.5, and with the corrected junction spec of §2 the case for stage 2
+specifically is now narrower than the original draft of this section
+suggested: stage 2's continuous-time requirement is confined to not
+missing a brief OR-assertion between ticks, not to resolving arrival
+order, which is a materially smaller and cheaper ask.
+
+### 5.6 How coarse can the junction's own tick be, given `τ_rf`?
+
+A natural question, given that the junction's refractory period `τ_rf` is
+itself commonly cited in the 5–10 ms range for dendritic spikes, is
+whether the junction's own digital logic could simply run at a tick near
+`τ_rf` — i.e., 1–10 ms — rather than at the sub-millisecond scale implied
+by §5.2. The corrected junction spec of §2 makes the answer more favorable
+than it would be for a true arbiter, but the two timescales involved
+should not be conflated:
+
+- `τ_rf` bounds how often the junction can report a **new** event: since
+  the junction is blocked for `τ_rf` after firing, its maximum output
+  rate is `1/τ_rf` (roughly 100–200 Hz for `τ_rf` = 5–10 ms). Downstream
+  logic — propagating the jSpike, updating the somatic accumulator,
+  network-level bookkeeping — genuinely does not need to sample this
+  channel faster than `τ_rf` to avoid losing decisions, and a synchronous
+  FSM tick approaching `τ_rf` is defensible for that purpose alone. This
+  is the sense in which the intuition behind a 1–10 ms system tick is
+  correct, and it is *more* clearly correct here than it would be for a
+  true first-past-the-post arbiter, precisely because the junction no
+  longer needs to preserve order information that a coarse tick could
+  corrupt.
+- `τ_rf` does **not** by itself bound how finely the *input capture* stage
+  needs to resolve the OR-assertion. Two candidate dSpikes converging on
+  one junction can be much closer together than `τ_rf` — in the tinyHippo
+  timing regime, consecutive sequence-group activations are only ~3.8 ms
+  apart, well inside a 5–10 ms refractory window — so multiple jSpike-
+  triggering events from *distinct* upstream sources can cluster inside a
+  single junction dead-time. Because the junction only needs to know
+  *that* the OR fired, not *which* input did, this no longer creates an
+  arbitration problem; but if the goal is also to preserve which
+  higher-level sequence group produced which jSpike (a network-level,
+  not junction-level, requirement — relevant to the Spearman-ρ
+  replay-order metric), the tick governing *when the OR is sampled* still
+  needs to be commensurate with the ~3.8 ms inter-event spacing, not with
+  `τ_rf`.
+- There is also a phase-alignment issue independent of both numbers above:
+  a synchronous tick set equal to `τ_rf` only avoids missing events if it
+  happens to be aligned to the start of each refractory window, which an
+  asynchronously-arriving biological input never guarantees. Without the
+  edge-catcher described in §2 (or oversampling by roughly 2–10×), a tick
+  at `τ_rf` can miss or mis-time a brief OR-assertion that straddles a
+  tick boundary.
+
+Net assessment: your intuition is correct for the **junction's own
+bookkeeping and downstream propagation logic** — a 1–10 ms tick, and
+specifically the low end of that range given the ~3.8 ms inter-event
+spacing already present in the tinyHippo model, is an adequate and
+inexpensive design point, and the corrected OR-plus-refractory spec makes
+it *more* defensible than it would have been under the original
+winner-take-all framing, since no ordering fidelity is being traded away
+by using a coarse tick. It does not, however, extend to the fast
+edge-capture element sitting between the analog dSpike lines and that
+slow tick domain — that element still needs to operate on a timescale set
+by the shortest gap between competing inputs (sub-millisecond in this
+project's own SWR timing), not by `τ_rf`, precisely so that the coarse
+downstream tick has a correct, un-aliased OR signal to sample in the
+first place. This also substantially weakens the energy argument in §5.3
+as applied specifically to stage 2: at a 1–10 ms tick, clock power is not
+a binding constraint (kHz-range clocking is trivially cheap in CMOS), so
+the case for continuous-time circuitry at the junction rests entirely on
+correct edge capture, not on energy savings from avoiding a faster clock.
