@@ -371,6 +371,49 @@ and falling back to `GetConnections(target=)` with numpy source-filtering, which
 touches only that population's incoming slots. No parameter changes are needed —
 the run fits comfortably in 20 h once the scan is gone.
 
+## 12. Test 3 at 12 % — cortical recall does not survive the lesion (Jobs D + E)
+
+`res/2026-08-19/`, seed 101, 16 epochs, `SCHAFFER_K=200`, `DELAY_JITTER=4.0`.
+Both jobs completed: the lesion that consumed >9 h in the previous attempt now
+runs from cached handles, and the post-lesion probe window is present in both
+outputs. The hippocampal side is bit-identical across D and E (ρ +0.632/−0.656,
+L-LTP 10.1 %, DG 1.52 %), as it must be — `NO_MPFC_ASSOC` touches only the
+cortical hook — so the comparison is properly controlled.
+
+Recall reconstructed from the saved mPFC spikes (cue at 16 200 ms, 80 ms
+scoring window, 40 % of the assembly cued, baseline 16 100–16 180 ms):
+
+| | assembly | uncued | cue_recall | completion | baseline | net |
+|---|---|---|---|---|---|---|
+| D consolidated | 309 | 185 | 0.992 | 0.049 (9 cells) | 0.022 (4) | **+0.027** |
+| E control | 303 | 182 | 1.000 | 0.016 (3 cells) | 0.005 (1) | **+0.011** |
+
+**This is a negative result.** The `[OK]` criterion is 0.25, which at this
+assembly size means ~46 of 185 uncued cells; D reactivated 9. Both runs miss it
+by roughly an order of magnitude, so the gap is not a matter of statistical
+power — cortex does not reconstruct the pattern once the hippocampus is cut.
+
+D is directionally above E, 3x on the raw counts, matching the direction of the
+1 % preliminary in §10. It does not survive testing: Fisher exact on 9/185 vs
+3/182 gives **p = 0.140**, from a single seed. This is the same profile as the
+EC LV effect in §9 that failed to replicate across three seeds, and it should
+not be reported as an effect. D against its own pre-cue baseline is p = 0.020,
+but that is 9 cells against an expected 4.
+
+The mechanism is visible in the recurrent weights. The mPFC→mPFC hook
+(28 800 synapses, K_rec 20 over 1440 cells) barely moved: median exactly at
+`w_init` 1.8, mean 1.833, and only 614 synapses (2.1 %) reached the 2.4 ceiling.
+Even if every one of those landed inside the 309-cell assembly, that is ~2 strong
+recurrent inputs per cell. Against an ~20 mV rest→threshold gap that cannot
+ignite a cell — and the true figure is lower still, since the volley arithmetic
+of §10 only holds for synchronous arrival and this input is sparse and
+asynchronous. There is a cortical trace; there is no cortical attractor.
+
+So the honest state of the loop: replay, separation, completion, tagging and
+selective consolidation all work at 12 %, and the trace reaches cortex as
+weights — but it is not yet strong enough to be *read out* without the
+hippocampus, which is what systems consolidation requires.
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
