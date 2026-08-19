@@ -400,25 +400,48 @@ def jittered_delay(base, jitter, lo=0.5):
 # than by anything biological. Spreading delays turns that instantaneous sum
 # into a temporal integral, and spreading weights and cell excitability means
 # the same input recruits a reproducible SUBSET rather than all-or-none.
-_HET = {"w_cv": 0.0, "delay_cv": 0.0, "neuron_cv": 0.0}
+_HET = {"w_cv": 0.0, "delay_cv": 0.0, "neuron_cv": 0.0, "wcomp": 1.0}
 
 
-def set_heterogeneity(w_cv=0.0, delay_cv=0.0, neuron_cv=0.0):
-    """Set the model-wide defaults consulted by fixed_connect / het_params."""
+def set_heterogeneity(w_cv=0.0, delay_cv=0.0, neuron_cv=0.0, wcomp=1.0):
+    """Set the model-wide defaults consulted by fixed_connect / het_params.
+
+    wcomp scales every weight. Heterogeneity LOWERS effective gain: spreading
+    arrival times reduces coincident summation, and because firing is a
+    threshold nonlinearity, spreading input around a fixed mean moves the
+    population mean rate DOWN rather than leaving it unchanged. The model's
+    operating point was tuned with synchronous volleys, so switching it on
+    without compensation drops CA1 PYR ~4x at cv 0.15 (4.05 -> 0.97 Hz) while
+    interneurons barely move. --delay-jitter-wcomp already does this for the
+    five jittered projections; this is the model-wide equivalent.
+    """
     _HET["w_cv"] = float(w_cv or 0.0)
     _HET["delay_cv"] = float(delay_cv or 0.0)
     _HET["neuron_cv"] = float(neuron_cv or 0.0)
-    if any(_HET.values()):
+    _HET["wcomp"] = float(wcomp if wcomp else 1.0)
+    if any(v for k, v in _HET.items() if k != "wcomp") or _HET["wcomp"] != 1.0:
         print(f"  [het] model-wide heterogeneity: weights cv={_HET['w_cv']}, "
-              f"delays cv={_HET['delay_cv']}, neuron params cv={_HET['neuron_cv']}")
+              f"delays cv={_HET['delay_cv']}, neuron params cv={_HET['neuron_cv']}, "
+              f"weight compensation x{_HET['wcomp']}")
 
 
 # Izhikevich parameters that may be spread per cell. a and d are strictly
 # positive; b enters the fixed points as (5-b) so it is kept well away from 5;
 # c is the reset potential. I_e shifts rheobase directly and is the persistent
 # excitability knob (V_m heterogeneity is not -- it washes out at rest).
+# A CV is only meaningful for a parameter with a true zero. a, b and d are
+# rates/gains and scale relatively; c and I_e are voltages/currents whose zero
+# point is arbitrary, so a relative CV is nonsense for them -- 30% of c = -65 mV
+# is 19.5 mV, which drew cells with a reset potential ABOVE the -50 mV threshold
+# and made them self-ignite (measured: interneurons 20 -> 48 Hz, CA1 PYR
+# collapsing to 0.32 Hz, rho_rev failing at -0.309). Those get an absolute
+# reference scale instead, multiplied by the same cv knob.
 _HET_NEURON_KEYS = ("a", "b", "c", "d", "I_e")
-_HET_CLIP = {"a": (1e-3, 1.0), "b": (0.01, 4.5), "c": (-80.0, -40.0),
+_HET_SCALE = {"a": ("rel", None), "b": ("rel", None), "d": ("rel", None),
+              "c": ("abs", 5.0),      # cv 0.3 -> 1.5 mV spread of reset
+              "I_e": ("abs", 3.0)}    # cv 0.3 -> 0.9 pA spread of drive
+# c stays clear of the ~-50 mV threshold: a cell must not reset above it.
+_HET_CLIP = {"a": (1e-3, 1.0), "b": (0.01, 4.5), "c": (-80.0, -55.0),
              "d": (0.05, 30.0), "I_e": (None, None)}
 
 
@@ -439,9 +462,16 @@ def het_params(params, n, rng, cv=None):
         if not isinstance(out[k], (int, float)):
             continue            # already per-cell (e.g. I_e set explicitly)
         base = float(out[k])
-        if base == 0.0:
+        mode, ref = _HET_SCALE.get(k, ("rel", None))
+        if mode == "rel":
+            if base == 0.0:
+                continue        # nothing to scale relatively
+            sd = abs(base) * cv
+        else:
+            sd = float(ref) * cv    # absolute: applies even when base is 0
+        if sd <= 0:
             continue
-        vals = rng.normal(base, abs(base) * cv, n)
+        vals = rng.normal(base, sd, n)
         lo, hi = _HET_CLIP.get(k, (None, None))
         if lo is not None or hi is not None:
             vals = np.clip(vals, lo if lo is not None else -np.inf,
@@ -482,6 +512,8 @@ def fixed_connect(pre, post, indegree, weight, delay, w_cv=None):
     """
     if w_cv is None:
         w_cv = _HET["w_cv"]
+    if isinstance(weight, (int, float)) and _HET["wcomp"] != 1.0:
+        weight = float(weight) * _HET["wcomp"]
     # Global delay heterogeneity: a scalar delay becomes uniform(d+/-cv*d).
     if isinstance(delay, (int, float)) and _HET["delay_cv"] > 0:
         delay = jittered_delay(float(delay), float(delay) * _HET["delay_cv"])
@@ -4005,6 +4037,12 @@ Dentate gyrus (Phase 6.2):
              "ceiling of §13. Try 0.2-0.4. Overridden per-channel by the three "
              "flags below.")
     parser.add_argument(
+        "--het-wcomp", type=float, default=1.0, metavar="X",
+        help="Weight scale applied model-wide alongside --het, restoring the "
+             "operating point that heterogeneity lowers. Without it CA1 PYR "
+             "falls ~4x at cv 0.15, which confounds any comparison against the "
+             "homogeneous condition.")
+    parser.add_argument(
         "--het-w-cv", type=float, default=None, metavar="CV",
         help="Weight CV on every projection (default: --het).")
     parser.add_argument(
@@ -4171,7 +4209,8 @@ Dentate gyrus (Phase 6.2):
     _pick = lambda v: args.het if v is None else v
     set_heterogeneity(w_cv=_pick(args.het_w_cv),
                       delay_cv=_pick(args.het_delay_cv),
-                      neuron_cv=_pick(args.het_neuron_cv))
+                      neuron_cv=_pick(args.het_neuron_cv),
+                      wcomp=args.het_wcomp)
 
     # Parse alpha sweep into a list of floats; empty list = single-alpha mode
     if args.alpha_sweep is not None:
