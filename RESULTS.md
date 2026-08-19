@@ -400,14 +400,33 @@ EC LV effect in §9 that failed to replicate across three seeds, and it should
 not be reported as an effect. D against its own pre-cue baseline is p = 0.020,
 but that is 9 cells against an expected 4.
 
-The mechanism is visible in the recurrent weights. The mPFC→mPFC hook
-(28 800 synapses, K_rec 20 over 1440 cells) barely moved: median exactly at
-`w_init` 1.8, mean 1.833, and only 614 synapses (2.1 %) reached the 2.4 ceiling.
-Even if every one of those landed inside the 309-cell assembly, that is ~2 strong
-recurrent inputs per cell. Against an ~20 mV rest→threshold gap that cannot
-ignite a cell — and the true figure is lower still, since the volley arithmetic
-of §10 only holds for synchronous arrival and this input is sparse and
-asynchronous. There is a cortical trace; there is no cortical attractor.
+**Correction.** An earlier version of this section read the mechanism off the
+HDF5 `mpfc_assoc` group, reporting that "the mPFC recurrent hook barely moved —
+614 of 28 800 synapses at ceiling". That group is the **feedforward EC LV→mPFC**
+projection (`K_eclv_mpfc` 20, `w_init` 1.8), not the recurrent one. The
+recurrent hook runs but its weights were never written to the file, so those
+numbers said nothing about the cortical attractor. The recurrent weights are now
+exported as a separate `mpfc_recurrent` group. The Test 3 verdict above is
+unaffected — it is computed from spikes.
+
+What can be said without those weights is structural, and it is enough. The
+recurrent projection is `K_rec = 20` random inputs per cell over N = 1440, so an
+uncued assembly cell receives on average
+
+    20 x 124/1440 = 1.72
+
+inputs from the 124-cell cue. At the initial `w_rec` 0.9 that is ~1.5 mV against
+a ~20 mV rest→threshold gap; even pinning every one of those synapses at a 2.4
+ceiling reaches only ~4.1 mV. **Test 3 cannot pass at `K_rec = 20` however well
+the learning works** — clearing threshold needs ~8 ceiling-weight inputs from
+the cue, i.e. `K_rec` ≳ 97, and that already assumes synchronous arrival, which
+does not hold (§10). Note this is the same `K x w` reasoning that misled the E/I
+iteration, so treat it as an order-of-magnitude bound, not a prediction.
+
+E/I balance is **not** the lever, despite the analogy to CA3 in §5. During the
+post-cue window mPFC interneurons fire 6 of 288 cells at 0.26 Hz — there is
+almost no inhibition to rebalance, the same trap that made an earlier attempt to
+halve mPFC inhibition a no-op.
 
 So the honest state of the loop: replay, separation, completion, tagging and
 selective consolidation all work at 12 %, and the trace reaches cortex as

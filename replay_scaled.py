@@ -3388,7 +3388,8 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                      ec_module=None, stc_hook=None,
                      eclv_module=None, mpfc_module=None,
                      homeo_stats=None, homeo_results=None, dg_module=None,
-                     mpfc_assoc_hook=None, schaffer_hook=None):
+                     mpfc_assoc_hook=None, schaffer_hook=None,
+                     mpfc_rec_hook=None):
     """
     Save all simulation results to an HDF5 file for offline plotting.
 
@@ -3598,6 +3599,32 @@ def save_replay_hdf5(net, sim_ms, scale_label, outpath, bin_ms=10.0,
                 ag.create_dataset(key, data=np.array([r[key] for r in hist], dtype=dt))
             ag.create_dataset("w_final", data=mpfc_assoc_hook.w.astype(np.float32),
                               **compress)
+
+        # --- recurrent mPFC->mPFC (what a lesioned cortex must recall ON) ----
+        # Kept separate from mpfc_assoc: that group is the FEEDFORWARD
+        # EC LV->mPFC projection. Conflating the two led to reading the
+        # feedforward weights as evidence about the cortical attractor.
+        if mpfc_rec_hook is not None and mpfc_rec_hook.history:
+            hist = mpfc_rec_hook.history
+            rg = h5.create_group("mpfc_recurrent")
+            rg.attrs["description"] = (
+                "Replay-gated Hebbian build-up of the RECURRENT mPFC->mPFC "
+                "collaterals -- the only substrate left to reactivate a "
+                "pattern once the hippocampus is lesioned.")
+            rg.attrs["n_events"] = len(hist)
+            rg.attrs["w_init"]   = mpfc_rec_hook.w_init
+            for key, dt in (("n_coactive", np.int32), ("n_hetero", np.int32),
+                            ("w_mean", np.float32), ("n_associated", np.int32),
+                            ("frac_associated", np.float32),
+                            ("w_cv", np.float32),
+                            ("t_swr_start", np.float32)):
+                rg.create_dataset(key, data=np.array([r[key] for r in hist], dtype=dt))
+            rg.create_dataset("w_final", data=mpfc_rec_hook.w.astype(np.float32),
+                              **compress)
+            # pre/post indices make per-cell convergence measurable
+            if getattr(mpfc_rec_hook, "pre_idx", None) is not None:
+                rg.create_dataset("pre_idx", data=mpfc_rec_hook.pre_idx.astype(np.int32), **compress)
+                rg.create_dataset("post_idx", data=mpfc_rec_hook.post_idx.astype(np.int32), **compress)
 
         # --- Dentate gyrus groups (optional, Phase 6.2) ----------------------
         h5.attrs["dg_present"] = dg_module is not None
@@ -3854,6 +3881,15 @@ Dentate gyrus (Phase 6.2):
     parser.add_argument(
         "--cr-prime-weight", type=float, default=1.5, metavar="W",
         help="Weight of the post-lesion mPFC priming drive.")
+    parser.add_argument(
+        "--mpfc-k-rec", type=int, default=20, metavar="K",
+        help="Recurrent mPFC->mPFC in-degree. The default 20 is a hard gate on "
+             "Test 3: with N=1440 an uncued assembly cell then receives only "
+             "~1.7 inputs from a 124-cell cue, so no weight can ignite it.")
+    parser.add_argument(
+        "--mpfc-w-rec", type=float, default=0.9, metavar="W",
+        help="Recurrent mPFC->mPFC weight (initial; the recurrent hook learns "
+             "from here).")
     parser.add_argument(
         "--cr-cue-frac", type=float, default=0.4, metavar="F",
         help="Fraction of the cortical assembly to cue in --cortical-recall.")
@@ -4183,6 +4219,8 @@ Dentate gyrus (Phase 6.2):
                 ec_lv_pop = eclv_module.population,
                 lateral_inhibition = not args.no_mpfc_lateral_inh,
                 recurrent = args.cortical_recall,
+                K_rec = args.mpfc_k_rec,
+                w_rec = args.mpfc_w_rec,
                 delay_jitter = args.delay_jitter,
                 delay_jitter_wcomp = args.delay_jitter_wcomp,
             )
@@ -4446,6 +4484,7 @@ Dentate gyrus (Phase 6.2):
                      eclv_module=eclv_module, mpfc_module=mpfc_module,
                      homeo_stats=homeo_stats, homeo_results=homeo_results,
                      dg_module=dg_module, mpfc_assoc_hook=mpfc_assoc_hook,
+                     mpfc_rec_hook=mpfc_rec_hook,
                      schaffer_hook=schaffer_hook)
 
     if rank != 0:
