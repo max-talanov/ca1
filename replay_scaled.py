@@ -386,11 +386,35 @@ def jittered_delay(base, jitter, lo=0.5):
     return nest.random.uniform(min=max(lo, base - jitter), max=base + jitter)
 
 
-def fixed_connect(pre, post, indegree, weight, delay):
+def jittered_weight(base, cv):
+    """Per-synapse weight: scalar when cv<=0, else normal(base, |base|*cv).
+
+    Sign is preserved by clipping at 5% of base -- a Gaussian around a small
+    weight will otherwise cross zero and silently turn inhibitory synapses
+    excitatory (the failure already seen once in the mPFC recurrent hook).
+
+    Why this matters: with a scalar weight every one of a cell's K inputs is
+    identical, so the only thing distinguishing two postsynaptic cells is which
+    presynaptic cells they happened to draw. Combined with a scalar delay that
+    makes the whole volley land at one instant with one amplitude, which is the
+    synchrony ceiling that caps K*w at the 20 mV granule gap.
+    """
+    if cv is None or cv <= 0:
+        return float(base)
+    b = float(base)
+    sd = abs(b) * float(cv)
+    par = nest.random.normal(mean=b, std=sd)
+    return nest.math.max(par, 0.05 * b) if b > 0 else nest.math.min(par, 0.05 * b)
+
+
+def fixed_connect(pre, post, indegree, weight, delay, w_cv=0.0):
     """
     NEST native fixed_indegree — C++, fully MPI-parallel.
     Pre-flight checks cumulative static_synapse count vs NEST's 134M/VP limit.
     Each post neuron receives exactly `indegree` inputs drawn from pre.
+
+    `weight` and `delay` may each be a scalar or a NEST parameter; w_cv>0 turns
+    a scalar weight into normal(weight, |weight|*w_cv).
     """
     pre_nc  = _to_nc(pre)
     post_nc = _to_nc(post)
@@ -405,7 +429,8 @@ def fixed_connect(pre, post, indegree, weight, delay):
         conn_spec={"rule": "fixed_indegree", "indegree": int(indegree)},
         # delay may be a scalar OR a NEST parameter (e.g. nest.random.uniform)
         # for per-synapse heterogeneity -- see jittered_delay().
-        syn_spec={"weight": float(weight),
+        syn_spec={"weight": (jittered_weight(weight, w_cv)
+                             if isinstance(weight, (int, float)) else weight),
                   "delay": float(delay) if isinstance(delay, (int, float)) else delay},
     )
 
@@ -1253,6 +1278,13 @@ def build_dg_module(
     # Mean-rate budget at the current setting: Poisson 0.95 * 520 = 494 mV/s
     # plus EC 50 * ~3 Hz * 0.15 = 23, total ~517 vs the tuned 520.
     ec_lii=None, w_ec_dg=0.15, pp_residual=0.95,
+    # Heterogeneity for the DG pathway. The whole module used scalar weights and
+    # delays, so a granule cell's K perforant inputs arrived at one instant with
+    # one amplitude -- the synchrony ceiling that forces w_ec_dg down to 0.15
+    # and leaves the pattern-carrying input at 0.6% of granule drive (§13).
+    # Spreading arrival over delay_jitter ms drops the instantaneous kick from
+    # K*w to roughly (K/spread_bins)*w, which is what buys headroom on w_ec_dg.
+    delay_jitter=0.0, w_cv=0.0,
     # Perforant path (EC LII proxy) — heterogeneous Poisson onto GC.
     # Bracketing the granule sparse-coding target across three 1% runs:
     #   pp_weight 8.0 -> 97% active per window (dense; drowned CA3 replay)
@@ -1345,8 +1377,10 @@ def build_dg_module(
     if ec_driven:
         K_pp = K("ec_dg_pp", len(ec_lii))
         # 3 ms: entorhinal->dentate conduction, same as the other cortical hops
-        fixed_connect(ec_lii, GC, K_pp, w_ec_dg, 3.0)
+        fixed_connect(ec_lii, GC, K_pp, w_ec_dg,
+                      jittered_delay(3.0, delay_jitter), w_cv=w_cv)
         print(f"  [DGModule] perforant path EC LII->GC: K={K_pp} w={w_ec_dg} "
+              f"(cv={w_cv}, delay 3.0+/-{delay_jitter} ms) "
               f"({len(ec_lii):,} EC -> {N_gc:,} GC)  ** loop CLOSED **")
     else:
         print("  [DGModule] perforant path: Poisson stand-in only "
@@ -1365,14 +1399,19 @@ def build_dg_module(
     MC = MC_LOW + MC_HIGH        # combined mossy-cell NodeCollection for GC/basket wiring
 
     # GC -> basket (E->I): recruit feedback inhibition
-    fixed_connect(GC, BASKET, K("dg_gc_basket", N_gc), w_gc_basket, d_fast)
+    fixed_connect(GC, BASKET, K("dg_gc_basket", N_gc), w_gc_basket,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
     # basket -> GC (I->E): the sparsifying feedback loop
-    fixed_connect(BASKET, GC, K("dg_basket_gc", N_basket), w_basket_gc, d_fast)
+    fixed_connect(BASKET, GC, K("dg_basket_gc", N_basket), w_basket_gc,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
     # GC -> mossy cells (mossy collaterals in the hilus)
-    fixed_connect(GC, MC_LOW,  K("dg_gc_mc", N_gc), w_gc_mc, d_fast)
-    fixed_connect(GC, MC_HIGH, K("dg_gc_mc", N_gc), w_gc_mc, d_fast)
+    fixed_connect(GC, MC_LOW,  K("dg_gc_mc", N_gc), w_gc_mc,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
+    fixed_connect(GC, MC_HIGH, K("dg_gc_mc", N_gc), w_gc_mc,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
     # mossy cells -> GC (associational back-projection, net excitatory but weak)
-    fixed_connect(MC, GC, K("dg_mc_gc", len(MC)), w_mc_gc, d_fast)
+    fixed_connect(MC, GC, K("dg_mc_gc", len(MC)), w_mc_gc,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
     # mossy cells -> basket (drive feedback inhibition of GC: the MC "gain control")
     fixed_connect(MC, BASKET, K("dg_mc_basket", len(MC)), w_mc_basket, d_fast)
 
@@ -1381,8 +1420,10 @@ def build_dg_module(
     t_mf = time.perf_counter()
     K_mf_sup  = K("dg_mf_ca3_sup",  N_gc)
     K_mf_deep = K("dg_mf_ca3_deep", N_gc)
-    fixed_connect(GC, ca3_sup,  K_mf_sup,  w_mf_ca3_sup,  d_fast)
-    fixed_connect(GC, ca3_deep, K_mf_deep, w_mf_ca3_deep, d_fast)
+    fixed_connect(GC, ca3_sup,  K_mf_sup,  w_mf_ca3_sup,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
+    fixed_connect(GC, ca3_deep, K_mf_deep, w_mf_ca3_deep,
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
     n_mf = len(ca3_sup) * K_mf_sup + len(ca3_deep) * K_mf_deep
     print(f"  [DGModule] mossy fibres: ~{n_mf:,} synapses "
           f"(K_sup={K_mf_sup}, K_deep={K_mf_deep})  "
@@ -3882,6 +3923,23 @@ Dentate gyrus (Phase 6.2):
         "--cr-prime-weight", type=float, default=1.5, metavar="W",
         help="Weight of the post-lesion mPFC priming drive.")
     parser.add_argument(
+        "--dg-delay-jitter", type=float, default=0.0, metavar="MS",
+        help="Per-synapse delay jitter (ms) on the DG pathway incl. the "
+             "perforant path and mossy fibres. Spreads the EC volley in time, "
+             "lifting the synchrony ceiling that caps w_ec_dg (see §13).")
+    parser.add_argument(
+        "--w-cv", type=float, default=0.0, metavar="CV",
+        help="Coefficient of variation for DG synaptic weights. 0 (default) "
+             "keeps the scalar weights the model has always used.")
+    parser.add_argument(
+        "--w-ec-dg", type=float, default=0.15, metavar="W",
+        help="Perforant path EC LII->GC weight. 0.15 is the synchrony-limited "
+             "value; raise it together with --dg-delay-jitter.")
+    parser.add_argument(
+        "--pp-residual", type=float, default=0.95, metavar="F",
+        help="Scale on the Poisson stand-in for unmodelled cortical drive to "
+             "DG. Lowering it raises the pattern-carrying signal share.")
+    parser.add_argument(
         "--mpfc-k-rec", type=int, default=20, metavar="K",
         help="Recurrent mPFC->mPFC in-degree. The default 20 is a hard gate on "
              "Test 3: with N=1440 an uncued assembly cell then receives only "
@@ -4195,6 +4253,10 @@ Dentate gyrus (Phase 6.2):
             ec_lii    = (ec_module.population
                          if (ec_module is not None and not args.no_ec_dg_loop)
                          else None),
+            w_ec_dg      = args.w_ec_dg,
+            pp_residual  = args.pp_residual,
+            delay_jitter = args.dg_delay_jitter,
+            w_cv         = args.w_cv,
         )
 
     # ---- Optional Phase 3: EC Layer V + mPFC ---------------------------------
