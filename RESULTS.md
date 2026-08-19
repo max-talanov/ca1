@@ -433,6 +433,96 @@ selective consolidation all work at 12 %, and the trace reaches cortex as
 weights — but it is not yet strong enough to be *read out* without the
 hippocampus, which is what systems consolidation requires.
 
+## 13. Do we have engrams? No — and that is the root problem
+
+Scored against the standard criteria (Josselyn & Tonegawa 2020):
+
+| criterion | status |
+|---|---|
+| sparse | yes — 862/12 005 EC cells consolidate, all-or-none per cell (§11) |
+| persistent | yes — L-LTP captured, 1.59x weights |
+| **specific** | **no** |
+| sufficient | no — Test 3, 0.049 vs a 0.25 criterion (§12) |
+| necessary | never tested |
+
+Specificity is the definitional core of an engram, and at 12 % it is not weak,
+it is absent. Within-pattern vs between-pattern separation, Job F (14 epochs,
+2 patterns alternating):
+
+| population | active | identity sep | timing sep |
+|---|---|---|---|
+| CA3 SUP | 98.0 % | 0.000 | 0.028 |
+| CA1 PYR | 100.0 % | −0.003 | 0.002 |
+| EC LII | 18.4 % | +0.055 | −0.027 |
+| EC LV | 83.8 % | +0.013 | −0.009 |
+| mPFC | 72.6 % | +0.036 | +0.058 |
+
+Nothing anywhere distinguishes pattern A from pattern B.
+
+### Where it is lost: DG is sparse but not selective
+
+§4 reports DG "pattern separation" as an active fraction of 2–4 %. That
+measures sparseness only. Selectivity is a different claim, and it fails:
+
+```
+DG granule   3.28% active   Jaccard within 0.067   between 0.067   sep +0.000
+CA3 SUP     98.0% active    Jaccard within 0.961   between 0.960   sep +0.000
+```
+
+0.067 is 4x chance overlap (chance = f/(2−f) = 0.017 at f = 3.28 %), so granule
+activity is weakly reproducible — but within-pattern equals between-pattern to
+three decimals. Restricting to the 7 epochs that replay the *same* pattern:
+
+```
+cells active at least once   14,124   (5.8x the 2,442 active in any one window)
+fired in 1/7 windows         11,671   (83%)
+fired in 7/7 windows              0
+fired in >=6/7                    1
+```
+
+There is no core assembly. The same pattern recruits a nearly-disjoint granule
+population on every replay. Counts 2–6 do exceed the binomial null (2,019 vs
+798; 363 vs 23), so per-cell excitability biases the draw, but noise dominates.
+
+### Why: the pattern-carrying input is 0.6 % of granule drive
+
+Granule cells receive two excitatory sources — the EC LII perforant path, which
+carries the replayed pattern, and a heterogeneous Poisson residual standing in
+for unmodelled cortex, **resampled independently every window**. Per cell:
+
+| source | mV/s | share |
+|---|---|---|
+| Poisson residual (noise) | 494.0 | 99.4 % |
+| EC LII perforant path (signal) | 3.0 | **0.6 %** |
+
+DG cannot be pattern-specific when 99.4 % of its drive is fresh noise. The
+granule code is decided by Poisson shot noise, which is exactly the
+participation statistics above.
+
+Two compounding causes. First, `build_dg_module`'s budget comment assumes EC LII
+fires at ~3 Hz (`EC 50 * ~3 Hz * 0.15 = 23`); after the §11 cortical sparsity
+retune it fires at **0.40 Hz**, so the term is 3.0, not 23 — the retune cut the
+signal share from ~4.4 % to 0.6 % without anyone noticing. Second, even the
+design point was never enough to build a reproducible assembly.
+
+This is not a parameter tweak, because the two drives are limited by different
+things. EC arrives **synchronously** in SWR-locked bursts, so `K x w_ec_dg` must
+stay under the 20 mV granule gap or every granule cell detonates (measured:
+`K=50 w=0.4` saturates DG to 98.8 % by the second SWR). The Poisson residual
+arrives **asynchronously**, so it dominates the mean-rate budget while staying
+individually subthreshold. Raising the signal hits the synchrony ceiling long
+before it wins the rate competition, and removing the noise reintroduces the
+cold-start deadlock the residual exists to solve — DG has no drive until the
+loop runs, and the loop cannot start without DG.
+
+### Consequence for Test 3
+
+A cortex that completes a pattern it cannot distinguish from any other pattern
+is an attractor, not a memory. Any positive Test 3 obtained while §13 stands
+demonstrates that mPFC has recurrent dynamics, **not** that a specific memory
+became hippocampus-independent. Specificity has to be settled first; the
+`K_rec` work in §12 is downstream of it.
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
