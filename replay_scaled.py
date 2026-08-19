@@ -386,6 +386,70 @@ def jittered_delay(base, jitter, lo=0.5):
     return nest.random.uniform(min=max(lo, base - jitter), max=base + jitter)
 
 
+# ============================================================================
+# Global heterogeneity — every cell and every synapse is an individual
+# ============================================================================
+# Real neurons are not copies of one another. This model treated them as copies:
+# within a population every cell shared identical a/b/c/d/I_e (only V_m varied,
+# and that is a transient -- all cells relax to the same rest), and every
+# synapse of a projection carried an identical weight and an identical delay.
+#
+# That homogeneity is the root of the synchrony ceiling in §13: K identical
+# inputs arriving at one instant sum to exactly K*w, so the gain of any
+# projection is capped by the postsynaptic threshold gap divided by K, rather
+# than by anything biological. Spreading delays turns that instantaneous sum
+# into a temporal integral, and spreading weights and cell excitability means
+# the same input recruits a reproducible SUBSET rather than all-or-none.
+_HET = {"w_cv": 0.0, "delay_cv": 0.0, "neuron_cv": 0.0}
+
+
+def set_heterogeneity(w_cv=0.0, delay_cv=0.0, neuron_cv=0.0):
+    """Set the model-wide defaults consulted by fixed_connect / het_params."""
+    _HET["w_cv"] = float(w_cv or 0.0)
+    _HET["delay_cv"] = float(delay_cv or 0.0)
+    _HET["neuron_cv"] = float(neuron_cv or 0.0)
+    if any(_HET.values()):
+        print(f"  [het] model-wide heterogeneity: weights cv={_HET['w_cv']}, "
+              f"delays cv={_HET['delay_cv']}, neuron params cv={_HET['neuron_cv']}")
+
+
+# Izhikevich parameters that may be spread per cell. a and d are strictly
+# positive; b enters the fixed points as (5-b) so it is kept well away from 5;
+# c is the reset potential. I_e shifts rheobase directly and is the persistent
+# excitability knob (V_m heterogeneity is not -- it washes out at rest).
+_HET_NEURON_KEYS = ("a", "b", "c", "d", "I_e")
+_HET_CLIP = {"a": (1e-3, 1.0), "b": (0.01, 4.5), "c": (-80.0, -40.0),
+             "d": (0.05, 30.0), "I_e": (None, None)}
+
+
+def het_params(params, n, rng, cv=None):
+    """Expand a scalar Izhikevich param dict into per-cell distributions.
+
+    Keeps the calibrated value as the MEAN, so f-I calibration (e.g. the
+    MC_HIGH/MC_LOW 4.97x rheobase ratio) is preserved in expectation while the
+    cells stop being copies of one another.
+    """
+    cv = _HET["neuron_cv"] if cv is None else float(cv)
+    if cv <= 0 or n <= 0:
+        return dict(params)
+    out = dict(params)
+    for k in _HET_NEURON_KEYS:
+        if k not in out:
+            continue
+        if not isinstance(out[k], (int, float)):
+            continue            # already per-cell (e.g. I_e set explicitly)
+        base = float(out[k])
+        if base == 0.0:
+            continue
+        vals = rng.normal(base, abs(base) * cv, n)
+        lo, hi = _HET_CLIP.get(k, (None, None))
+        if lo is not None or hi is not None:
+            vals = np.clip(vals, lo if lo is not None else -np.inf,
+                           hi if hi is not None else np.inf)
+        out[k] = vals.tolist()
+    return out
+
+
 def jittered_weight(base, cv):
     """Per-synapse weight: scalar when cv<=0, else normal(base, |base|*cv).
 
@@ -407,7 +471,7 @@ def jittered_weight(base, cv):
     return nest.math.max(par, 0.05 * b) if b > 0 else nest.math.min(par, 0.05 * b)
 
 
-def fixed_connect(pre, post, indegree, weight, delay, w_cv=0.0):
+def fixed_connect(pre, post, indegree, weight, delay, w_cv=None):
     """
     NEST native fixed_indegree — C++, fully MPI-parallel.
     Pre-flight checks cumulative static_synapse count vs NEST's 134M/VP limit.
@@ -416,6 +480,11 @@ def fixed_connect(pre, post, indegree, weight, delay, w_cv=0.0):
     `weight` and `delay` may each be a scalar or a NEST parameter; w_cv>0 turns
     a scalar weight into normal(weight, |weight|*w_cv).
     """
+    if w_cv is None:
+        w_cv = _HET["w_cv"]
+    # Global delay heterogeneity: a scalar delay becomes uniform(d+/-cv*d).
+    if isinstance(delay, (int, float)) and _HET["delay_cv"] > 0:
+        delay = jittered_delay(float(delay), float(delay) * _HET["delay_cv"])
     pre_nc  = _to_nc(pre)
     post_nc = _to_nc(post)
     _preflight_conn_check(
@@ -785,25 +854,25 @@ def build_replay_network(
     print("  Creating populations (with V_m heterogeneity)...")
     _rng_vm = np.random.default_rng(seed_connect + 1)  # reproducible
 
-    CA1_PYR      = nest.Create("izhikevich", N_ca1_pyr,      params=ca1_pyr_params)
+    CA1_PYR      = nest.Create("izhikevich", N_ca1_pyr,      params=het_params(ca1_pyr_params, N_ca1_pyr, _rng_vm))
     # CA1 PYR: σ=5 mV spread → Gaussian burst envelope (bio: ~15 mV cell-to-cell)
     nest.SetStatus(CA1_PYR, "V_m",
                    _rng_vm.normal(-65.0, 5.0, N_ca1_pyr).clip(-75,-55).tolist())
 
-    CA1_BASKET   = nest.Create("izhikevich", N_ca1_basket,   params=basket_params)
-    CA1_OLM      = nest.Create("izhikevich", N_ca1_olm,      params=olm_params)
+    CA1_BASKET   = nest.Create("izhikevich", N_ca1_basket,   params=het_params(basket_params, N_ca1_basket, _rng_vm))
+    CA1_OLM      = nest.Create("izhikevich", N_ca1_olm,      params=het_params(olm_params, N_ca1_olm, _rng_vm))
 
-    CA3_SUP      = nest.Create("izhikevich", N_ca3_sup,      params=ca3_sup_params)
+    CA3_SUP      = nest.Create("izhikevich", N_ca3_sup,      params=het_params(ca3_sup_params, N_ca3_sup, _rng_vm))
     # CA3 SUP: σ=4 mV → spread within each group → smooth diagonal heatmap
     nest.SetStatus(CA3_SUP, "V_m",
                    _rng_vm.normal(-63.2, 4.0, N_ca3_sup).clip(-72,-54).tolist())
 
-    CA3_DEEP     = nest.Create("izhikevich", N_ca3_deep,     params=ca3_deep_params)
+    CA3_DEEP     = nest.Create("izhikevich", N_ca3_deep,     params=het_params(ca3_deep_params, N_ca3_deep, _rng_vm))
     nest.SetStatus(CA3_DEEP, "V_m",
                    _rng_vm.normal(-64.7, 4.0, N_ca3_deep).clip(-72,-55).tolist())
 
-    CA3_INT_SUP  = nest.Create("izhikevich", N_ca3_int_sup,  params=basket_params)
-    CA3_INT_DEEP = nest.Create("izhikevich", N_ca3_int_deep, params=basket_params)
+    CA3_INT_SUP  = nest.Create("izhikevich", N_ca3_int_sup,  params=het_params(basket_params, N_ca3_int_sup, _rng_vm))
+    CA3_INT_DEEP = nest.Create("izhikevich", N_ca3_int_deep, params=het_params(basket_params, N_ca3_int_deep, _rng_vm))
 
     # -------------------------------------------------------------------------
     # Background inputs (one_to_one Poisson — cheap, no bottleneck)
@@ -1345,13 +1414,13 @@ def build_dg_module(
 
     _rng = np.random.default_rng(seed_connect + 7)
 
-    GC = nest.Create("izhikevich", N_gc, params=gc_params)
+    GC = nest.Create("izhikevich", N_gc, params=het_params(gc_params, N_gc, _rng))
     # V_m heterogeneity → graded excitability → sparse, ordered recruitment
     nest.SetStatus(GC, "V_m",
                    _rng.normal(-65.0, 4.0, N_gc).clip(-75, -55).tolist())
-    MC_LOW  = nest.Create("izhikevich", N_mc_low,  params=mc_low_params)
-    MC_HIGH = nest.Create("izhikevich", N_mc_high, params=mc_high_params)
-    BASKET  = nest.Create("izhikevich", N_basket,  params=basket_params)
+    MC_LOW  = nest.Create("izhikevich", N_mc_low,  params=het_params(mc_low_params, N_mc_low, _rng))
+    MC_HIGH = nest.Create("izhikevich", N_mc_high, params=het_params(mc_high_params, N_mc_high, _rng))
+    BASKET  = nest.Create("izhikevich", N_basket,  params=het_params(basket_params, N_basket, _rng))
 
     d_fast = 1.5
 
@@ -1857,8 +1926,9 @@ def build_ec_lii(
 
     # ---- Stellate cell (Izhikevich) ----------------------------------------
     EC_LII = nest.Create("izhikevich", N_ec_lii,
-                         params=dict(a=0.02, b=0.2, c=-65.0, d=6.0,
-                                     V_m=-65.0, U_m=-13.0, I_e=0.0))
+                         params=het_params(dict(a=0.02, b=0.2, c=-65.0, d=6.0,
+                                                V_m=-65.0, U_m=-13.0, I_e=0.0),
+                                           N_ec_lii, np.random.default_rng(21)))
     # Graded excitability, as every hippocampal population already has. With a
     # uniform V_m every cell is identical, so a synchronous volley fires all of
     # them or none -- nothing for lateral inhibition to select between, and no
@@ -2050,8 +2120,9 @@ def build_ec_lv(
 
     # Izhikevich layer-5 intrinsic-burst params
     EC_LV = nest.Create("izhikevich", N_lv,
-                        params=dict(a=0.02, b=0.2, c=-55.0, d=4.0,
-                                    V_m=-64.7, U_m=-13.0, I_e=3.0))
+                        params=het_params(dict(a=0.02, b=0.2, c=-55.0, d=4.0,
+                                               V_m=-64.7, U_m=-13.0, I_e=3.0),
+                                          N_lv, np.random.default_rng(22)))
     nest.SetStatus(EC_LV, "V_m",
                    np.random.default_rng(12).normal(-64.7, 4.0, N_lv)
                    .clip(-75, -55).tolist())
@@ -2192,8 +2263,9 @@ def build_mpfc(
 
     # Izhikevich layer-5 prefrontal: regular spiking, strongly adapting
     MPFC = nest.Create("izhikevich", N_pfc,
-                       params=dict(a=0.02, b=0.2, c=-65.0, d=8.0,
-                                   V_m=-65.0, U_m=-13.0, I_e=0.0))
+                       params=het_params(dict(a=0.02, b=0.2, c=-65.0, d=8.0,
+                                              V_m=-65.0, U_m=-13.0, I_e=0.0),
+                                         N_pfc, np.random.default_rng(23)))
     nest.SetStatus(MPFC, "V_m",
                    np.random.default_rng(13).normal(-65.0, 4.0, N_pfc)
                    .clip(-75, -55).tolist())
@@ -2221,8 +2293,9 @@ def build_mpfc(
     if lateral_inhibition:
         N_int = max(10, int(N_pfc * int_frac))
         MPFC_INT = nest.Create("izhikevich", N_int,
-                               params=dict(a=0.10, b=0.2, c=-65.0, d=2.0,
-                                           V_m=-65.0, U_m=-13.0, I_e=0.0))
+                               params=het_params(dict(a=0.10, b=0.2, c=-65.0, d=2.0,
+                                                      V_m=-65.0, U_m=-13.0, I_e=0.0),
+                                                 N_int, np.random.default_rng(24)))
         # In-degrees must be SCALE-INVARIANT, like every other in-degree in this
         # model. K_ie was originally N_int//2, which grows with the population:
         # 12 at 1% but 144 at 12%. Because the volley is synchronous, the
@@ -3923,6 +3996,27 @@ Dentate gyrus (Phase 6.2):
         "--cr-prime-weight", type=float, default=1.5, metavar="W",
         help="Weight of the post-lesion mPFC priming drive.")
     parser.add_argument(
+        "--het", type=float, default=0.0, metavar="CV",
+        help="Model-wide heterogeneity: sets weight, delay AND neuron-parameter "
+             "CV in one go, on EVERY cell and EVERY synapse. Neurons within a "
+             "population are otherwise exact copies (only V_m varies, and that "
+             "washes out at rest), and every synapse of a projection carries an "
+             "identical weight and delay -- which is what creates the synchrony "
+             "ceiling of §13. Try 0.2-0.4. Overridden per-channel by the three "
+             "flags below.")
+    parser.add_argument(
+        "--het-w-cv", type=float, default=None, metavar="CV",
+        help="Weight CV on every projection (default: --het).")
+    parser.add_argument(
+        "--het-delay-cv", type=float, default=None, metavar="CV",
+        help="Delay CV on every projection (default: --het).")
+    parser.add_argument(
+        "--het-neuron-cv", type=float, default=None, metavar="CV",
+        help="Per-cell CV on Izhikevich a/b/c/d/I_e (default: --het). The "
+             "calibrated value is kept as the mean, so the f-I calibration "
+             "(e.g. the 4.97x MC_HIGH/MC_LOW rheobase ratio) is preserved in "
+             "expectation.")
+    parser.add_argument(
         "--dg-delay-jitter", type=float, default=0.0, metavar="MS",
         help="Per-synapse delay jitter (ms) on the DG pathway incl. the "
              "perforant path and mossy fibres. Spreads the EC volley in time, "
@@ -4072,6 +4166,12 @@ Dentate gyrus (Phase 6.2):
              "epoch -> record metrics). Saves ~10 hours of compute vs separate "
              "jobs. Overrides --homeo-alpha. Requires --homeostasis --stc.")
     args = parser.parse_args()
+
+    # Model-wide heterogeneity must be set BEFORE any Create/Connect call.
+    _pick = lambda v: args.het if v is None else v
+    set_heterogeneity(w_cv=_pick(args.het_w_cv),
+                      delay_cv=_pick(args.het_delay_cv),
+                      neuron_cv=_pick(args.het_neuron_cv))
 
     # Parse alpha sweep into a list of floats; empty list = single-alpha mode
     if args.alpha_sweep is not None:
