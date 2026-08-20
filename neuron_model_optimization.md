@@ -2,6 +2,14 @@
 
 ## 0. Scope and framing
 
+This note extends the original *Dendritic convolution* draft into a structured
+account of how the dendritic-tree processing observed in the Associative
+Cortex (AC) and Hippocampal system (HS) can be read as a three-stage
+information-reduction (convolution) pipeline, and it closes with a feasibility
+assessment of implementing that pipeline in electronic — specifically
+memristive/CMOS mixed-signal — spiking neural network (SNN) hardware, in the
+context of the tinyHippo project's NEST-based CA3/CA1 model.
+
 The word "convolution" is used here in its information-theoretic sense — a
 progressive folding-down of a high-dimensional input space onto a
 lower-dimensional decision variable — rather than in the discrete-signal-
@@ -264,6 +272,68 @@ feature of the original system — which in turn argues against adding
 additional somatic input channels (e.g. neuromodulatory third and fourth
 lines) purely for hardware convenience without checking whether they change
 network-level dynamics.
+
+### 3.1 A concrete reference topology
+
+![Reference circuit topology for the dendritic-convolution pipeline: per-synapse threshold units feed a two-level hierarchy of OR-gated refractory junctions (each level with its own 5–10 ms τ_rf), converging on a soma that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](assets/dendritic_convolution_reference_topology.jpg)
+
+**Figure 1.** Reference circuit topology for a two-cluster excitatory
+dendritic tree feeding a single soma, instantiating the three-stage
+convolution pipeline of §§1–3 as a concrete block diagram. Per-synapse
+threshold units (`thr`, stage 1, §1) convert each excitatory synapse's
+weighted input to a boolean dSpike. Two clusters of excitatory synapses
+(`Cluster1`, `Cluster2` — the morphological grouping discussed in §2.1)
+feed a first tier of OR-gated refractory junctions (`junction th/rp`,
+stage 2, §2), each carrying its own 5–10 ms `τ_rf`; their outputs
+converge on a second-tier junction, itself carrying an independent 5–10 ms
+`τ_rf`, before reaching the soma. A third cluster of inhibitory synapses
+(`Cluster3`) bypasses the threshold/junction pipeline entirely and drives
+the soma directly, and the soma output propagates through a final,
+fixed-delay axon stage before leaving the neuron.
+
+This diagram makes several points from earlier sections concrete rather
+than schematic, and is worth reading alongside them directly:
+
+- **The junction hierarchy is literally two independent instances of the
+  same `τ_rf`-gated primitive**, exactly the "reusable leaf cell"
+  construction argued for in §2 and §4.2 — the figure's `junction th/rp`
+  block appears twice (once per hierarchy level) with identical internal
+  structure and independently tunable `τ_rf`, rather than as two
+  different circuit designs. The `Soma th/rp` block carries the same
+  tag, which is the diagram's way of showing that the soma is that same
+  threshold-plus-refractory primitive again, just with different fan-in
+  and (presumably) a different threshold and `τ_rf` — the point made
+  when discussing ASIC reuse for this pipeline.
+- **Stacking two hierarchy levels stacks their dead-times.** Because each
+  level's junction has its own independent 5–10 ms `τ_rf` and the second
+  level only starts its own refractory window once it receives a jSpike
+  from the first, the worst-case synapse-to-soma latency contributed by
+  the junction hierarchy alone is on the order of two `τ_rf` periods
+  (roughly 10–20 ms for 5–10 ms per level), not one. This is a concrete,
+  diagram-derived number that sharpens §5.6's tick-sizing discussion: a
+  deeper hierarchy multiplies the network-level dead-time budget
+  linearly with depth, which is a real cost of adding hierarchy levels
+  for biological fidelity (§4.2) and should be weighed against it.
+- **Inhibition bypasses the dendritic pipeline entirely.** The figure
+  makes explicit an architectural claim that §3's text left implicit:
+  `Cluster3`'s inhibitory synapses connect directly to the soma, with no
+  `thr` or `junction` stage in between. This is consistent with the
+  perisomatic/proximal targeting of many fast inhibitory inputs in the
+  biological hippocampus and cortex (e.g., basket-cell-type inhibition
+  acting close to the soma rather than on distal dendrites), and it
+  matters electronically: the inhibitory line needs none of the
+  stage-1/stage-2 circuitry discussed in §§1–2 and §4.1–4.2, only a
+  direct connection into the somatic summing node of §3's "two-line
+  summing bus," which is a further, diagram-confirmed simplification of
+  the inhibitory path relative to the excitatory one.
+- **The axon delay is a separate, decoupled stage.** The final `axon
+  delay` block is drawn outside the soma and outside the `τ_rf`-scale
+  circuitry entirely — it is a fixed propagation delay applied after the
+  somatic decision has already been made. This lines up with §5.5's
+  recommendation that network-level routing/propagation logic can stay
+  clocked digital without weakening the timing claims made about stages
+  1–2: the diagram physically separates the millisecond-scale dendritic
+  front end from this simple, decoupled delay element.
 
 ## 4. Feasibility analysis of an electronic dendritic-convolution SNN
 
@@ -654,3 +724,74 @@ as applied specifically to stage 2: at a 1–10 ms tick, clock power is not
 a binding constraint (kHz-range clocking is trivially cheap in CMOS), so
 the case for continuous-time circuitry at the junction rests entirely on
 correct edge capture, not on energy savings from avoiding a faster clock.
+
+## 6. Network-level topology: the same argument one level up
+
+Figure 1 (§3.1) worked out the pipeline inside a single neuron. The
+argument extends directly to the network that connects many such neurons
+together, and it is worth showing that extension explicitly rather than
+leaving it implicit.
+
+![Network-level topology: three input channels of varying population size converge through a millisecond-scale slow spike router into a Hippocampal System (HS) population, which diverges through a second slow spike router into three associative-cortex target populations of matching sizes; every neuron in every population is tagged th/rp/del, the same threshold/refractory-period/delay primitive used inside a single neuron's pipeline.](assets/network_level_routing_topology.jpg)
+
+**Figure 2.** Network-level instantiation of the same architecture:
+three input channels (`input ch 1/2/3`, populations of 6, 3, and 2
+neurons respectively) converge through a **slow spike router (ms)** onto
+a central `HS` (Hippocampal System) population, which diverges through a
+second **slow spike router (ms)** onto three associative-cortex target
+populations (`assoc. 1/2/3`) of matching sizes. Every neuron in every
+population — input, HS, and associative — carries the same `th/rp/del`
+tag.
+
+Three points from earlier sections generalize directly from this figure:
+
+- **The reusable leaf cell now spans the whole neuron, not just one
+  stage.** Figure 1 showed `thr`, `junction th/rp`, and `Soma th/rp` as
+  three separate instances of a shared threshold-plus-refractory
+  primitive inside one neuron's dendritic pipeline. Figure 2 shows that,
+  once assembled, that whole pipeline — threshold, refractory period,
+  *and* the axon delay from §3.1 — collapses to a single `neuron th/rp/del`
+  tile that is replicated without modification across every population in
+  the network, from small two-neuron populations (`assoc. 3`) to
+  six-neuron ones (`input ch 1`, `assoc. 1`). This is the network-level
+  payoff of the ASIC leaf-cell argument made in §2 and §4.2: the same
+  standard cell that composes a single neuron also composes the network,
+  which is what makes a design of this kind tractable to verify and
+  characterize at scale rather than as a collection of bespoke circuits.
+- **The router is where the "network-level routing-layer logic" of §5.5
+  physically lives, and it is explicitly labeled at the timescale §5.6
+  argued for.** §5.5 recommended that spike-packet transport between
+  neurons "can remain clocked digital... because summation over a leak
+  time constant is the one stage in this pipeline that is genuinely
+  tolerant of tick-scale quantization," and §5.6 derived that the
+  junction's own bookkeeping tick can reasonably sit in the low-to-mid
+  millisecond range given this project's ~3.8 ms inter-event spacing.
+  Figure 2 draws that conclusion as an explicit, separate circuit block —
+  the **slow spike router (ms)** — visually and functionally distinct
+  from the `neuron th/rp/del` tiles it connects, with its millisecond
+  timescale stated directly on the block rather than left as an inferred
+  design parameter. This is a useful confirmation that the router
+  abstraction the earlier timing analysis argued for is also the natural
+  unit boundary at the network level: fast, dendrite-scale computation
+  stays inside the neuron tile, and everything that needs to be
+  compatible with a coarse tick — packet transport between populations —
+  is factored into its own block.
+- **The converge/diverge symmetry mirrors the project's own
+  hippocampo-cortical loop.** Three variously-sized input channels funnel
+  through one router into a single HS population, which then fans back
+  out through a second router into three variously-sized associative
+  target populations of matching sizes (6/3/2 in, 6/3/2 out). This
+  convergent-then-divergent topology — many cortical input channels
+  compressed through a hippocampal bottleneck and then re-expanded back
+  out to cortex — is structurally the same shape as the CA3/CA1/EC loop
+  already modeled in this project's NEST simulations (`bidirectional_replay.py`,
+  `mem_cons_plan.md`): multiple upstream input channels converging on a
+  smaller associative core, and a divergent return path carrying the
+  consolidated result back out to multiple cortical targets. The figure
+  should be read as a schematic of that same converge-diverge shape at
+  the level of input/HS/associative-cortex populations, not as a claim
+  that `input ch 1/2/3` and `assoc. 1/2/3` map one-to-one onto specific
+  named subfields (e.g. CA3, CA1, individual EC layers) — that finer
+  correspondence, if wanted, is a separate modeling decision for the
+  tinyHippo circuit rather than something this diagram asserts on its
+  own.
