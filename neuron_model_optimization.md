@@ -733,7 +733,7 @@ together, and it is worth showing that extension explicitly rather than
 leaving it implicit.
 
 ![Network-level topology: three input channels 
-of varying population size converge through a millisecond-scale slow spike router into a Hippocampal System (HS) population, which diverges through a second slow spike router into three associative-cortex target populations of matching sizes; every neuron in every population is tagged th/rp/del, the same threshold/refractory-period/delay primitive used inside a single neuron's pipeline.](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/network_level_routing_topology.jpg)
+of varying population size converge through a millisecond-scale slow spike router into a Hippocampal System (HS) population, which diverges through a second slow spike router into three associative-cortex target populations of matching sizes; every neuron in every population is tagged th/rp/del, the same threshold/refractory-period/delay primitive used inside a single neuron's pipeline.](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/network_level_routing_topology.jpeg)
 
 **Figure 2.** Network-level instantiation of the same architecture:
 three input channels (`input ch 1/2/3`, populations of 6, 3, and 2
