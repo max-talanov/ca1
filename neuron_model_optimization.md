@@ -275,7 +275,7 @@ network-level dynamics.
 
 ### 3.1 A concrete reference topology
 
-![Reference circuit topology for the dendritic-convolution pipeline: per-synapse threshold units feed a two-level hierarchy of OR-gated refractory junctions (each level with its own 5–10 ms τ_rf), converging on a soma that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](dendritic_convolution_reference_topology.jpg)
+![Reference circuit topology for the dendritic-convolution pipeline: per-synapse threshold units feed a two-level hierarchy of OR-gated refractory junctions (each level with its own 5–10 ms τ_rf), converging on a soma that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/dendritic_convolution_reference_topology.jpeg)
 
 **Figure 1.** Reference circuit topology for a two-cluster excitatory
 dendritic tree feeding a single soma, instantiating the three-stage
@@ -732,7 +732,8 @@ argument extends directly to the network that connects many such neurons
 together, and it is worth showing that extension explicitly rather than
 leaving it implicit.
 
-![Network-level topology: three input channels of varying population size converge through a millisecond-scale slow spike router into a Hippocampal System (HS) population, which diverges through a second slow spike router into three associative-cortex target populations of matching sizes; every neuron in every population is tagged th/rp/del, the same threshold/refractory-period/delay primitive used inside a single neuron's pipeline.](network_level_routing_topology.jpg)
+![Network-level topology: three input channels 
+of varying population size converge through a millisecond-scale slow spike router into a Hippocampal System (HS) population, which diverges through a second slow spike router into three associative-cortex target populations of matching sizes; every neuron in every population is tagged th/rp/del, the same threshold/refractory-period/delay primitive used inside a single neuron's pipeline.](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/network_level_routing_topology.jpg)
 
 **Figure 2.** Network-level instantiation of the same architecture:
 three input channels (`input ch 1/2/3`, populations of 6, 3, and 2
