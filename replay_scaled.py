@@ -425,6 +425,28 @@ def set_heterogeneity(w_cv=0.0, delay_cv=0.0, neuron_cv=0.0, wcomp=1.0):
               f"weight compensation x{_HET['wcomp']}")
 
 
+def wcomp_w(weight):
+    """Apply the excitatory compensation to an externally-driven weight.
+
+    fixed_connect handles projection weights, but the Poisson drives -- the
+    tonic CA3 excitation, the per-population background, the sharp-wave/ripple
+    shaping -- are wired with a direct nest.Connect and so were never
+    compensated. That is why CA3 SUP stayed pinned at ~4.5 Hz across wcomp
+    1.5/2.0/3.0 while CA1, which is driven through fixed_connect Schaffer
+    collaterals, did respond.
+
+    Compensation must reach excitation onto PRINCIPAL cells only. Applying it
+    to excitation onto interneurons -- whether an E->I projection or a Poisson
+    drive aimed at a basket population -- amplifies the inhibitory side harder
+    than the excitatory one, because interneurons sit closer to threshold.
+    Measured when the drives were compensated indiscriminately: CA1 basket
+    52.8 -> 99.5 Hz and CA1 PYR 4.05 -> 0.06 Hz at wcomp 2.5. Call sites
+    targeting interneurons pass compensate=False.
+    """
+    w = float(weight)
+    return w * _HET["wcomp"] if (w > 0 and _HET["wcomp"] != 1.0) else w
+
+
 # Izhikevich parameters that may be spread per cell. a and d are strictly
 # positive; b enters the fixed points as (5-b) so it is kept well away from 5;
 # c is the reset potential. I_e shifts rheobase directly and is the persistent
@@ -501,7 +523,8 @@ def jittered_weight(base, cv):
     return nest.math.max(par, 0.05 * b) if b > 0 else nest.math.min(par, 0.05 * b)
 
 
-def fixed_connect(pre, post, indegree, weight, delay, w_cv=None):
+def fixed_connect(pre, post, indegree, weight, delay, w_cv=None,
+                  compensate=True):
     """
     NEST native fixed_indegree — C++, fully MPI-parallel.
     Pre-flight checks cumulative static_synapse count vs NEST's 134M/VP limit.
@@ -512,8 +535,14 @@ def fixed_connect(pre, post, indegree, weight, delay, w_cv=None):
     """
     if w_cv is None:
         w_cv = _HET["w_cv"]
-    if isinstance(weight, (int, float)) and _HET["wcomp"] != 1.0:
-        weight = float(weight) * _HET["wcomp"]
+    # Compensation applies to EXCITATORY weights only. Scaling inhibition by
+    # the same factor leaves E/I unchanged and merely raises loop gain, which
+    # in this inhibition-dominated network suppresses the pyramids further:
+    # measured at wcomp 1.5, ca1_basket held at 52.8 Hz (unmoved) while CA3 SUP
+    # fell 4.54 -> 3.57 Hz. What heterogeneity costs is coincident EXCITATORY
+    # summation, so that is what has to be restored.
+    if compensate and isinstance(weight, (int, float)) and weight > 0:
+        weight = wcomp_w(weight)
     # Global delay heterogeneity: a scalar delay becomes uniform(d+/-cv*d).
     if isinstance(delay, (int, float)) and _HET["delay_cv"] > 0:
         delay = jittered_delay(float(delay), float(delay) * _HET["delay_cv"])
@@ -913,13 +942,15 @@ def build_replay_network(
     print("  Connecting background inputs...")
     d_fast = 1.5;  d_slow = 3.0
 
-    def _drive(n, rate, target, weight, delay):
+    def _drive(n, rate, target, weight, delay, compensate=True):
         gen = nest.Create("poisson_generator", n, params={"rate": float(rate)})
         nest.Connect(gen, target, conn_spec="one_to_one",
-                     syn_spec={"weight": float(weight), "delay": float(delay)})
+                     syn_spec={"weight": (wcomp_w(weight) if compensate
+                                          else float(weight)),
+                               "delay": float(delay)})
 
     _drive(N_ca1_pyr,      rate_ec_ca1_pyr,         CA1_PYR,      2.0, d_slow)
-    _drive(N_ca1_basket,   rate_drive_ca1_basket,   CA1_BASKET,   2.0, d_fast)
+    _drive(N_ca1_basket,   rate_drive_ca1_basket,   CA1_BASKET,   2.0, d_fast, compensate=False)
     if suppress_dg_drive:
         # A real DG circuit will drive CA3 via mossy fibres (build_dg_module);
         # skip the Poisson proxy so the mossy-fibre input is not double-counted.
@@ -942,7 +973,7 @@ def build_replay_network(
             _tg = nest.Create("poisson_generator", N_ca3_sup)
             nest.SetStatus(_tg, "rate", _tr.tolist())
             nest.Connect(_tg, CA3_SUP, conn_spec="one_to_one",
-                         syn_spec={"weight": float(ca3_tonic_weight), "delay": d_fast})
+                         syn_spec={"weight": wcomp_w(ca3_tonic_weight), "delay": d_fast})
         if ca3_tonic_rate_deep > 0:
             _drive(N_ca3_deep, ca3_tonic_rate_deep, CA3_DEEP, ca3_tonic_weight, d_fast)
     else:
@@ -959,8 +990,8 @@ def build_replay_network(
     _drive(N_ca3_deep,     rate_ec_ca3_deep,        CA3_DEEP,     1.2, d_slow)
     _drive(N_ca3_sup,      rate_ca3_drive_sup,      CA3_SUP,      2.0, d_fast)
     _drive(N_ca3_deep,     rate_ca3_drive_deep,     CA3_DEEP,     1.5, d_fast)
-    _drive(N_ca3_int_sup,  rate_drive_ca3_int_sup,  CA3_INT_SUP,  2.0, d_fast)
-    _drive(N_ca3_int_deep, rate_drive_ca3_int_deep, CA3_INT_DEEP, 2.0, d_fast)
+    _drive(N_ca3_int_sup,  rate_drive_ca3_int_sup,  CA3_INT_SUP,  2.0, d_fast, compensate=False)
+    _drive(N_ca3_int_deep, rate_drive_ca3_int_deep, CA3_INT_DEEP, 2.0, d_fast, compensate=False)
 
     # -------------------------------------------------------------------------
     # Theta drive
@@ -999,8 +1030,8 @@ def build_replay_network(
             sharpwave_rate=swr_sharpwave_rate,
             ripple_rate_mean=swr_ripple_mean, ripple_rate_amp=swr_ripple_amp,
             ripple_hz=swr_ripple_hz)
-        nest.Connect(sw_sh_sup,  CA3_SUP, conn_spec="one_to_one", syn_spec={"weight": 0.35, "delay": 1.0})
-        nest.Connect(sw_rip_sup, CA3_SUP, conn_spec="one_to_one", syn_spec={"weight": 0.15, "delay": 1.0})
+        nest.Connect(sw_sh_sup,  CA3_SUP, conn_spec="one_to_one", syn_spec={"weight": wcomp_w(0.35), "delay": 1.0})
+        nest.Connect(sw_rip_sup, CA3_SUP, conn_spec="one_to_one", syn_spec={"weight": wcomp_w(0.15), "delay": 1.0})
 
         sw_sh_deep, sw_rip_deep = make_swr_event_generators(
             n=N_ca3_deep, start_ms=swr_s, stop_ms=swr_e,
@@ -1008,8 +1039,8 @@ def build_replay_network(
             ripple_rate_mean=swr_ripple_mean * 0.35,
             ripple_rate_amp=swr_ripple_amp   * 0.35,
             ripple_hz=swr_ripple_hz)
-        nest.Connect(sw_sh_deep,  CA3_DEEP, conn_spec="one_to_one", syn_spec={"weight": 0.35, "delay": 1.0})
-        nest.Connect(sw_rip_deep, CA3_DEEP, conn_spec="one_to_one", syn_spec={"weight": 0.15, "delay": 1.0})
+        nest.Connect(sw_sh_deep,  CA3_DEEP, conn_spec="one_to_one", syn_spec={"weight": wcomp_w(0.35), "delay": 1.0})
+        nest.Connect(sw_rip_deep, CA3_DEEP, conn_spec="one_to_one", syn_spec={"weight": wcomp_w(0.15), "delay": 1.0})
 
         _, sw_rip_int_sup = make_swr_event_generators(
             n=N_ca3_int_sup, start_ms=swr_s, stop_ms=swr_e,
@@ -1030,8 +1061,8 @@ def build_replay_network(
             sharpwave_rate=swr_sharpwave_rate * 0.6,
             ripple_rate_mean=swr_ripple_mean * 0.6,
             ripple_rate_amp=swr_ripple_amp   * 0.6, ripple_hz=swr_ripple_hz)
-        nest.Connect(sw_sh_c1,  CA1_PYR, conn_spec="one_to_one", syn_spec={"weight": 0.20, "delay": 1.0})
-        nest.Connect(sw_rip_c1, CA1_PYR, conn_spec="one_to_one", syn_spec={"weight": 0.10, "delay": 1.0})
+        nest.Connect(sw_sh_c1,  CA1_PYR, conn_spec="one_to_one", syn_spec={"weight": wcomp_w(0.20), "delay": 1.0})
+        nest.Connect(sw_rip_c1, CA1_PYR, conn_spec="one_to_one", syn_spec={"weight": wcomp_w(0.10), "delay": 1.0})
 
         _, sw_rip_c1b = make_swr_event_generators(
             n=N_ca1_basket, start_ms=swr_s, stop_ms=swr_e,
@@ -1082,8 +1113,8 @@ def build_replay_network(
     print("  Wiring CA3 E<->I (fixed_indegree)...")
     t_ei = time.perf_counter()
 
-    fixed_connect(CA3_SUP,      CA3_INT_SUP,  K("ca3_EI_sup",   N_ca3_sup),      0.5,  d_fast)
-    fixed_connect(CA3_DEEP,     CA3_INT_DEEP, K("ca3_EI_deep",  N_ca3_deep),     0.5,  d_fast)
+    fixed_connect(CA3_SUP,      CA3_INT_SUP,  K("ca3_EI_sup",   N_ca3_sup),      0.5,  d_fast, compensate=False)
+    fixed_connect(CA3_DEEP,     CA3_INT_DEEP, K("ca3_EI_deep",  N_ca3_deep),     0.5,  d_fast, compensate=False)
     fixed_connect(CA3_INT_SUP,  CA3_SUP,      K("ca3_IE_sup",   N_ca3_int_sup),  w_ca3_ie_sup, d_fast)
     fixed_connect(CA3_INT_DEEP, CA3_DEEP,     K("ca3_IE_deep",  N_ca3_int_deep), -2.0, d_fast)
     fixed_connect(CA3_INT_SUP,  CA3_DEEP,     K("ca3_IE_cross", N_ca3_int_sup),  -0.2, d_fast)
@@ -1118,8 +1149,8 @@ def build_replay_network(
                   w_schaffer_sup_pyr*_wc*_sc_sup*schaffer_w_scale,   _d_sch)
     fixed_connect(CA3_DEEP, CA1_PYR, _K_deep,
                   w_schaffer_deep_pyr*_wc*_sc_deep*schaffer_w_scale, _d_sch)
-    fixed_connect(CA3_SUP,  CA1_BASKET, K("schaffer_sup_basket",  N_ca3_sup),  w_schaffer_sup_basket, d_fast)
-    fixed_connect(CA3_DEEP, CA1_BASKET, K("schaffer_deep_basket", N_ca3_deep), w_schaffer_deep_basket,d_fast)
+    fixed_connect(CA3_SUP,  CA1_BASKET, K("schaffer_sup_basket",  N_ca3_sup),  w_schaffer_sup_basket, d_fast, compensate=False)
+    fixed_connect(CA3_DEEP, CA1_BASKET, K("schaffer_deep_basket", N_ca3_deep), w_schaffer_deep_basket,d_fast, compensate=False)
     print(f"    done in {time.perf_counter()-t_sch:.1f}s")
 
     # ---- CA1 local (fixed_indegree) -----------------------------------------
@@ -1127,7 +1158,7 @@ def build_replay_network(
     t_ca1 = time.perf_counter()
 
     fixed_connect(CA1_PYR,    CA1_PYR,    K("ca1_EE", N_ca1_pyr),     w_ca1_ee,  d_slow)
-    fixed_connect(CA1_PYR,    CA1_BASKET, K("ca1_EI", N_ca1_pyr),     w_ca1_ei,  d_fast)
+    fixed_connect(CA1_PYR,    CA1_BASKET, K("ca1_EI", N_ca1_pyr),     w_ca1_ei,  d_fast, compensate=False)
     fixed_connect(CA1_BASKET, CA1_PYR,    K("ca1_IE", N_ca1_basket),  w_ca1_ie,  d_fast)
     fixed_connect(CA1_OLM,    CA1_PYR,    K("ca1_OE", N_ca1_olm),     w_ca1_oe,  d_slow)
     print(f"    done in {time.perf_counter()-t_ca1:.1f}s")
@@ -1488,12 +1519,18 @@ def build_dg_module(
               "(no --ec-lii; EC->DG loop OPEN)")
 
     # ---- Background drive: mossy cells + interneurons near threshold ---------
-    for pop, rate, w in [(MC_LOW, rate_bg_mc, w_bg_mc),
-                          (MC_HIGH, rate_bg_mc, w_bg_mc),
-                          (BASKET, rate_bg_basket, w_bg_basket)]:
+    # These hold cells NEAR THRESHOLD -- they set an operating point, they do
+    # not carry signal, so weight compensation must not touch the interneuron
+    # ones. Compensating the basket background at wcomp 2.3 drove DG baskets
+    # 0.79 -> 58 Hz (73x) and, through w_basket_gc = -7.0, silenced the granule
+    # cells completely: DG active fraction 1.88% -> 0.00%.
+    for pop, rate, w, comp in [(MC_LOW, rate_bg_mc, w_bg_mc, True),
+                               (MC_HIGH, rate_bg_mc, w_bg_mc, True),
+                               (BASKET, rate_bg_basket, w_bg_basket, False)]:
         bg = nest.Create("poisson_generator", len(pop), params={"rate": float(rate)})
         nest.Connect(bg, pop, conn_spec="one_to_one",
-                     syn_spec={"weight": float(w), "delay": d_fast})
+                     syn_spec={"weight": wcomp_w(w) if comp else float(w),
+                               "delay": d_fast})
 
     # ---- Intra-DG feedback loops (fixed_indegree, C++/MPI-parallel) ---------
     print("  [DGModule] Wiring intra-DG feedback (fixed_indegree)...")
@@ -1501,7 +1538,8 @@ def build_dg_module(
 
     # GC -> basket (E->I): recruit feedback inhibition
     fixed_connect(GC, BASKET, K("dg_gc_basket", N_gc), w_gc_basket,
-                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
+                  jittered_delay(d_fast, delay_jitter), w_cv=w_cv,
+                  compensate=False)
     # basket -> GC (I->E): the sparsifying feedback loop
     fixed_connect(BASKET, GC, K("dg_basket_gc", N_basket), w_basket_gc,
                   jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
@@ -1514,7 +1552,7 @@ def build_dg_module(
     fixed_connect(MC, GC, K("dg_mc_gc", len(MC)), w_mc_gc,
                   jittered_delay(d_fast, delay_jitter), w_cv=w_cv)
     # mossy cells -> basket (drive feedback inhibition of GC: the MC "gain control")
-    fixed_connect(MC, BASKET, K("dg_mc_basket", len(MC)), w_mc_basket, d_fast)
+    fixed_connect(MC, BASKET, K("dg_mc_basket", len(MC)), w_mc_basket, d_fast, compensate=False)
 
     # ---- Mossy fibre DG -> CA3 (detonator: low in-degree, high weight) -------
     print("  [DGModule] Wiring mossy fibres GC->CA3 (detonator)...")
@@ -2350,7 +2388,7 @@ def build_mpfc(
                 f"point where Izhikevich neurons start spiking FROM inhibition "
                 f"(quadratic term). Reduce K_ie or w_mpfc_ie.",
                 RuntimeWarning, stacklevel=2)
-        fixed_connect(MPFC,     MPFC_INT, K_ei, w_mpfc_ei, 1.5)
+        fixed_connect(MPFC,     MPFC_INT, K_ei, w_mpfc_ei, 1.5, compensate=False)
         fixed_connect(MPFC_INT, MPFC,     K_ie, w_mpfc_ie, 1.5)
         spk_int = nest.Create("spike_recorder")
         nest.Connect(MPFC_INT, spk_int)
@@ -4038,10 +4076,11 @@ Dentate gyrus (Phase 6.2):
              "flags below.")
     parser.add_argument(
         "--het-wcomp", type=float, default=1.0, metavar="X",
-        help="Weight scale applied model-wide alongside --het, restoring the "
-             "operating point that heterogeneity lowers. Without it CA1 PYR "
-             "falls ~4x at cv 0.15, which confounds any comparison against the "
-             "homogeneous condition.")
+        help="Scale applied to every EXCITATORY weight alongside --het, "
+             "restoring the operating point that heterogeneity lowers. Without "
+             "it CA1 PYR falls ~4x at cv 0.15. Inhibition is deliberately left "
+             "alone: scaling both leaves E/I unchanged and only raises loop "
+             "gain, which made CA3 SUP fall further (4.54 -> 3.57 Hz).")
     parser.add_argument(
         "--het-w-cv", type=float, default=None, metavar="CV",
         help="Weight CV on every projection (default: --het).")
