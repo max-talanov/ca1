@@ -56,6 +56,38 @@
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,TRAIN_PATTERN=0,N_SWR=16,\
 #SCHAFFER_K=200,DELAY_JITTER=4.0,SCHAFFER_STDP=1,CORTICAL_RECALL=1,NO_MPFC_ASSOC=1,SEED=101 run.sh
 #
+# ---- JOB H : does heterogeneity make DG SELECTIVE? (the engram question) ----
+# Background (RESULTS.md §13): the model has no engram because DG is sparse but
+# NOT selective -- over 7 epochs replaying the SAME pattern, 83% of granule
+# cells fire in exactly 1 of 7 windows and none in all 7. Cause: the only
+# pattern-carrying input (EC LII perforant path) supplies 0.6% of granule drive,
+# the other 99.4% being a Poisson residual resampled every window. Raising the
+# perforant weight was blocked by a synchrony ceiling -- with scalar weights and
+# delays a granule cell's K=50 inputs land in one instant, so K*w must stay
+# under the 20 mV gap.
+#
+# --het gives every cell and every synapse a distribution, which lifts that
+# ceiling. H1 tests heterogeneity alone; H2 additionally spends the headroom on
+# the perforant path. Compare both against JOB F (homogeneous, same settings).
+#
+# NOT rate-matched: five attempts to calibrate --het-wcomp at 1% each uncovered
+# a different failure mode, and the 1% homogeneous baseline cannot anchor the
+# comparison anyway (rho_rev -0.079 there vs -0.656 at 12%). Read H1/H2 for
+# whether DG becomes SELECTIVE, and treat rate differences as expected.
+#
+# JOB H1 — heterogeneity alone
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3 run.sh
+#
+# JOB H2 — heterogeneity + perforant path through the door
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=1.2,PP_RESIDUAL=0.5,DG_DELAY_JITTER=4.0 run.sh
+#
+# READ FIRST in both: DG active fraction must be 2-4%. If it is 0.00% the
+# granule population has been extinguished by basket feedback (seen at 1% when
+# the basket background drive was wrongly compensated) and nothing else in the
+# run means anything. Then check whether granule cells develop a CORE SET --
+# cells firing in >=6/7 same-pattern windows, versus 1 observed today.
+#
 # CHECK BEFORE BELIEVING ANY RECALL NUMBER: the printed pre-cue baseline must be
 # ~0. If it is not, the priming is firing cells by itself and completion is
 # meaningless -- lower CR_PRIME_RATE (120 works at 1%; 250 did not).
@@ -73,6 +105,15 @@ HOMEOSTASIS=${HOMEOSTASIS:-0}  # 1=enable Phase 4 synaptic homeostasis
 HOMEO_ALPHA=${HOMEO_ALPHA:-0.75}  # downscaling factor (default 0.75)
 ALPHA_SWEEP=${ALPHA_SWEEP:-}      # comma-sep list, e.g. "0.50,0.75,0.90"; overrides HOMEO_ALPHA
 # ---- Phase 6.2 dentate gyrus + pattern completion ---------------------------
+HET=${HET:-0}                  # model-wide heterogeneity CV: weights, delays AND
+                               # per-cell a/b/c/d/I_e. 0 = the historical
+                               # homogeneous model (every cell a copy).
+HET_WCOMP=${HET_WCOMP:-1.0}    # excitatory-onto-principal weight scale, to offset
+                               # the gain heterogeneity costs. NOT rate-matched at
+                               # 12% -- see the JOB H notes in the header.
+W_EC_DG=${W_EC_DG:-}           # perforant path EC LII->GC weight (default 0.15)
+PP_RESIDUAL=${PP_RESIDUAL:-}   # scale on the Poisson stand-in drive to DG
+DG_DELAY_JITTER=${DG_DELAY_JITTER:-}   # extra ms jitter on the DG pathway
 DG=${DG:-0}                    # 1=add the real DG (Phase 6.2), replaces Poisson proxy
 DG_SCALE=${DG_SCALE:-$SCALE}   # DG scale %; defaults to SCALE
 PATTERN_COMPLETION=${PATTERN_COMPLETION:-0}  # 1=run the CA3 completion probe INSTEAD
@@ -107,6 +148,7 @@ echo "[Slurm] job=$SLURM_JOB_ID  ntasks=$SLURM_NTASKS  cpus-per-task=$SLURM_CPUS
 echo "[Slurm] scale=${SCALE}%  n_swr=$N_SWR  epoch_ms=$EPOCH_MS  prp_threshold=$PRP_THRESHOLD"
 echo "[Slurm] ec_lv=${EC_LV}  mpfc=${MPFC}  no_stc=${NO_STC}  homeostasis=${HOMEOSTASIS}  homeo_alpha=${HOMEO_ALPHA}  alpha_sweep=${ALPHA_SWEEP:-<none>}"
 echo "[Slurm] dg=${DG}  dg_scale=${DG_SCALE}  pattern_completion=${PATTERN_COMPLETION}"
+echo "[Slurm] het=${HET}  het_wcomp=${HET_WCOMP}  w_ec_dg=${W_EC_DG:-<default>}  pp_residual=${PP_RESIDUAL:-<default>}  dg_delay_jitter=${DG_DELAY_JITTER:-<default>}"
 
 python3 - <<'PY'
 import nest
@@ -141,6 +183,9 @@ fi
 # Tag output filename with active phases
 PHASE_TAG=""
 [ "$DG" = "1" ] && PHASE_TAG="${PHASE_TAG}_dg"
+# tag heterogeneity so H1/H2 cannot overwrite the homogeneous JOB F output
+[ "$HET" != "0" ] && PHASE_TAG="${PHASE_TAG}_het${HET}"
+[ -n "$W_EC_DG" ] && PHASE_TAG="${PHASE_TAG}_pp${W_EC_DG}"
 [ "$EC_LV" = "1" ]  && PHASE_TAG="${PHASE_TAG}_lv"
 [ "$MPFC"  = "1" ]  && PHASE_TAG="${PHASE_TAG}_mpfc"
 [ "${PRP_THRESHOLD%.*}" -gt 100 ] 2>/dev/null && PHASE_TAG="${PHASE_TAG}_ph5"
@@ -181,6 +226,10 @@ if [ "$CORTICAL_RECALL" = "1" ]; then
   OPTIONAL_FLAGS="$OPTIONAL_FLAGS --cr-prime-rate $CR_PRIME_RATE --cr-prime-weight $CR_PRIME_WEIGHT"
 fi
 [ "$DG"     = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg --dg-scale $DG_SCALE"
+[ "$HET" != "0" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --het $HET --het-wcomp $HET_WCOMP"
+[ -n "$W_EC_DG" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --w-ec-dg $W_EC_DG"
+[ -n "$PP_RESIDUAL" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --pp-residual $PP_RESIDUAL"
+[ -n "$DG_DELAY_JITTER" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-delay-jitter $DG_DELAY_JITTER"
 [ "$NO_STC" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --stc --n-swr $N_SWR --epoch-ms $EPOCH_MS --prp-threshold $PRP_THRESHOLD"
 [ "$EC_LV"  = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lv"
 [ "$MPFC"   = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --mpfc"
