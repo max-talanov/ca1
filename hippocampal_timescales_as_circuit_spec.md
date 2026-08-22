@@ -52,14 +52,6 @@ The synaptic tagging-and-capture (STC) mechanism described in the hippocampal pl
 
 The dashed trace is the predicted signature if capture is blocked entirely: the weight distribution should stay flat while replay quality (measured independently) stays unchanged — a clean separation of the replay mechanism from the consolidation mechanism. That separation is also, functionally, the experiment you'd want to run on a candidate memristive tagging device: drive it with the same input statistics, and check whether blocking "capture" produces the same flat, non-accumulating signature.
 
-## 4. What continuous time actually costs, and where it's needed
-
-Every stage above is realizable in a purely clocked digital design in principle — quantize time, evaluate on ticks, done. What's lost by doing that is concentrated almost entirely in two places: the postsynaptic threshold crossing (a real-valued event time, quantized to within half a tick by any clocked evaluator) and the few-millisecond spacing between elements within a single compressed replay event, which is finer than the 5–10 ms refractory windows typically cited for dendritic spikes and finer than most digital-SNN simulation time steps. Everything downstream of the junction — routing, somatic summation, systems-level consolidation over days to years — tolerates tick-scale quantization without qualitative error, and can stay ordinary clocked digital at negligible cost. The practical design rule this note draws from the fuller analysis: spend continuous-time analog circuitry only at the synapse/dendrite boundary, where the biology's own timing claims live; leave everything else digital.
-
-Two existing figures from the hardware document make the resulting architecture concrete — a single-neuron reference topology showing the threshold/junction/soma pipeline (`th/rp` primitive reused at every level), and a network-level topology showing the same primitive tiled across populations connected by millisecond-scale spike routers:
-
-- [Single-neuron reference topology](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/dendritic_convolution_reference_topology.jpeg)
-- [Network-level routing topology](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/network_level_routing_topology.jpeg)
 
 ---
 
