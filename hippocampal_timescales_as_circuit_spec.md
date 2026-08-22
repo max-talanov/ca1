@@ -1,12 +1,6 @@
 # Hippocampal Timescales as a Circuit Specification
 
 
-## Why this note exists
-
-Two kinds of material tend to live in separate documents and serve different audiences: the molecular biology of memory consolidation — from a single glutamate release event to a memory trace redistributed across neocortex — and a feasibility case for building the dendritic-processing side of that circuit in memristive/CMOS hardware. Neither, alone, makes the connection explicit: *the biological time constants are not background color, they are the spec the circuit has to hit.* This note exists to make that connection short enough to read in one sitting.
-
-Nothing here replaces the source documents — it is a compressed path through both, keeping only what a circuit or systems designer needs from the biology, and only the feasibility conclusions (not the full derivations) from the hardware analysis.
-
 ## 1. The timescales, compressed
 
 Learning in this system runs on eight processes spanning nine orders of magnitude, from a single receptor gating event to a memory trace redistributing across cortex over months. What matters for hardware is not the molecular detail of each stage but three facts: which stages are fast enough to force analog/continuous-time circuitry, which are slow enough that a clocked digital design is free, and where the biological threshold behavior maps directly onto a specific circuit primitive.
