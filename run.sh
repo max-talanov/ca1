@@ -82,6 +82,20 @@
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
 #W_EC_DG=1.2,PP_RESIDUAL=0.5,DG_DELAY_JITTER=4.0 run.sh
 #
+# JOB H3 — H2 rerun after the DG background fix.  H1/H2 (2026-08-22) produced a
+#   real CORE SET for the first time (64-69 granule cells firing in >=6/7
+#   same-pattern windows, against 1 in the homogeneous model) but ZERO pattern
+#   selectivity (Jaccard within-between -0.002). Cause: the compensated
+#   mossy-cell background put DG baskets at 22.3 Hz and clamped granule cells to
+#   0.45% active, so the perforant path could not influence WHICH cells fire --
+#   H2's 8x perforant weight changed nothing. With GC clamped, the cells that
+#   escape are the intrinsically most excitable ones, which is why the core set
+#   is reproducible but identical across patterns (H1/H2 core overlap 32 cells
+#   despite an 8x input difference). Now that no DG background drive is
+#   compensated, DG should return to 2-4% and the perforant path gets a say.
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=1.2,PP_RESIDUAL=0.5,DG_DELAY_JITTER=4.0,SEED=202 run.sh
+#
 # READ FIRST in both: DG active fraction must be 2-4%. If it is 0.00% the
 # granule population has been extinguished by basket feedback (seen at 1% when
 # the basket background drive was wrongly compensated) and nothing else in the

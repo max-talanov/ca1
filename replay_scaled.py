@@ -1416,7 +1416,10 @@ def build_dg_module(
     # and leaves the pattern-carrying input at 0.6% of granule drive (§13).
     # Spreading arrival over delay_jitter ms drops the instantaneous kick from
     # K*w to roughly (K/spread_bins)*w, which is what buys headroom on w_ec_dg.
-    delay_jitter=0.0, w_cv=0.0,
+    delay_jitter=0.0, w_cv=None,   # None => inherit the global --het w_cv
+                                   # (an explicit 0.0 here silently disabled
+                                   #  weight heterogeneity on every DG synapse:
+                                   #  JOB H1/H2 both printed cv=0.0 despite --het 0.30)
     # Perforant path (EC LII proxy) — heterogeneous Poisson onto GC.
     # Bracketing the granule sparse-coding target across three 1% runs:
     #   pp_weight 8.0 -> 97% active per window (dense; drowned CA3 replay)
@@ -1524,8 +1527,15 @@ def build_dg_module(
     # ones. Compensating the basket background at wcomp 2.3 drove DG baskets
     # 0.79 -> 58 Hz (73x) and, through w_basket_gc = -7.0, silenced the granule
     # cells completely: DG active fraction 1.88% -> 0.00%.
-    for pop, rate, w, comp in [(MC_LOW, rate_bg_mc, w_bg_mc, True),
-                               (MC_HIGH, rate_bg_mc, w_bg_mc, True),
+    # NONE of these are compensated. The mossy-cell drive was left compensated
+    # in the first pass on the argument that mossy cells are principal cells;
+    # JOB H1/H2 at 12% showed that is wrong in effect. At wcomp 2.3 it drove
+    # MC_LOW to 11.8 Hz (27x its homogeneous 0.43 Hz), which through MC->BASKET
+    # put DG baskets at 22.3 Hz and clamped granule cells to 0.45% active
+    # against the 2-4% target. With GC inhibition-clamped, an 8x rise in the
+    # perforant weight moved nothing: H2 changed DG selectivity by 0.002.
+    for pop, rate, w, comp in [(MC_LOW, rate_bg_mc, w_bg_mc, False),
+                               (MC_HIGH, rate_bg_mc, w_bg_mc, False),
                                (BASKET, rate_bg_basket, w_bg_basket, False)]:
         bg = nest.Create("poisson_generator", len(pop), params={"rate": float(rate)})
         nest.Connect(bg, pop, conn_spec="one_to_one",
