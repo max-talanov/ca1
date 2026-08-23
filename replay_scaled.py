@@ -459,6 +459,22 @@ def wcomp_w(weight):
 # collapsing to 0.32 Hz, rho_rev failing at -0.309). Those get an absolute
 # reference scale instead, multiplied by the same cv knob.
 _HET_NEURON_KEYS = ("a", "b", "c", "d", "I_e")
+# b is the BIFURCATION parameter: rheobase = (5-b)^2/0.16 - 140 - I_e goes
+# NEGATIVE (the cell fires tonically with no input at all) once
+# (5-b)^2 < 0.16*(140+I_e). At cv 0.30 a symmetric Gaussian around b=0.2 puts
+# 13% of cells past that for I_e=0, and 39% for EC LV's I_e=3.0. Measured
+# consequence at 12%: 25-30% of DG baskets ran at 38-189 Hz and clamped the
+# granule population to 0.49% active against a 2-4% target. b therefore gets a
+#
+# The model deliberately places cells NEAR that bifurcation -- EC LV sits at
+# b=0.2 with b_crit=0.217, a 1.0 pA rheobase -- so b cannot carry much spread.
+# It gets B_CV_FACTOR of the global cv plus a hard ceiling just below b_crit,
+# and populations already at or above that ceiling keep their calibrated b
+# unchanged rather than being clipped down to it (clipping there would move the
+# mean and undo the f-I calibration). Excitability heterogeneity is carried by
+# I_e instead, which is monotone and has no bifurcation.
+B_CV_FACTOR = 0.10
+B_MARGIN = 0.02
 _HET_SCALE = {"a": ("rel", None), "b": ("rel", None), "d": ("rel", None),
               "c": ("abs", 5.0),      # cv 0.3 -> 1.5 mV spread of reset
               "I_e": ("abs", 3.0)}    # cv 0.3 -> 0.9 pA spread of drive
@@ -495,6 +511,16 @@ def het_params(params, n, rng, cv=None):
             continue
         vals = rng.normal(base, sd, n)
         lo, hi = _HET_CLIP.get(k, (None, None))
+        if k == "b":
+            # keep every cell on the quiescent side of the saddle-node
+            _ie = params.get("I_e", 0.0)
+            _ie = float(np.mean(_ie)) if not isinstance(_ie, (int, float)) else float(_ie)
+            b_crit = 5.0 - np.sqrt(max(0.16 * (140.0 + _ie), 0.0))
+            cap = b_crit - B_MARGIN
+            if base >= cap:
+                continue        # already at the edge by design: leave it alone
+            vals = rng.normal(base, sd * B_CV_FACTOR, n)
+            hi = cap if hi is None else min(hi, cap)
         if lo is not None or hi is not None:
             vals = np.clip(vals, lo if lo is not None else -np.inf,
                            hi if hi is not None else np.inf)
@@ -4109,9 +4135,12 @@ Dentate gyrus (Phase 6.2):
              "perforant path and mossy fibres. Spreads the EC volley in time, "
              "lifting the synchrony ceiling that caps w_ec_dg (see §13).")
     parser.add_argument(
-        "--w-cv", type=float, default=0.0, metavar="CV",
-        help="Coefficient of variation for DG synaptic weights. 0 (default) "
-             "keeps the scalar weights the model has always used.")
+        "--w-cv", type=float, default=None, metavar="CV",
+        help="Coefficient of variation for DG synaptic weights. Unset inherits "
+             "--het; an explicit 0 forces scalar DG weights. This defaulted to "
+             "0.0 and was passed through to fixed_connect, which shadowed the "
+             "global setting -- JOBS H1/H2/H3 all printed cv=0.0 despite "
+             "--het 0.30, so no DG synapse ever had weight heterogeneity.")
     parser.add_argument(
         "--w-ec-dg", type=float, default=0.15, metavar="W",
         help="Perforant path EC LII->GC weight. 0.15 is the synchrony-limited "
