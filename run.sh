@@ -105,6 +105,34 @@
 # CHECK BEFORE BELIEVING ANY RECALL NUMBER: the printed pre-cue baseline must be
 # ~0. If it is not, the priming is firing cells by itself and completion is
 # meaningless -- lower CR_PRIME_RATE (120 works at 1%; 250 did not).
+#
+# JOB H4 — H3 rerun after two more fixes (2026-08-23):
+#   (1) `b` is a bifurcation parameter, not a scalable-heterogeneity gain --
+#       a symmetric spread on `b` was pushing cells past their rheobase
+#       saddle-node into tonic firing with zero input. DG basket max
+#       189 -> 31.5 Hz, mean 21.5 -> 5.2 Hz at 1%.
+#   (2) `--w-cv` was shadowed since 1266ba3 (CLI default 0.0 overrode the
+#       function default of None), so H1/H2/H3 all ran with cv=0.0 despite
+#       --het 0.30 -- no DG synapse ever had real weight heterogeneity.
+#   Also: `pattern_discrimination()` (the within/between Jaccard table) never
+#   included DG GC -- only CA3/CA1/EC-LII/EC-LV/mPFC were checked, so H1-H3's
+#   "DG selectivity" numbers all came from an offline one-off script, not the
+#   pipeline. DG GC is now in that table automatically.
+#
+#   HET_WCOMP must stay 2.3 explicitly -- the CLI default flipped to 1.0 on
+#   2026-08-19 (0b71908) for unrelated reasons, and 1.0 starves the WHOLE
+#   network (heterogeneity's gain loss is compensated model-wide by this
+#   knob; the DG-background bug from H3 is fixed separately via a hardcoded
+#   compensate=False on those synapses, so this flag no longer needs to stay
+#   low for DG's sake). Confirmed locally at 1%: wcomp=1.0 crashed CA1 PYR
+#   9.6 -> <1 Hz and silenced EC LII (0 spikes in the scored SWR windows,
+#   i.e. no perforant-path signal could reach DG regardless of tuning).
+#   At wcomp=2.3 with the real EC LII input restored, W_EC_DG=1.2 (H2/H3's
+#   value) over-drove DG to 13%/4% active; W_EC_DG=0.6 landed back in band
+#   locally (3.05% fwd / 4.30% rev, CA1 PYR 9.4 Hz) -- starting point below,
+#   re-bracket at 12% since 1%<->12% is not rate-matched (see JOB H header).
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,SEED=202 run.sh
 
 SCALE=${SCALE:-25}
 EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)

@@ -4787,6 +4787,13 @@ Dentate gyrus (Phase 6.2):
     if args.n_patterns > 1:
         _pops = [("CA3 SUP", net["CA3_SUP"], net["spk_ca3_sup"]),
                  ("CA1 PYR", net["PYR"],     net["spk_pyr"])]
+        if dg_module is not None:
+            # The engram question (RESULTS.md §13) is decided here, not
+            # downstream: DG is the first stage with a sparse code, so it is
+            # the first place "selective" can be measured at all. Previously
+            # this table skipped DG and the within/between Jaccard had to be
+            # recomputed offline from the exported raster every time.
+            _pops.append(("DG GC", dg_module.GC, dg_module.spk_gc))
         if ec_module   is not None:
             _pops.append(("EC LII", ec_module.population,   ec_module.spike_rec))
         if eclv_module is not None:
