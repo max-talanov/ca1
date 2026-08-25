@@ -726,6 +726,66 @@ def make_staggered_replay_drive(seq_groups, swr_start_ms, direction="forward",
     return all_gens
 
 
+# ---- Phase 7: encoding-direction pattern drive (place fields on a ring) ----
+# The trigger/scaffold above inject pattern identity straight into CA3 SUP --
+# the replay/consolidation direction (CA3 -> CA1 -> EC -> cortex), not the
+# encoding direction (cortex -> EC -> DG -> CA3). These three functions give
+# EC LII a pattern-specific drive instead, so CA3 only ever learns which
+# pattern is active via the existing EC LII -> DG perforant path -> mossy
+# fibre route, making CA3's (and DG's) assembly identity a CONSEQUENCE of
+# DG's own separation ability rather than an externally-given label.
+#
+# Patterns are place-field-like tuning curves rather than disjoint groups:
+# each EC LII cell gets a fixed random preferred location on a ring, and each
+# pattern is a location on that same ring. Two patterns close together on the
+# ring recruit overlapping cell sets (nearby fields respond to both); two far
+# apart recruit disjoint sets. `sigma` (field width relative to the ring)
+# is the tunable overlap knob -- this is the "overlapping but not fully
+# random" input the DG selectivity question actually needs to be tested
+# against (Leutgeb et al.-style pattern separation), rather than the fully
+# disjoint CA3-group split used by the replay-direction trigger above.
+
+def assign_place_fields(n_cells, rng):
+    """Fixed random preferred location per cell on a ring of circumference 1."""
+    return rng.uniform(0.0, 1.0, n_cells)
+
+
+def place_field_gain(field_centers, pattern_center, sigma):
+    """Per-cell tuning-curve gain in [0, 1] for one pattern location.
+
+    Circular distance on the ring (circumference 1), Gaussian tuning curve.
+    sigma is in the same ring units (e.g. 0.15 -> a field influences roughly
+    the nearest 30-40% of the ring).
+    """
+    d = np.abs(field_centers - pattern_center)
+    d = np.minimum(d, 1.0 - d)  # wrap around the ring
+    return np.exp(-(d ** 2) / (2.0 * sigma ** 2))
+
+
+def make_place_field_drive(population, field_centers, pattern_center, sigma,
+                            t0_ms, dur_ms, base_rate, peak_rate,
+                            weight, delay=1.0):
+    """Per-cell poisson_generator batch, rate = base_rate + gain*peak_rate.
+
+    Same mechanics as make_replay_trigger/make_staggered_replay_drive (fixed
+    start/stop generators, one_to_one connect) -- just parameterized by the
+    tuning-curve gain per cell instead of by group membership. base_rate/
+    peak_rate need the same empirical bracketing every other DG/EC parameter
+    in this model has needed; there is no principled a-priori value.
+    """
+    gain  = place_field_gain(field_centers, pattern_center, sigma)
+    rates = base_rate + gain * peak_rate
+    ids   = population.tolist() if hasattr(population, "tolist") else list(population)
+    gens  = nest.Create("poisson_generator", len(ids), params={
+        "start": float(t0_ms), "stop": float(t0_ms + dur_ms),
+    })
+    nest.SetStatus(gens, "rate", rates.tolist())
+    nest.Connect(gens, nest.NodeCollection([int(i) for i in ids]),
+                 conn_spec="one_to_one",
+                 syn_spec={"weight": float(weight), "delay": float(delay)})
+    return gens
+
+
 # ============================================================================
 # Network builder
 # ============================================================================
@@ -846,6 +906,17 @@ def build_replay_network(
     # SPECIFIC: train A-only and B-only on the SAME network (same seed, so
     # the same synapses exist) and compare the resulting weight changes.
     train_pattern=None,
+    # Phase 7: where the pattern-defining external drive attaches.
+    # "ca3" (default) is the original Watson-replay direction: the trigger/
+    # scaffold below inject pattern identity straight into CA3 SUP, modelling
+    # an SWR reactivating an already-encoded memory. "ec-lii" is the encoding
+    # direction (sensory/cortex -> EC -> DG -> CA3): CA3 gets NO direct
+    # injection at all here, and the pattern-specific place-field drive is
+    # wired onto EC LII instead, in main(), after build_ec_lii() runs (EC LII
+    # does not exist yet at this point in the build). patterns/epoch_pattern
+    # are still computed and returned in both modes so that drive can reuse
+    # the same epoch-to-pattern-index sequence.
+    pattern_source="ca3",
     # Phase C: per-synapse delay jitter (ms) on the FEEDFORWARD readout
     # projections (Schaffer, and the cortical hops in the modules). 0 = the
     # original single-scalar delays. See jittered_delay().
@@ -1238,12 +1309,15 @@ def build_replay_network(
                              else train_pattern % len(patterns))
         grp   = [ca3_sup_groups[i] for i in pat]
         f_s, r_s = t0_ep + swr_fwd_start, t0_ep + swr_rev_start
-        if trigger_on:
+        # pattern_source="ec-lii": CA3 gets no direct pattern-specific
+        # injection at all -- the encoding-direction drive is wired onto
+        # EC LII instead, in main(), after build_ec_lii() runs.
+        if trigger_on and pattern_source == "ca3":
             make_replay_trigger(grp[0],  f_s, trigger_dur_ms=trigger_dur_ms,
                                 trigger_rate=trigger_rate, weight=trigger_weight)
             make_replay_trigger(grp[-1], r_s, trigger_dur_ms=trigger_dur_ms,
                                 trigger_rate=trigger_rate, weight=trigger_weight)
-        if scaffold_on:
+        if scaffold_on and pattern_source == "ca3":
             make_staggered_replay_drive(
                 grp, f_s, direction="forward",
                 inter_step_ms=scaffold_step_ms, drive_rate=scaffold_rate,
@@ -4191,6 +4265,44 @@ Dentate gyrus (Phase 6.2):
              "its own epochs. Needed for any engram/selectivity claim: with one "
              "pattern there is nothing to be selective ABOUT.")
     parser.add_argument(
+        "--pattern-source", choices=["ca3", "ec-lii"], default="ca3", metavar="SRC",
+        help="Where the pattern-defining drive attaches (Phase 7). 'ca3' "
+             "(default) is the original replay/consolidation direction: the "
+             "trigger/scaffold inject pattern identity straight into CA3 SUP, "
+             "modelling an SWR reactivating an already-encoded memory -- every "
+             "prior JOB H/Test-3 result used this. 'ec-lii' is the encoding "
+             "direction (sensory/cortex -> EC -> DG -> CA3): CA3 gets NO direct "
+             "injection at all, and a place-field-tuned drive (see "
+             "--place-field-sigma) is wired onto EC LII instead, so CA3's "
+             "assembly becomes a CONSEQUENCE of DG's own separation rather than "
+             "an externally given label. Requires --ec-lii.")
+    parser.add_argument(
+        "--place-field-sigma", type=float, default=0.15, metavar="SIGMA",
+        help="Only with --pattern-source ec-lii. Width (ring units, "
+             "circumference 1) of each EC LII cell's place-field tuning curve. "
+             "Controls how much adjacent patterns overlap -- smaller = more "
+             "separated patterns, larger = more overlap. Needs empirical "
+             "bracketing like every other DG/EC parameter here.")
+    parser.add_argument(
+        "--ec-pattern-base-rate", type=float, default=20.0, metavar="HZ",
+        help="Only with --pattern-source ec-lii. Poisson floor rate for every "
+             "EC LII cell during the pattern-drive window, regardless of "
+             "tuning-curve gain. Needs empirical bracketing.")
+    parser.add_argument(
+        "--ec-pattern-peak-rate", type=float, default=200.0, metavar="HZ",
+        help="Only with --pattern-source ec-lii. Additional Poisson rate at "
+             "full tuning-curve gain (i.e. at a cell's own field centre). "
+             "Needs empirical bracketing.")
+    parser.add_argument(
+        "--ec-pattern-weight", type=float, default=0.30, metavar="W",
+        help="Only with --pattern-source ec-lii. Synaptic weight of the "
+             "place-field drive onto EC LII. This is a K=1 (one dedicated "
+             "generator per cell) pathway competing against the existing "
+             "CA1->EC pathway (K=50, w=0.30) -- raising the rate alone "
+             "plateaued (13-14%% active regardless of a 4x rate increase), "
+             "so this needs to go well above 0.30 for the pattern signal to "
+             "out-compete CA1's 50-fold convergence. Needs bracketing.")
+    parser.add_argument(
         "--no-ec-dg-loop", action="store_true",
         help="Keep the EC LII->DG perforant path as a Poisson stand-in even when "
              "--ec-lii is present, leaving the EC->DG->CA3->CA1->EC loop OPEN. "
@@ -4312,6 +4424,8 @@ Dentate gyrus (Phase 6.2):
         parser.error("--mpfc requires --ec-lv")
     if args.homeostasis and not args.stc:
         parser.error("--homeostasis requires --stc (Phase 2 must be active)")
+    if args.pattern_source == "ec-lii" and not args.ec_lii:
+        parser.error("--pattern-source ec-lii requires --ec-lii")
 
     cfg = build_scale_config(args.scale)
 
@@ -4425,6 +4539,7 @@ Dentate gyrus (Phase 6.2):
         suppress_dg_drive = args.dg,   # real DG mossy fibres replace the proxy
         n_patterns     = args.n_patterns,
         train_pattern  = args.train_pattern,
+        pattern_source = args.pattern_source,
         n_epochs       = n_epochs,
         epoch_ms       = SIM_MS,
         delay_jitter   = args.delay_jitter,
@@ -4450,6 +4565,42 @@ Dentate gyrus (Phase 6.2):
             delay_jitter  = args.delay_jitter,
             delay_jitter_wcomp = args.delay_jitter_wcomp,
         )
+
+    # ---- Phase 7: encoding-direction pattern drive onto EC LII ---------------
+    # Only runs with --pattern-source ec-lii (validated above to require
+    # --ec-lii). This is the counterpart of the CA3 trigger/scaffold inside
+    # build_replay_network, just attached to EC LII instead and issued here
+    # because EC LII does not exist until build_ec_lii() has run. CA3 never
+    # receives any direct pattern-specific injection in this mode -- see
+    # build_replay_network's trigger_on/scaffold_on gating.
+    if args.pattern_source == "ec-lii":
+        print(">>> Wiring encoding-direction place-field drive onto EC LII...")
+        _pf_rng = np.random.default_rng(
+            (args.seed if args.seed is not None else 42) + 13)
+        ec_field_centers = assign_place_fields(N_ec_lii, _pf_rng)
+        n_pat = max(1, net["n_patterns"])
+        for ep in range(max(1, n_epochs)):
+            t0_ep = ep * SIM_MS
+            pat_idx = (net["epoch_pattern"][ep] if ep < len(net["epoch_pattern"])
+                       else ep % n_pat)
+            pattern_center = pat_idx / n_pat
+            f_s, r_s = t0_ep + net["swr_fwd"][0], t0_ep + net["swr_rev"][0]
+            f_dur = net["swr_fwd"][1] - net["swr_fwd"][0]
+            r_dur = net["swr_rev"][1] - net["swr_rev"][0]
+            make_place_field_drive(
+                ec_module.population, ec_field_centers, pattern_center,
+                args.place_field_sigma, f_s, f_dur,
+                args.ec_pattern_base_rate, args.ec_pattern_peak_rate,
+                weight=args.ec_pattern_weight)
+            make_place_field_drive(
+                ec_module.population, ec_field_centers, pattern_center,
+                args.place_field_sigma, r_s, r_dur,
+                args.ec_pattern_base_rate, args.ec_pattern_peak_rate,
+                weight=args.ec_pattern_weight)
+        print(f"    {n_pat} pattern(s) as ring locations, sigma="
+              f"{args.place_field_sigma}, base={args.ec_pattern_base_rate} Hz, "
+              f"peak={args.ec_pattern_peak_rate} Hz  ** CA3 gets no direct "
+              f"injection in this mode **")
 
     # ---- Phase C step 2: Schaffer STDP --------------------------------------
     schaffer_hook = None

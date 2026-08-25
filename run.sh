@@ -133,6 +133,40 @@
 #   re-bracket at 12% since 1%<->12% is not rate-matched (see JOB H header).
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
 #W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,SEED=202 run.sh
+#
+# JOB H5 — the encoding direction (Phase 7), not just the replay direction.
+#   All of JOB H1-H4 injected the pattern directly into CA3 SUP -- the
+#   REPLAY/consolidation direction (CA3->CA1->EC->cortex), which is what this
+#   whole codebase was built to study. It is NOT the encoding direction the
+#   user actually asked about (sensory/cortex->EC->DG->CA3), and DG can never
+#   be tested for its classical pattern-separation role while CA3 is being
+#   handed the answer directly -- confirmed structurally: EC LII's only
+#   afferent is CA1 (build_ec_lii), so DG's perforant path only ever echoes
+#   what CA3 already decided, never an independent input.
+#
+#   PATTERN_SOURCE=ec-lii reverses this: the pattern-defining drive attaches
+#   to EC LII instead, as place-field-like tuning curves on a ring (each EC
+#   LII cell gets a fixed random preferred location; each pattern is a ring
+#   location; PLACE_FIELD_SIGMA controls how much adjacent patterns overlap
+#   -- the "similar but not identical" input DG pattern separation is
+#   actually supposed to be tested against, not disjoint groups). CA3 gets
+#   NO direct injection in this mode -- it only ever learns the pattern via
+#   the existing EC LII->DG perforant path -> mossy fibre route. No new
+#   plasticity was added: the mossy fibre is already a fixed, sparse,
+#   high-weight "detonator" projection, so if DG genuinely produces a
+#   pattern-specific granule code, different CA3 cells get detonated purely
+#   from the existing wiring.
+#
+#   EC_PATTERN_BASE_RATE / EC_PATTERN_PEAK_RATE / PLACE_FIELD_SIGMA are all
+#   UNCALIBRATED -- bracket locally (NEST now runs locally, see
+#   [[phase-plan-memhippo]] memory) before spending an MN5 allocation, the
+#   same way W_EC_DG/PP_RESIDUAL were bracketed for JOB H4. Read the
+#   `pattern_discrimination` table's EC LII row as a positive control first
+#   (it should show strong separation since it is pattern-locked by
+#   construction) -- if EC LII itself doesn't discriminate, the drive is
+#   miscalibrated and the DG/CA3 rows below it mean nothing yet.
+#  sbatch --export=ALL,SCALE=1,DG=1,N_PATTERNS=2,N_SWR=8,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=200 run.sh
 
 SCALE=${SCALE:-25}
 EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)
@@ -157,6 +191,12 @@ W_EC_DG=${W_EC_DG:-}           # perforant path EC LII->GC weight (default 0.15)
 PP_RESIDUAL=${PP_RESIDUAL:-}   # scale on the Poisson stand-in drive to DG
 DG_DELAY_JITTER=${DG_DELAY_JITTER:-}   # extra ms jitter on the DG pathway
 DG=${DG:-0}                    # 1=add the real DG (Phase 6.2), replaces Poisson proxy
+# ---- Phase 7: encoding-direction pattern drive (see JOB H5 below) ---------
+PATTERN_SOURCE=${PATTERN_SOURCE:-}   # ca3 (default) or ec-lii
+PLACE_FIELD_SIGMA=${PLACE_FIELD_SIGMA:-}     # ec-lii only: ring-unit field width
+EC_PATTERN_BASE_RATE=${EC_PATTERN_BASE_RATE:-}  # ec-lii only: Poisson floor Hz
+EC_PATTERN_PEAK_RATE=${EC_PATTERN_PEAK_RATE:-}  # ec-lii only: Poisson peak-gain Hz
+EC_PATTERN_WEIGHT=${EC_PATTERN_WEIGHT:-}     # ec-lii only: place-field synapse weight
 DG_SCALE=${DG_SCALE:-$SCALE}   # DG scale %; defaults to SCALE
 PATTERN_COMPLETION=${PATTERN_COMPLETION:-0}  # 1=run the CA3 completion probe INSTEAD
 PC_CUE_FRACS=${PC_CUE_FRACS:-0.1,0.2,0.3,0.5,0.7,1.0}
@@ -191,6 +231,7 @@ echo "[Slurm] scale=${SCALE}%  n_swr=$N_SWR  epoch_ms=$EPOCH_MS  prp_threshold=$
 echo "[Slurm] ec_lv=${EC_LV}  mpfc=${MPFC}  no_stc=${NO_STC}  homeostasis=${HOMEOSTASIS}  homeo_alpha=${HOMEO_ALPHA}  alpha_sweep=${ALPHA_SWEEP:-<none>}"
 echo "[Slurm] dg=${DG}  dg_scale=${DG_SCALE}  pattern_completion=${PATTERN_COMPLETION}"
 echo "[Slurm] het=${HET}  het_wcomp=${HET_WCOMP}  w_ec_dg=${W_EC_DG:-<default>}  pp_residual=${PP_RESIDUAL:-<default>}  dg_delay_jitter=${DG_DELAY_JITTER:-<default>}"
+echo "[Slurm] pattern_source=${PATTERN_SOURCE:-ca3}  place_field_sigma=${PLACE_FIELD_SIGMA:-<default>}  ec_pattern_base_rate=${EC_PATTERN_BASE_RATE:-<default>}  ec_pattern_peak_rate=${EC_PATTERN_PEAK_RATE:-<default>}"
 
 python3 - <<'PY'
 import nest
@@ -272,6 +313,11 @@ fi
 [ -n "$W_EC_DG" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --w-ec-dg $W_EC_DG"
 [ -n "$PP_RESIDUAL" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --pp-residual $PP_RESIDUAL"
 [ -n "$DG_DELAY_JITTER" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-delay-jitter $DG_DELAY_JITTER"
+[ -n "$PATTERN_SOURCE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --pattern-source $PATTERN_SOURCE"
+[ -n "$PLACE_FIELD_SIGMA" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --place-field-sigma $PLACE_FIELD_SIGMA"
+[ -n "$EC_PATTERN_BASE_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-base-rate $EC_PATTERN_BASE_RATE"
+[ -n "$EC_PATTERN_PEAK_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-peak-rate $EC_PATTERN_PEAK_RATE"
+[ -n "$EC_PATTERN_WEIGHT" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-weight $EC_PATTERN_WEIGHT"
 [ "$NO_STC" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --stc --n-swr $N_SWR --epoch-ms $EPOCH_MS --prp-threshold $PRP_THRESHOLD"
 [ "$EC_LV"  = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lv"
 [ "$MPFC"   = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --mpfc"
