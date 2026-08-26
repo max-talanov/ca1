@@ -275,7 +275,11 @@ network-level dynamics.
 
 ### 3.1 A concrete reference topology
 
-![Reference circuit topology for the dendritic-convolution pipeline: per-synapse threshold units feed a two-level hierarchy of OR-gated refractory junctions (each level with its own 5–10 ms τ_rf), converging on a soma that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/dendritic_convolution_reference_topology.jpeg)
+![Reference circuit topology for the 
+dendritic-convolution pipeline: per-synapse 
+threshold units feed a two-level hierarchy of 
+OR-gated refractory junctions (each level with 
+its own 5–10 ms τ_rf), converging on a soma that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](https://raw.githubusercontent.com/max-talanov/tinyHippo/refs/heads/main/dendritic_convolution.png)
 
 **Figure 1.** Reference circuit topology for a two-cluster excitatory
 dendritic tree feeding a single soma, instantiating the three-stage
