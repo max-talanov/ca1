@@ -22,7 +22,12 @@ Learning in this system runs on eight processes spanning nine orders of magnitud
 
 ## 2. The dendritic-convolution pipeline: what's cheap and what's hard in silicon
 
-![Reference circuit topology for the dendritic-convolution pipeline: per-synapse threshold units feed a two-level hierarchy of OR-gated refractory junctions (each level with its own 5–10 ms τ_rf), converging on a soma that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](dendritic_convolution_reference_topology.jpeg)
+![Reference circuit topology for the 
+dendritic-convolution pipeline: per-synapse 
+threshold units feed a two-level hierarchy of 
+OR-gated refractory junctions (each level with 
+its own 5–10 ms τ_rf), converging on a soma 
+that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](dendritic_convolution.png)
 
 
 The companion hardware document frames dendritic processing as a three-stage information-reduction pipeline — a postsynaptic threshold, an OR-gated refractory junction, and a somatic summation — each stage a candidate site for replacing an expensive analog circuit with a cheap thresholding one. Its stage-by-stage feasibility verdict:
