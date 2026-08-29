@@ -167,6 +167,36 @@
 #   miscalibrated and the DG/CA3 rows below it mean nothing yet.
 #  sbatch --export=ALL,SCALE=1,DG=1,N_PATTERNS=2,N_SWR=8,PATTERN_SOURCE=ec-lii,\
 #PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=200 run.sh
+#
+# JOB H6 — Phase 8: does DG neurogenesis make DG selective? At 1% the EC LII
+#   drive was too weak against the existing CA1->EC pathway (K=1 vs K=50) --
+#   bracketed locally to EC_PATTERN_PEAK_RATE=800, EC_PATTERN_WEIGHT=1.5,
+#   which finally gave EC LII its own real separation (sep +0.045 to +0.16
+#   depending on run) -- the first positive signal anywhere in this whole
+#   investigation. DG still did not inherit it (sep ~0, noise-level).
+#
+#   Neurogenesis (new hyperexcitable, under-inhibited GC cohort each epoch,
+#   see build_dg_neurogenesis_hook) was added specifically to test whether
+#   that closes the gap. Matched-seed local comparison (1%, N_SWR=8, seed
+#   202, otherwise identical): DG sep went -0.007/+0.018 (id/timing) ->
+#   -0.021/-0.017 with neurogenesis on -- nominally worse on both axes, no
+#   directional improvement, verdict unchanged (identity NONE, timing EC
+#   LII only). Read as noise, not a real effect, AT THIS SCALE.
+#
+#   Local is 12,000 granule cells over 8 epochs (120 new cells/epoch) -- thin
+#   for both the heterogeneity distributions and the cohort-vs-cohort
+#   statistics this mechanism depends on. N_SWR bumped to 14 (7 epochs/
+#   pattern, matching JOB H1-H5) for real statistical power. Run the control
+#   (no neurogenesis) and the neurogenesis arm as a matched pair, same seed:
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
+#EC_PATTERN_WEIGHT=1.5,SEED=202 run.sh
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=2,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
+#EC_PATTERN_WEIGHT=1.5,DG_NEUROGENESIS=1,NEUROGENESIS_RATE=0.01,\
+#NEUROGENESIS_MATURATION_EPOCHS=4,SEED=202 run.sh
 
 SCALE=${SCALE:-25}
 EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)
@@ -197,6 +227,13 @@ PLACE_FIELD_SIGMA=${PLACE_FIELD_SIGMA:-}     # ec-lii only: ring-unit field widt
 EC_PATTERN_BASE_RATE=${EC_PATTERN_BASE_RATE:-}  # ec-lii only: Poisson floor Hz
 EC_PATTERN_PEAK_RATE=${EC_PATTERN_PEAK_RATE:-}  # ec-lii only: Poisson peak-gain Hz
 EC_PATTERN_WEIGHT=${EC_PATTERN_WEIGHT:-}     # ec-lii only: place-field synapse weight
+# ---- Phase 8: DG neurogenesis ---------------------------------------------
+DG_NEUROGENESIS=${DG_NEUROGENESIS:-0}   # 1=new hyperexcitable GC cohort each epoch
+NEUROGENESIS_RATE=${NEUROGENESIS_RATE:-}   # fraction of original N_gc born/epoch
+NEUROGENESIS_MATURATION_EPOCHS=${NEUROGENESIS_MATURATION_EPOCHS:-}
+NEUROGENESIS_YOUNG_IE=${NEUROGENESIS_YOUNG_IE:-}
+NEUROGENESIS_YOUNG_INHIB_SCALE=${NEUROGENESIS_YOUNG_INHIB_SCALE:-}
+NEUROGENESIS_YOUNG_PP_SCALE=${NEUROGENESIS_YOUNG_PP_SCALE:-}
 DG_SCALE=${DG_SCALE:-$SCALE}   # DG scale %; defaults to SCALE
 PATTERN_COMPLETION=${PATTERN_COMPLETION:-0}  # 1=run the CA3 completion probe INSTEAD
 PC_CUE_FRACS=${PC_CUE_FRACS:-0.1,0.2,0.3,0.5,0.7,1.0}
@@ -232,6 +269,7 @@ echo "[Slurm] ec_lv=${EC_LV}  mpfc=${MPFC}  no_stc=${NO_STC}  homeostasis=${HOME
 echo "[Slurm] dg=${DG}  dg_scale=${DG_SCALE}  pattern_completion=${PATTERN_COMPLETION}"
 echo "[Slurm] het=${HET}  het_wcomp=${HET_WCOMP}  w_ec_dg=${W_EC_DG:-<default>}  pp_residual=${PP_RESIDUAL:-<default>}  dg_delay_jitter=${DG_DELAY_JITTER:-<default>}"
 echo "[Slurm] pattern_source=${PATTERN_SOURCE:-ca3}  place_field_sigma=${PLACE_FIELD_SIGMA:-<default>}  ec_pattern_base_rate=${EC_PATTERN_BASE_RATE:-<default>}  ec_pattern_peak_rate=${EC_PATTERN_PEAK_RATE:-<default>}"
+echo "[Slurm] dg_neurogenesis=${DG_NEUROGENESIS}  neurogenesis_rate=${NEUROGENESIS_RATE:-<default>}  maturation_epochs=${NEUROGENESIS_MATURATION_EPOCHS:-<default>}  young_ie=${NEUROGENESIS_YOUNG_IE:-<default>}  young_inhib_scale=${NEUROGENESIS_YOUNG_INHIB_SCALE:-<default>}  young_pp_scale=${NEUROGENESIS_YOUNG_PP_SCALE:-<default>}"
 
 python3 - <<'PY'
 import nest
@@ -287,6 +325,11 @@ fi
 [ "$CORTICAL_RECALL" = "1" ] && PHASE_TAG="${PHASE_TAG}_recall"
 [ "$NO_MPFC_ASSOC" = "1" ]   && PHASE_TAG="${PHASE_TAG}_noplast"
 [ -n "$TRAIN_PATTERN" ]      && PHASE_TAG="${PHASE_TAG}_p${TRAIN_PATTERN}"
+# tag pattern-source/neurogenesis so a JOB H6-style A/B pair (same SCALE,
+# HET, W_EC_DG, SEED -- differing only in these flags) cannot collide on the
+# same output file when run in parallel.
+[ "$PATTERN_SOURCE" = "ec-lii" ] && PHASE_TAG="${PHASE_TAG}_eclii"
+[ "$DG_NEUROGENESIS" = "1" ]     && PHASE_TAG="${PHASE_TAG}_neurogen"
 [ -n "$SEED" ]               && PHASE_TAG="${PHASE_TAG}_s${SEED}"
 OUTFILE="${OUTDIR}/replay_${SCALE}pct_stc${PHASE_TAG}.h5"
 echo "[Slurm] output → $OUTFILE"
@@ -318,6 +361,12 @@ fi
 [ -n "$EC_PATTERN_BASE_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-base-rate $EC_PATTERN_BASE_RATE"
 [ -n "$EC_PATTERN_PEAK_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-peak-rate $EC_PATTERN_PEAK_RATE"
 [ -n "$EC_PATTERN_WEIGHT" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-weight $EC_PATTERN_WEIGHT"
+[ "$DG_NEUROGENESIS" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-neurogenesis"
+[ -n "$NEUROGENESIS_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-rate $NEUROGENESIS_RATE"
+[ -n "$NEUROGENESIS_MATURATION_EPOCHS" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-maturation-epochs $NEUROGENESIS_MATURATION_EPOCHS"
+[ -n "$NEUROGENESIS_YOUNG_IE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-young-ie $NEUROGENESIS_YOUNG_IE"
+[ -n "$NEUROGENESIS_YOUNG_INHIB_SCALE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-young-inhib-scale $NEUROGENESIS_YOUNG_INHIB_SCALE"
+[ -n "$NEUROGENESIS_YOUNG_PP_SCALE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-young-pp-scale $NEUROGENESIS_YOUNG_PP_SCALE"
 [ "$NO_STC" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --stc --n-swr $N_SWR --epoch-ms $EPOCH_MS --prp-threshold $PRP_THRESHOLD"
 [ "$EC_LV"  = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lv"
 [ "$MPFC"   = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --mpfc"

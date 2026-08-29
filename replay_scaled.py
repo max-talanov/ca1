@@ -1726,6 +1726,219 @@ def dg_pattern_separation_stats(dg_module, sim_ms, window=None):
                 mean_rate_hz=mean_hz, verdict=verdict)
 
 
+# ---- Phase 8: DG neurogenesis (adult-born granule cell turnover) ----------
+# Young adult-born granule cells are transiently hyperexcitable (lower
+# rheobase), receive substantially less perisomatic GABAergic inhibition, and
+# show enhanced afferent synaptic gain (Aimone et al. 2009/2011; Marin-Burgin
+# et al. 2012) -- then mature into ordinary granule cells indistinguishable
+# from the rest of the population over a period here compressed to a few
+# epochs. The leading functional hypothesis is TEMPORAL pattern separation:
+# a different cohort of hyperexcitable cells is present at any given time, so
+# similar experiences separated in time get different codes even when a
+# static network would conflate them.
+#
+# Population size only grows here -- NEST has no clean mid-run node deletion,
+# and the claim under test (young cells behave differently) does not require
+# old cells to actually die, only new ones to exist. Over a typical 8-14
+# epoch run that is a bounded, modest increase (~10-15% of the original
+# granule count).
+
+@dataclass
+class DGNeurogenesisCohort:
+    """One birth-cohort of granule cells, aging toward the mature baseline.
+
+    Holds ONE target-only SynapseCollection (all of this cohort's incoming
+    synapses) plus boolean masks and a full weight vector, rather than
+    separate per-source-population handles -- SetStatus is always called on
+    the full collection with a full-length weight list (non-aged entries,
+    e.g. the Poisson residual and MC associational input, write back their
+    own unchanged value as a no-op). This is the same technique
+    build_homeostasis_hook uses, and for the same reason: see the note in
+    run_dg_neurogenesis_hook about why source+target GetConnections is
+    never used here.
+    """
+    gc           : object       # nest.NodeCollection -- this cohort's cells
+    birth_epoch  : int
+    in_conns     : object       # nest.SynapseCollection, target=gc (ALL incoming)
+    pp_mask      : np.ndarray   # bool -- which in_conns entries are EC LII->gc
+    inhib_mask   : np.ndarray   # bool -- which in_conns entries are BASKET->gc
+    base_weights : np.ndarray   # current full weight vector (mutated + written back)
+
+
+@dataclass
+class DGNeurogenesisHook:
+    """State for Phase 8 neurogenesis. Built once, then run_dg_neurogenesis_
+    hook() is called once per epoch, between nest.Simulate() calls -- exactly
+    the same interleaving the STC/mPFC-association hooks already use, which
+    is what makes creating/wiring new cells here safe: NEST supports Create/
+    Connect/SetStatus freely between Simulate() calls."""
+    ec_lii            : object   # nest.NodeCollection, perforant-path source
+    ca3_sup           : object
+    ca3_deep          : object
+    original_n_gc     : int
+    maturation_epochs : int
+    young_ie          : float
+    young_inhib_scale : float
+    young_pp_scale    : float
+    w_ec_dg           : float    # mature baseline weights, to relax toward
+    w_basket_gc       : float
+    w_gc_basket       : float
+    w_gc_mc           : float
+    w_mc_gc           : float
+    w_mf_ca3_sup      : float
+    w_mf_ca3_deep     : float
+    pp_rate_mean      : float
+    pp_rate_sigma     : float
+    pp_weight         : float
+    rng               : object
+    cohorts           : list = None
+
+
+def build_dg_neurogenesis_hook(
+    dg_module, ec_lii, ca3_sup, ca3_deep,
+    maturation_epochs=4, young_ie=4.0, young_inhib_scale=0.3, young_pp_scale=2.0,
+    w_ec_dg=0.15,
+    # The rest match build_dg_module's own defaults verbatim -- new cohorts
+    # must converge on the SAME mature baseline the original GC population
+    # was built with, not independently-chosen values.
+    w_basket_gc=-7.0, w_gc_basket=2.5, w_gc_mc=2.0, w_mc_gc=0.6,
+    w_mf_ca3_sup=2.5, w_mf_ca3_deep=1.5,
+    pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=4.0,
+    seed=42,
+) -> DGNeurogenesisHook:
+    return DGNeurogenesisHook(
+        ec_lii=ec_lii, ca3_sup=ca3_sup, ca3_deep=ca3_deep,
+        original_n_gc=dg_module.N_gc, maturation_epochs=maturation_epochs,
+        young_ie=young_ie, young_inhib_scale=young_inhib_scale,
+        young_pp_scale=young_pp_scale, w_ec_dg=w_ec_dg, w_basket_gc=w_basket_gc,
+        w_gc_basket=w_gc_basket, w_gc_mc=w_gc_mc, w_mc_gc=w_mc_gc,
+        w_mf_ca3_sup=w_mf_ca3_sup, w_mf_ca3_deep=w_mf_ca3_deep,
+        pp_rate_mean=pp_rate_mean, pp_rate_sigma=pp_rate_sigma, pp_weight=pp_weight,
+        rng=np.random.default_rng(seed + 31), cohorts=[],
+    )
+
+
+def run_dg_neurogenesis_hook(hook, dg_module, epoch, rate):
+    """Birth one new cohort and age every tracked cohort toward maturity.
+
+    Call once per epoch (including epoch 0), BEFORE that epoch's
+    nest.Simulate(), so newly created cells are wired in time to participate.
+    """
+    import nest
+
+    def _cohort_state(age):
+        frac = (min(1.0, age / hook.maturation_epochs)
+                if hook.maturation_epochs > 0 else 1.0)
+        pp_scale    = hook.young_pp_scale    + frac * (1.0 - hook.young_pp_scale)
+        inhib_scale = hook.young_inhib_scale + frac * (1.0 - hook.young_inhib_scale)
+        ie_val      = hook.young_ie * (1.0 - frac)
+        return pp_scale, inhib_scale, ie_val
+
+    # ---- birth a new cohort --------------------------------------------------
+    n_new = max(1, round(rate * hook.original_n_gc))
+    pp0, inhib0, ie0 = _cohort_state(0)
+    gc_params = dict(a=0.02, b=0.2, c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=ie0)
+    new_gc = nest.Create("izhikevich", n_new, params=gc_params)
+    nest.SetStatus(new_gc, "V_m",
+                   hook.rng.normal(-65.0, 4.0, n_new).clip(-75, -55).tolist())
+
+    # perforant path IN and inhibition IN: full K, same as the mature
+    # population -- this assigns each new cell its own normal allotment
+    # once, so it does NOT compound across cohorts.
+    K_pp = K("ec_dg_pp", len(hook.ec_lii))
+    fixed_connect(hook.ec_lii, new_gc, K_pp, hook.w_ec_dg * pp0, 3.0,
+                  compensate=False)
+
+    pp_rates = hook.rng.normal(hook.pp_rate_mean, hook.pp_rate_sigma,
+                               n_new).clip(5.0, None)
+    pp = nest.Create("poisson_generator", n_new)
+    nest.SetStatus(pp, "rate", pp_rates.tolist())
+    nest.Connect(pp, new_gc, conn_spec="one_to_one",
+                 syn_spec={"weight": float(hook.pp_weight), "delay": 1.5})
+
+    K_basket_gc = K("dg_basket_gc", len(dg_module.BASKET))
+    fixed_connect(dg_module.BASKET, new_gc, K_basket_gc,
+                  hook.w_basket_gc * inhib0, 1.5, compensate=False)
+
+    # associational back-projection IN (MC -> new cells): full K, same
+    # reasoning as perforant path / inhibition above. Wired here, BEFORE the
+    # GetConnections snapshot below, so that snapshot captures every one of
+    # new_gc's incoming connections in a single pass.
+    MC = dg_module.MC_LOW + dg_module.MC_HIGH
+    fixed_connect(MC, new_gc, K("dg_mc_gc", len(MC)), hook.w_mc_gc, 1.5,
+                  compensate=False)
+
+    # Cache ONE target-only GetConnections snapshot of ALL of new_gc's
+    # incoming synapses, post-filtered by source in Python -- NOT
+    # nest.GetConnections(source=, target=), which forces NEST 3.9 to walk
+    # the FULL kernel connectome (>15h on MN5 at 12% scale, confirmed: this
+    # exact mistake, made twice per epoch, is what killed the first MN5
+    # neurogenesis run at epoch 2/14 after >13h -- see build_homeostasis_
+    # hook's docstring for the same lesson learned earlier for CA3). A
+    # target-only query walks only new_gc's own incoming slots (a few
+    # hundred synapses per cell), the same trick STCHook/homeostasis use.
+    # Non-aged entries (the Poisson residual, MC associational input) just
+    # write their own unchanged value back every epoch -- see run_
+    # homeostasis_hook for the identical pattern.
+    in_conns = nest.GetConnections(target=new_gc)
+    src          = np.array(nest.GetStatus(in_conns, "source"), dtype=np.int64)
+    base_weights = np.array(nest.GetStatus(in_conns, "weight"), dtype=np.float64)
+    ec_ids   = set(hook.ec_lii.tolist())
+    bsk_ids  = set(dg_module.BASKET.tolist())
+    pp_mask    = np.array([g in ec_ids  for g in src], dtype=bool)
+    inhib_mask = np.array([g in bsk_ids for g in src], dtype=bool)
+
+    # new cells as SOURCE into fixed-size populations (basket recruitment,
+    # mossy collaterals, mossy fibre onto CA3): a TOKEN indegree only, not
+    # the full K. A fresh full-strength K from every cohort would compound
+    # -- each cohort adding another whole K's worth of convergence would
+    # inflate basket drive and CA3's mossy-fibre input epoch over epoch.
+    # Real young cells are a small fraction of the total granule pool and
+    # should perturb their targets proportionally, not repeat the full
+    # detonator every time a cohort is born.
+    def _token_k(key):
+        return max(1, round(TARGET_INDEGREE[key] * n_new / hook.original_n_gc))
+
+    fixed_connect(new_gc, dg_module.BASKET, _token_k("dg_gc_basket"),
+                  hook.w_gc_basket, 1.5, compensate=False)
+    fixed_connect(new_gc, dg_module.MC_LOW, _token_k("dg_gc_mc"),
+                  hook.w_gc_mc, 1.5, compensate=False)
+    fixed_connect(new_gc, dg_module.MC_HIGH, _token_k("dg_gc_mc"),
+                  hook.w_gc_mc, 1.5, compensate=False)
+    fixed_connect(new_gc, hook.ca3_sup, _token_k("dg_mf_ca3_sup"),
+                  hook.w_mf_ca3_sup, 1.5, compensate=False)
+    fixed_connect(new_gc, hook.ca3_deep, _token_k("dg_mf_ca3_deep"),
+                  hook.w_mf_ca3_deep, 1.5, compensate=False)
+
+    # Grow the module: every existing consumer (dg_pattern_separation_stats,
+    # pattern_discrimination) just reads dg_module.GC/N_gc, so this is the
+    # only change needed for them to see the new cells automatically.
+    nest.Connect(new_gc, dg_module.spk_gc)
+    dg_module.GC = dg_module.GC + new_gc
+    dg_module.N_gc = dg_module.N_gc + n_new
+
+    hook.cohorts.append(DGNeurogenesisCohort(
+        gc=new_gc, birth_epoch=epoch, in_conns=in_conns,
+        pp_mask=pp_mask, inhib_mask=inhib_mask, base_weights=base_weights))
+
+    # ---- age every tracked cohort, including the one just born (age 0) ------
+    for coh in hook.cohorts:
+        age = epoch - coh.birth_epoch
+        if age > hook.maturation_epochs:
+            continue  # already relaxed to baseline, nothing left to update
+        pp_scale, inhib_scale, ie_val = _cohort_state(age)
+        coh.base_weights[coh.pp_mask]    = hook.w_ec_dg * pp_scale
+        coh.base_weights[coh.inhib_mask] = hook.w_basket_gc * inhib_scale
+        # SetStatus on the full collection -- non-aged entries (Poisson
+        # residual, MC associational input) write back their own unchanged
+        # value as a no-op, same as run_homeostasis_hook.
+        nest.SetStatus(coh.in_conns, "weight", coh.base_weights.tolist())
+        nest.SetStatus(coh.gc, "I_e", float(ie_val))
+
+    print(f"  [DGNeurogenesis] epoch {epoch}: +{n_new} new GC (I_e={ie0:+.1f}), "
+          f"total N_gc={dg_module.N_gc:,}, {len(hook.cohorts)} cohort(s) tracked")
+
+
 # ============================================================================
 # CA3 pattern completion  (auto-association probe)
 # ============================================================================
@@ -4209,6 +4422,35 @@ Dentate gyrus (Phase 6.2):
              "perforant path and mossy fibres. Spreads the EC volley in time, "
              "lifting the synchrony ceiling that caps w_ec_dg (see §13).")
     parser.add_argument(
+        "--dg-neurogenesis", action="store_true",
+        help="Phase 8: a new, hyperexcitable, under-inhibited cohort of "
+             "granule cells is born each epoch and matures over "
+             "--neurogenesis-maturation-epochs. Requires --dg. Population "
+             "size only grows (no cell removal -- NEST has no clean mid-run "
+             "node deletion).")
+    parser.add_argument(
+        "--neurogenesis-rate", type=float, default=0.01, metavar="F",
+        help="Fraction of the ORIGINAL granule-cell count born as a new "
+             "cohort each epoch (default 0.01 = 1%%).")
+    parser.add_argument(
+        "--neurogenesis-maturation-epochs", type=int, default=4, metavar="M",
+        help="Epochs over which a cohort relaxes from young to mature "
+             "(excitability, inhibition received, perforant-path gain).")
+    parser.add_argument(
+        "--neurogenesis-young-ie", type=float, default=4.0, metavar="PA",
+        help="I_e offset (pA) at birth -- lowers rheobase, i.e. hyperexcitable. "
+             "Relaxes to 0 (mature baseline) over the maturation window.")
+    parser.add_argument(
+        "--neurogenesis-young-inhib-scale", type=float, default=0.3, metavar="F",
+        help="Fraction of the mature basket->GC weight a cohort receives at "
+             "birth (0.3 = 70%% less inhibition than a mature cell). Rises "
+             "to 1.0 over the maturation window.")
+    parser.add_argument(
+        "--neurogenesis-young-pp-scale", type=float, default=2.0, metavar="F",
+        help="Multiplier on the perforant-path (EC LII->GC) weight a cohort "
+             "receives at birth (enhanced afferent gain/plasticity). Decays "
+             "to 1.0 over the maturation window.")
+    parser.add_argument(
         "--w-cv", type=float, default=None, metavar="CV",
         help="Coefficient of variation for DG synaptic weights. Unset inherits "
              "--het; an explicit 0 forces scalar DG weights. This defaulted to "
@@ -4426,6 +4668,11 @@ Dentate gyrus (Phase 6.2):
         parser.error("--homeostasis requires --stc (Phase 2 must be active)")
     if args.pattern_source == "ec-lii" and not args.ec_lii:
         parser.error("--pattern-source ec-lii requires --ec-lii")
+    if args.dg_neurogenesis and not args.dg:
+        parser.error("--dg-neurogenesis requires --dg")
+    if args.dg_neurogenesis and not args.ec_lii:
+        parser.error("--dg-neurogenesis requires --ec-lii (perforant-path source "
+                      "for new cohorts)")
 
     cfg = build_scale_config(args.scale)
 
@@ -4627,6 +4874,20 @@ Dentate gyrus (Phase 6.2):
             w_cv         = args.w_cv,
         )
 
+    # ---- Optional Phase 8: DG neurogenesis -----------------------------------
+    neurogenesis_hook = None
+    if args.dg_neurogenesis:
+        print(">>> Initialising DG neurogenesis hook (Phase 8)...")
+        neurogenesis_hook = build_dg_neurogenesis_hook(
+            dg_module, ec_module.population, net["CA3_SUP"], net["CA3_DEEP"],
+            maturation_epochs = args.neurogenesis_maturation_epochs,
+            young_ie          = args.neurogenesis_young_ie,
+            young_inhib_scale = args.neurogenesis_young_inhib_scale,
+            young_pp_scale    = args.neurogenesis_young_pp_scale,
+            w_ec_dg           = args.w_ec_dg,
+            **({} if args.seed is None else dict(seed=args.seed)),
+        )
+
     # ---- Optional Phase 3: EC Layer V + mPFC ---------------------------------
     # Built BEFORE the plasticity hooks: nest.GetConnections() descriptors are
     # invalidated by any later Connect(), and NEST warns about exactly that.
@@ -4681,6 +4942,9 @@ Dentate gyrus (Phase 6.2):
 
     for epoch in range(n_epochs):
         epoch_t0 = epoch * SIM_MS
+        if neurogenesis_hook is not None:
+            run_dg_neurogenesis_hook(neurogenesis_hook, dg_module, epoch,
+                                     args.neurogenesis_rate)
         nest.Simulate(SIM_MS)
 
         if stc_hook is not None:
