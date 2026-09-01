@@ -1763,6 +1763,10 @@ class DGNeurogenesisCohort:
     pp_mask      : np.ndarray   # bool -- which in_conns entries are EC LII->gc
     inhib_mask   : np.ndarray   # bool -- which in_conns entries are BASKET->gc
     base_weights : np.ndarray   # current full weight vector (mutated + written back)
+    pre_idx      : np.ndarray   # index into EC LII population (Phase 10 plasticity;
+                                 # only meaningful where pp_mask is True, else -1)
+    post_idx     : np.ndarray   # index into THIS cohort's own gc (every entry has
+                                 # a valid target here, since in_conns is target=gc)
 
 
 @dataclass
@@ -1794,6 +1798,29 @@ class DGNeurogenesisHook:
     cohorts           : list = None
 
 
+def _dg_cache_cohort_incoming(gc_pop, ec_lii, basket_pop):
+    """Target-only GetConnections snapshot of gc_pop's incoming synapses,
+    post-filtered by source in Python. NOT nest.GetConnections(source=,
+    target=) -- see run_dg_neurogenesis_hook's note on why. Shared by
+    build_dg_neurogenesis_hook (the original population, cohort -1) and
+    run_dg_neurogenesis_hook (every later cohort), so the two never drift
+    out of sync with each other.
+    """
+    import nest
+    in_conns     = nest.GetConnections(target=gc_pop)
+    src          = np.array(nest.GetStatus(in_conns, "source"), dtype=np.int64)
+    tgt          = np.array(nest.GetStatus(in_conns, "target"), dtype=np.int64)
+    base_weights = np.array(nest.GetStatus(in_conns, "weight"), dtype=np.float64)
+    ec_map  = {g: i for i, g in enumerate(ec_lii.tolist())}
+    bsk_ids = set(basket_pop.tolist())
+    gc_map  = {g: i for i, g in enumerate(gc_pop.tolist())}
+    pre_idx    = np.array([ec_map.get(g, -1) for g in src], dtype=np.int64)
+    pp_mask    = pre_idx >= 0
+    inhib_mask = np.array([g in bsk_ids for g in src], dtype=bool)
+    post_idx   = np.array([gc_map[g] for g in tgt], dtype=np.int64)
+    return in_conns, pp_mask, inhib_mask, base_weights, pre_idx, post_idx
+
+
 def build_dg_neurogenesis_hook(
     dg_module, ec_lii, ca3_sup, ca3_deep,
     maturation_epochs=4, young_ie=4.0, young_inhib_scale=0.3, young_pp_scale=2.0,
@@ -1806,7 +1833,24 @@ def build_dg_neurogenesis_hook(
     pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=4.0,
     seed=42,
 ) -> DGNeurogenesisHook:
-    return DGNeurogenesisHook(
+    """Builds the hook AND, unconditionally, seeds "cohort -1": the
+    original (pre-neurogenesis) granule population, cached the same way
+    every later cohort will be, with birth_epoch set far enough in the past
+    that it is always at the mature baseline learning rate (Phase 10). This
+    means run_dg_perforant_plasticity_hook works identically for the
+    original population and for neurogenesis cohorts, and it means calling
+    this builder is enough to get DG perforant-path plasticity even when
+    --dg-neurogenesis itself is off (run_dg_neurogenesis_hook, which BIRTHS
+    new cohorts, is a separate, optional call).
+
+    WARNING -- this pays a real, one-time GetConnections(target=...) cost
+    over dg_module.GC's ENTIRE incoming connectivity. build_mpfc_assoc_hook's
+    comparable one-time cache (a MUCH smaller target, ~28,800 synapses at
+    12% scale) took 3.7-4.1 hours on MN5 in this session's own runs, so
+    target-only GetConnections cost evidently does not scale purely with
+    the target's own in-degree. Budget MN5 wall-time accordingly.
+    """
+    hook = DGNeurogenesisHook(
         ec_lii=ec_lii, ca3_sup=ca3_sup, ca3_deep=ca3_deep,
         original_n_gc=dg_module.N_gc, maturation_epochs=maturation_epochs,
         young_ie=young_ie, young_inhib_scale=young_inhib_scale,
@@ -1816,37 +1860,64 @@ def build_dg_neurogenesis_hook(
         pp_rate_mean=pp_rate_mean, pp_rate_sigma=pp_rate_sigma, pp_weight=pp_weight,
         rng=np.random.default_rng(seed + 31), cohorts=[],
     )
+    print(f"  [DGNeurogenesis] caching original population's incoming "
+          f"synapses ({dg_module.N_gc:,} cells) as cohort -1 (mature "
+          f"baseline plasticity)...")
+    t0 = time.perf_counter()
+    in_conns, pp_mask, inhib_mask, base_weights, pre_idx, post_idx = \
+        _dg_cache_cohort_incoming(dg_module.GC, ec_lii, dg_module.BASKET)
+    print(f"  [DGNeurogenesis] cohort -1 cached in {time.perf_counter()-t0:.1f}s "
+          f"({len(in_conns):,} synapses)")
+    hook.cohorts.append(DGNeurogenesisCohort(
+        gc=dg_module.GC, birth_epoch=-10**9, in_conns=in_conns,
+        pp_mask=pp_mask, inhib_mask=inhib_mask, base_weights=base_weights,
+        pre_idx=pre_idx, post_idx=post_idx))
+    return hook
+
+
+def _dg_cohort_age_frac(hook, age):
+    """0 at birth -> 1 at maturation_epochs, clamped. Shared by
+    run_dg_neurogenesis_hook (intrinsic-property relaxation) and
+    run_dg_perforant_plasticity_hook (Phase 10 learning-rate relaxation) so
+    both age a cohort identically."""
+    return min(1.0, age / hook.maturation_epochs) if hook.maturation_epochs > 0 else 1.0
 
 
 def run_dg_neurogenesis_hook(hook, dg_module, epoch, rate):
-    """Birth one new cohort and age every tracked cohort toward maturity.
+    """Birth one new cohort and age every tracked cohort's INTRINSIC
+    properties (excitability, inhibition received) toward maturity. Does
+    NOT touch perforant-path weights -- those are governed entirely by
+    run_dg_perforant_plasticity_hook now (Phase 10); see that function for
+    why a static young-cell weight multiplier was retired in favour of an
+    age-dependent LEARNING RATE.
 
     Call once per epoch (including epoch 0), BEFORE that epoch's
     nest.Simulate(), so newly created cells are wired in time to participate.
     """
     import nest
 
-    def _cohort_state(age):
-        frac = (min(1.0, age / hook.maturation_epochs)
-                if hook.maturation_epochs > 0 else 1.0)
-        pp_scale    = hook.young_pp_scale    + frac * (1.0 - hook.young_pp_scale)
+    def _intrinsic_state(age):
+        frac = _dg_cohort_age_frac(hook, age)
         inhib_scale = hook.young_inhib_scale + frac * (1.0 - hook.young_inhib_scale)
         ie_val      = hook.young_ie * (1.0 - frac)
-        return pp_scale, inhib_scale, ie_val
+        return inhib_scale, ie_val
 
     # ---- birth a new cohort --------------------------------------------------
     n_new = max(1, round(rate * hook.original_n_gc))
-    pp0, inhib0, ie0 = _cohort_state(0)
+    inhib0, ie0 = _intrinsic_state(0)
     gc_params = dict(a=0.02, b=0.2, c=-65.0, d=8.0, V_m=-65.0, U_m=-13.0, I_e=ie0)
     new_gc = nest.Create("izhikevich", n_new, params=gc_params)
     nest.SetStatus(new_gc, "V_m",
                    hook.rng.normal(-65.0, 4.0, n_new).clip(-75, -55).tolist())
 
-    # perforant path IN and inhibition IN: full K, same as the mature
-    # population -- this assigns each new cell its own normal allotment
-    # once, so it does NOT compound across cohorts.
+    # perforant path IN: plain baseline weight, same as the mature
+    # population, for every cohort regardless of age -- Phase 10 moved the
+    # young-cell effect from a static weight multiplier here to the
+    # LEARNING RATE in run_dg_perforant_plasticity_hook, so what makes a
+    # young cohort's synapses end up different is what they experience
+    # while young, not an arbitrary age-indexed scalar.
     K_pp = K("ec_dg_pp", len(hook.ec_lii))
-    fixed_connect(hook.ec_lii, new_gc, K_pp, hook.w_ec_dg * pp0, 3.0,
+    fixed_connect(hook.ec_lii, new_gc, K_pp, hook.w_ec_dg, 3.0,
                   compensate=False)
 
     pp_rates = hook.rng.normal(hook.pp_rate_mean, hook.pp_rate_sigma,
@@ -1877,16 +1948,8 @@ def run_dg_neurogenesis_hook(hook, dg_module, epoch, rate):
     # hook's docstring for the same lesson learned earlier for CA3). A
     # target-only query walks only new_gc's own incoming slots (a few
     # hundred synapses per cell), the same trick STCHook/homeostasis use.
-    # Non-aged entries (the Poisson residual, MC associational input) just
-    # write their own unchanged value back every epoch -- see run_
-    # homeostasis_hook for the identical pattern.
-    in_conns = nest.GetConnections(target=new_gc)
-    src          = np.array(nest.GetStatus(in_conns, "source"), dtype=np.int64)
-    base_weights = np.array(nest.GetStatus(in_conns, "weight"), dtype=np.float64)
-    ec_ids   = set(hook.ec_lii.tolist())
-    bsk_ids  = set(dg_module.BASKET.tolist())
-    pp_mask    = np.array([g in ec_ids  for g in src], dtype=bool)
-    inhib_mask = np.array([g in bsk_ids for g in src], dtype=bool)
+    in_conns, pp_mask, inhib_mask, base_weights, pre_idx, post_idx = \
+        _dg_cache_cohort_incoming(new_gc, hook.ec_lii, dg_module.BASKET)
 
     # new cells as SOURCE into fixed-size populations (basket recruitment,
     # mossy collaterals, mossy fibre onto CA3): a TOKEN indegree only, not
@@ -1919,24 +1982,92 @@ def run_dg_neurogenesis_hook(hook, dg_module, epoch, rate):
 
     hook.cohorts.append(DGNeurogenesisCohort(
         gc=new_gc, birth_epoch=epoch, in_conns=in_conns,
-        pp_mask=pp_mask, inhib_mask=inhib_mask, base_weights=base_weights))
+        pp_mask=pp_mask, inhib_mask=inhib_mask, base_weights=base_weights,
+        pre_idx=pre_idx, post_idx=post_idx))
 
-    # ---- age every tracked cohort, including the one just born (age 0) ------
+    # ---- age every tracked cohort's INTRINSIC properties, including the
+    # one just born (age 0). Perforant-path weights are NOT touched here --
+    # see run_dg_perforant_plasticity_hook.
     for coh in hook.cohorts:
         age = epoch - coh.birth_epoch
         if age > hook.maturation_epochs:
             continue  # already relaxed to baseline, nothing left to update
-        pp_scale, inhib_scale, ie_val = _cohort_state(age)
-        coh.base_weights[coh.pp_mask]    = hook.w_ec_dg * pp_scale
+        inhib_scale, ie_val = _intrinsic_state(age)
         coh.base_weights[coh.inhib_mask] = hook.w_basket_gc * inhib_scale
-        # SetStatus on the full collection -- non-aged entries (Poisson
-        # residual, MC associational input) write back their own unchanged
-        # value as a no-op, same as run_homeostasis_hook.
+        # SetStatus on the full collection -- non-aged entries (perforant
+        # path, Poisson residual, MC associational input) write back their
+        # own unchanged value as a no-op, same as run_homeostasis_hook.
         nest.SetStatus(coh.in_conns, "weight", coh.base_weights.tolist())
         nest.SetStatus(coh.gc, "I_e", float(ie_val))
 
     print(f"  [DGNeurogenesis] epoch {epoch}: +{n_new} new GC (I_e={ie0:+.1f}), "
           f"total N_gc={dg_module.N_gc:,}, {len(hook.cohorts)} cohort(s) tracked")
+
+
+# ---- Phase 10: EC LII -> GC perforant-path plasticity ----------------------
+# Retires the Phase 8 static young_pp_scale weight multiplier. Without any
+# learning, "young" vs "old" was purely a function of time-since-birth --
+# there was no mechanism by which a granule cell's response could depend on
+# WHICH pattern it has been exposed to, so there was no way for a young
+# cohort to respond differently to a novel pattern than to a familiar one
+# even in principle. This gives EC LII->GC an actual Hebbian rule, using the
+# exact same co-activation-potentiates / post-without-pre-depresses
+# algorithm as run_mpfc_assoc_hook (EC LV->mPFC) -- see that function's
+# docstring for the rule itself. young_pp_scale now multiplies the LEARNING
+# RATE (not the weight directly): a young cohort's synapses move toward
+# whatever is co-active WHILE THEY ARE YOUNG much faster than a mature
+# cohort's would, which is the actual mechanism real adult-born granule
+# cells are thought to use (enhanced LTP during a critical period), not an
+# arbitrary age-indexed scalar.
+#
+# Every tracked cohort -- INCLUDING cohort -1, the original population,
+# seeded in build_dg_neurogenesis_hook -- goes through the same update, at
+# the mature (age >= maturation_epochs) baseline rate. This means DG has
+# some plasticity even with --dg-neurogenesis off, so an observed
+# neurogenesis effect can be attributed to the young-cohort ENHANCEMENT
+# specifically, not to "DG has learning at all now".
+
+def run_dg_perforant_plasticity_hook(hook, dg_module, ec_module,
+                                     t_swr_start, t_swr_end, epoch,
+                                     A_assoc=0.01, A_hetero=0.002,
+                                     w_max=1.5, w_min=0.05):
+    """Hebbian EC LII -> GC learning, per cohort. Call twice per epoch
+    (forward + reverse SWR window), same as run_stc_hook/run_mpfc_assoc_hook.
+    """
+    import nest
+
+    def fired(spk_rec, pop):
+        ev = nest.GetStatus(spk_rec, "events")[0]
+        t = np.asarray(ev["times"]); s = np.asarray(ev["senders"])
+        act = np.unique(s[(t >= t_swr_start) & (t <= t_swr_end)])
+        idx = {g: i for i, g in enumerate(pop.tolist())}
+        m = np.zeros(len(pop), dtype=bool)
+        for g in act:
+            i = idx.get(int(g))
+            if i is not None:
+                m[i] = True
+        return m
+
+    pre_fired = fired(ec_module.spike_rec, ec_module.population)
+
+    for coh in hook.cohorts:
+        age = epoch - coh.birth_epoch
+        frac = _dg_cohort_age_frac(hook, age)
+        a_eff = A_assoc * (hook.young_pp_scale + frac * (1.0 - hook.young_pp_scale))
+
+        post_fired = fired(dg_module.spk_gc, coh.gc)
+        pre_a  = np.zeros(len(coh.base_weights), dtype=bool)
+        pre_a[coh.pp_mask] = pre_fired[coh.pre_idx[coh.pp_mask]]
+        post_a = post_fired[coh.post_idx]
+
+        both   = coh.pp_mask & pre_a & post_a     # Hebbian: co-activation -> potentiate
+        hetero = coh.pp_mask & post_a & ~pre_a    # post without pre -> weak depression
+        coh.base_weights[both]   = np.minimum(coh.base_weights[both]   + a_eff,   w_max)
+        coh.base_weights[hetero] = np.maximum(coh.base_weights[hetero] - A_hetero, w_min)
+        # SetStatus on the full collection -- non-pp entries (inhibition,
+        # Poisson residual, MC associational input) write back their own
+        # unchanged value as a no-op, same as run_homeostasis_hook.
+        nest.SetStatus(coh.in_conns, "weight", coh.base_weights.tolist())
 
 
 # ============================================================================
@@ -4447,9 +4578,39 @@ Dentate gyrus (Phase 6.2):
              "to 1.0 over the maturation window.")
     parser.add_argument(
         "--neurogenesis-young-pp-scale", type=float, default=2.0, metavar="F",
-        help="Multiplier on the perforant-path (EC LII->GC) weight a cohort "
-             "receives at birth (enhanced afferent gain/plasticity). Decays "
-             "to 1.0 over the maturation window.")
+        help="Phase 10: multiplier on the perforant-path (EC LII->GC) LEARNING "
+             "RATE (--dg-assoc-a) a cohort has at birth -- enhanced LTP during "
+             "the critical period, not a static weight boost. Decays to 1.0 "
+             "(mature baseline rate) over the maturation window. Only has an "
+             "effect together with --dg-perforant-stdp.")
+    parser.add_argument(
+        "--dg-perforant-stdp", action="store_true",
+        help="Phase 10: Hebbian EC LII->GC learning (co-activation potentiates, "
+             "post-without-pre weakly depresses -- same rule as the EC LV->mPFC "
+             "association hook). Works standalone with just --dg (every "
+             "granule cell learns at the mature baseline rate); combine with "
+             "--dg-neurogenesis so young cohorts learn faster "
+             "(--neurogenesis-young-pp-scale) while they are still young. "
+             "Without this, young vs mature cells cannot differ in a way that "
+             "depends on WHICH pattern they were exposed to -- only in "
+             "age-indexed intrinsic properties. Requires --dg --ec-lii.")
+    parser.add_argument(
+        "--dg-assoc-a", type=float, default=0.01, metavar="A",
+        help="Phase 10. Mature-baseline Hebbian potentiation per co-activation "
+             "event (mpfc_assoc_hook's analogous default is 0.02). Needs "
+             "empirical bracketing.")
+    parser.add_argument(
+        "--dg-assoc-a-hetero", type=float, default=0.002, metavar="A",
+        help="Phase 10. Heterosynaptic depression per event when GC fires "
+             "without its EC LII partner (mpfc_assoc_hook's analogous default "
+             "is 0.004). NOT scaled by cohort age -- enhanced LTP in young "
+             "cells is the specific literature claim, not enhanced LTD.")
+    parser.add_argument(
+        "--dg-assoc-w-max", type=float, default=1.5, metavar="W",
+        help="Phase 10. Perforant-path weight ceiling from learning.")
+    parser.add_argument(
+        "--dg-assoc-w-min", type=float, default=0.05, metavar="W",
+        help="Phase 10. Perforant-path weight floor from learning/depression.")
     parser.add_argument(
         "--w-cv", type=float, default=None, metavar="CV",
         help="Coefficient of variation for DG synaptic weights. Unset inherits "
@@ -4544,6 +4705,16 @@ Dentate gyrus (Phase 6.2):
              "plateaued (13-14%% active regardless of a 4x rate increase), "
              "so this needs to go well above 0.30 for the pattern signal to "
              "out-compete CA1's 50-fold convergence. Needs bracketing.")
+    parser.add_argument(
+        "--novel-pattern-onset", type=int, default=None, metavar="EPOCH",
+        help="Phase 9 novelty-detection design. Only with --pattern-source "
+             "ec-lii and --n-patterns >= 2. Holds back the LAST pattern "
+             "index (n_patterns-1) -- it is never shown before this epoch, "
+             "so its first-ever presentation can be compared against the "
+             "already-familiar earlier patterns AT THE SAME EPOCH (an "
+             "oddball/novelty-among-familiar design). After its debut it "
+             "resumes cycling normally through all patterns. Unset (default) "
+             "= no change, all patterns cycle evenly from epoch 0.")
     parser.add_argument(
         "--no-ec-dg-loop", action="store_true",
         help="Keep the EC LII->DG perforant path as a Poisson stand-in even when "
@@ -4673,6 +4844,16 @@ Dentate gyrus (Phase 6.2):
     if args.dg_neurogenesis and not args.ec_lii:
         parser.error("--dg-neurogenesis requires --ec-lii (perforant-path source "
                       "for new cohorts)")
+    if args.novel_pattern_onset is not None:
+        if args.pattern_source != "ec-lii":
+            parser.error("--novel-pattern-onset requires --pattern-source ec-lii")
+        if args.n_patterns < 2:
+            parser.error("--novel-pattern-onset requires --n-patterns >= 2 "
+                          "(the last pattern index is the one held back)")
+    if args.dg_perforant_stdp and not args.dg:
+        parser.error("--dg-perforant-stdp requires --dg")
+    if args.dg_perforant_stdp and not args.ec_lii:
+        parser.error("--dg-perforant-stdp requires --ec-lii (perforant-path source)")
 
     cfg = build_scale_config(args.scale)
 
@@ -4797,6 +4978,30 @@ Dentate gyrus (Phase 6.2):
            dict(master_seed=args.seed, seed_connect=args.seed)),
     )
 
+    # ---- Phase 9: novel-pattern-held-back schedule (--novel-pattern-onset) --
+    # Overwrites net["epoch_pattern"] (NOT build_replay_network's internal
+    # copy) so pattern_discrimination() -- which reads net["epoch_pattern"]
+    # at call time, after the loop finishes -- groups epochs the same way
+    # the actual drive was scheduled. Only touches --pattern-source ec-lii:
+    # the last pattern index (n_patterns-1) is held back and never shown
+    # before epoch args.novel_pattern_onset, so its first-ever presentation
+    # can be compared against the already-familiar earlier patterns at that
+    # SAME epoch (an oddball/novelty design, not a temporal-tagging one).
+    if args.novel_pattern_onset is not None:
+        onset  = args.novel_pattern_onset
+        n_pat  = args.n_patterns
+        novel_schedule = []
+        for ep in range(max(1, n_epochs)):
+            if ep < onset:
+                novel_schedule.append(ep % (n_pat - 1))       # familiar only
+            elif ep == onset:
+                novel_schedule.append(n_pat - 1)               # novel pattern's debut
+            else:
+                novel_schedule.append((ep - onset - 1) % n_pat)  # resume full cycle
+        net["epoch_pattern"] = novel_schedule
+        print(f">>> Novel-pattern schedule: pattern {n_pat-1} held back until "
+              f"epoch {onset}, then cycling normally: {novel_schedule}")
+
     # ---- Optional Phase 1: EC LII/III ----------------------------------------
     # Built BEFORE the DG so its population can supply the perforant path and
     # close the EC->DG->CA3->CA1->EC loop. EC LII itself only needs CA1, which
@@ -4876,8 +5081,9 @@ Dentate gyrus (Phase 6.2):
 
     # ---- Optional Phase 8: DG neurogenesis -----------------------------------
     neurogenesis_hook = None
-    if args.dg_neurogenesis:
-        print(">>> Initialising DG neurogenesis hook (Phase 8)...")
+    if args.dg_neurogenesis or args.dg_perforant_stdp:
+        print(">>> Initialising DG neurogenesis hook (Phase 8) / "
+              "perforant-path plasticity (Phase 10)...")
         neurogenesis_hook = build_dg_neurogenesis_hook(
             dg_module, ec_module.population, net["CA3_SUP"], net["CA3_DEEP"],
             maturation_epochs = args.neurogenesis_maturation_epochs,
@@ -4942,10 +5148,26 @@ Dentate gyrus (Phase 6.2):
 
     for epoch in range(n_epochs):
         epoch_t0 = epoch * SIM_MS
-        if neurogenesis_hook is not None:
+        if neurogenesis_hook is not None and args.dg_neurogenesis:
             run_dg_neurogenesis_hook(neurogenesis_hook, dg_module, epoch,
                                      args.neurogenesis_rate)
         nest.Simulate(SIM_MS)
+
+        # Phase 10: DG perforant-path Hebbian learning, same two SWR windows
+        # as every other plasticity hook. Runs whenever the hook exists (i.e.
+        # --dg-perforant-stdp was given) regardless of --dg-neurogenesis --
+        # the original population (cohort -1) always learns at the mature
+        # baseline rate; neurogenesis cohorts additionally get the young-
+        # cell learning-rate boost while still inside their maturation window.
+        if neurogenesis_hook is not None and args.dg_perforant_stdp:
+            for _ws, _we in ((swr_fwd[0], swr_fwd[1]), (swr_rev[0], swr_rev[1])):
+                run_dg_perforant_plasticity_hook(
+                    neurogenesis_hook, dg_module, ec_module,
+                    t_swr_start=epoch_t0 + _ws, t_swr_end=epoch_t0 + _we,
+                    epoch=epoch,
+                    A_assoc=args.dg_assoc_a, A_hetero=args.dg_assoc_a_hetero,
+                    w_max=args.dg_assoc_w_max, w_min=args.dg_assoc_w_min,
+                )
 
         if stc_hook is not None:
             current_t = epoch_t0 + SIM_MS

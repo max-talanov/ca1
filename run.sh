@@ -197,6 +197,42 @@
 #PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
 #EC_PATTERN_WEIGHT=1.5,DG_NEUROGENESIS=1,NEUROGENESIS_RATE=0.01,\
 #NEUROGENESIS_MATURATION_EPOCHS=4,SEED=202 run.sh
+#
+# JOB H7 — Phase 10: DG perforant-path Hebbian plasticity (EC LII->GC),
+#   testing whether a REAL experience-dependent learning rule (not just
+#   age-indexed intrinsic properties, see JOB H6 above) lets young
+#   neurogenesis cohorts respond differently to a held-back novel pattern
+#   ("oddball" design, --novel-pattern-onset). ALL GCs get this plasticity
+#   (--dg-perforant-stdp), so the no-neurogenesis arm is not a "no learning"
+#   control -- it isolates whether the young-cohort learning-rate boost adds
+#   anything beyond baseline mature plasticity.
+#
+#   Attempted locally first at 1% (matched pair, same seed/schedule as
+#   below) and it thrashed: two parallel runs pushed a 16GB laptop's swap to
+#   11.6/12GB used, ~17% CPU duty cycle, 15h41m wall time with zero forward
+#   progress past NEST kernel init. Killed both -- moving straight to MN5
+#   12% instead of fighting local memory contention. Wanted to pad the
+#   budget beyond the usual 20h given the one-time cohort -1 perforant-path
+#   cache is a new, untested cost at this scale (the analogous
+#   `mpfc_assoc_hook` cache, a much smaller target population, already took
+#   3.7-4.1h at 12% in past runs, and cache cost did not scale cleanly with
+#   target in-degree there) -- but this account's QOS hard-caps wall time at
+#   20h (QOSMaxWallDurationPerJobLimit rejected 36h outright), so that is
+#   the ceiling regardless. If the STDP cache pushes a run past 20h, it
+#   will be killed mid-flight same as the first neurogenesis attempt was --
+#   watch the first run of this pair closely as a timing probe, and if it's
+#   still building the network past ~4-6h in, consider canceling before it
+#   burns the full allocation on a doomed run.
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=3,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
+#EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,DG_PERFORANT_STDP=1,SEED=202 run.sh
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=3,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
+#EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,DG_PERFORANT_STDP=1,\
+#DG_NEUROGENESIS=1,NEUROGENESIS_RATE=0.01,NEUROGENESIS_MATURATION_EPOCHS=4,\
+#SEED=202 run.sh
 
 SCALE=${SCALE:-25}
 EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)
@@ -234,6 +270,12 @@ NEUROGENESIS_MATURATION_EPOCHS=${NEUROGENESIS_MATURATION_EPOCHS:-}
 NEUROGENESIS_YOUNG_IE=${NEUROGENESIS_YOUNG_IE:-}
 NEUROGENESIS_YOUNG_INHIB_SCALE=${NEUROGENESIS_YOUNG_INHIB_SCALE:-}
 NEUROGENESIS_YOUNG_PP_SCALE=${NEUROGENESIS_YOUNG_PP_SCALE:-}
+# ---- Phase 10: DG perforant-path plasticity --------------------------------
+DG_PERFORANT_STDP=${DG_PERFORANT_STDP:-0}   # 1=Hebbian EC LII->GC learning
+DG_ASSOC_A=${DG_ASSOC_A:-}           # mature-baseline potentiation per event
+DG_ASSOC_A_HETERO=${DG_ASSOC_A_HETERO:-}    # heterosynaptic depression per event
+DG_ASSOC_W_MAX=${DG_ASSOC_W_MAX:-}
+DG_ASSOC_W_MIN=${DG_ASSOC_W_MIN:-}
 DG_SCALE=${DG_SCALE:-$SCALE}   # DG scale %; defaults to SCALE
 PATTERN_COMPLETION=${PATTERN_COMPLETION:-0}  # 1=run the CA3 completion probe INSTEAD
 PC_CUE_FRACS=${PC_CUE_FRACS:-0.1,0.2,0.3,0.5,0.7,1.0}
@@ -241,6 +283,7 @@ PC_CUE_WEIGHT=${PC_CUE_WEIGHT:-2.5}
 # ---- multi-pattern / temporal-code / Test-3 knobs -------------------------
 N_PATTERNS=${N_PATTERNS:-1}        # >1 splits CA3 groups into interleaved assemblies
 TRAIN_PATTERN=${TRAIN_PATTERN:-}   # replay ONLY this pattern index (A-only vs B-only)
+NOVEL_PATTERN_ONSET=${NOVEL_PATTERN_ONSET:-}   # Phase 9 oddball: epoch index where a held-back pattern first appears
 SEED=${SEED:-}                     # sets BOTH the NEST kernel and numpy seeds
 SCHAFFER_K=${SCHAFFER_K:-}         # CA3->CA1 in-degree override (weights auto-scaled)
 SCHAFFER_STDP=${SCHAFFER_STDP:-0}  # 1 = delay-aware STDP on CA3->CA1
@@ -270,6 +313,8 @@ echo "[Slurm] dg=${DG}  dg_scale=${DG_SCALE}  pattern_completion=${PATTERN_COMPL
 echo "[Slurm] het=${HET}  het_wcomp=${HET_WCOMP}  w_ec_dg=${W_EC_DG:-<default>}  pp_residual=${PP_RESIDUAL:-<default>}  dg_delay_jitter=${DG_DELAY_JITTER:-<default>}"
 echo "[Slurm] pattern_source=${PATTERN_SOURCE:-ca3}  place_field_sigma=${PLACE_FIELD_SIGMA:-<default>}  ec_pattern_base_rate=${EC_PATTERN_BASE_RATE:-<default>}  ec_pattern_peak_rate=${EC_PATTERN_PEAK_RATE:-<default>}"
 echo "[Slurm] dg_neurogenesis=${DG_NEUROGENESIS}  neurogenesis_rate=${NEUROGENESIS_RATE:-<default>}  maturation_epochs=${NEUROGENESIS_MATURATION_EPOCHS:-<default>}  young_ie=${NEUROGENESIS_YOUNG_IE:-<default>}  young_inhib_scale=${NEUROGENESIS_YOUNG_INHIB_SCALE:-<default>}  young_pp_scale=${NEUROGENESIS_YOUNG_PP_SCALE:-<default>}"
+echo "[Slurm] dg_perforant_stdp=${DG_PERFORANT_STDP}  dg_assoc_a=${DG_ASSOC_A:-<default>}  dg_assoc_a_hetero=${DG_ASSOC_A_HETERO:-<default>}  dg_assoc_w_max=${DG_ASSOC_W_MAX:-<default>}  dg_assoc_w_min=${DG_ASSOC_W_MIN:-<default>}"
+echo "[Slurm] novel_pattern_onset=${NOVEL_PATTERN_ONSET:-<none>}"
 
 python3 - <<'PY'
 import nest
@@ -330,6 +375,8 @@ fi
 # same output file when run in parallel.
 [ "$PATTERN_SOURCE" = "ec-lii" ] && PHASE_TAG="${PHASE_TAG}_eclii"
 [ "$DG_NEUROGENESIS" = "1" ]     && PHASE_TAG="${PHASE_TAG}_neurogen"
+[ "$DG_PERFORANT_STDP" = "1" ]   && PHASE_TAG="${PHASE_TAG}_pstdp"
+[ -n "$NOVEL_PATTERN_ONSET" ]    && PHASE_TAG="${PHASE_TAG}_novel${NOVEL_PATTERN_ONSET}"
 [ -n "$SEED" ]               && PHASE_TAG="${PHASE_TAG}_s${SEED}"
 OUTFILE="${OUTDIR}/replay_${SCALE}pct_stc${PHASE_TAG}.h5"
 echo "[Slurm] output → $OUTFILE"
@@ -342,6 +389,7 @@ OPTIONAL_FLAGS=""
 [ "$EC_LII" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lii --ec-lii-k $EC_LII_K"
 [ "$N_PATTERNS" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --n-patterns $N_PATTERNS"
 [ -n "$TRAIN_PATTERN" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --train-pattern $TRAIN_PATTERN"
+[ -n "$NOVEL_PATTERN_ONSET" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --novel-pattern-onset $NOVEL_PATTERN_ONSET"
 [ -n "$SEED" ]          && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --seed $SEED"
 [ -n "$SCHAFFER_K" ]    && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --schaffer-k $SCHAFFER_K"
 [ "$SCHAFFER_STDP" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --schaffer-stdp"
@@ -367,6 +415,11 @@ fi
 [ -n "$NEUROGENESIS_YOUNG_IE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-young-ie $NEUROGENESIS_YOUNG_IE"
 [ -n "$NEUROGENESIS_YOUNG_INHIB_SCALE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-young-inhib-scale $NEUROGENESIS_YOUNG_INHIB_SCALE"
 [ -n "$NEUROGENESIS_YOUNG_PP_SCALE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-young-pp-scale $NEUROGENESIS_YOUNG_PP_SCALE"
+[ "$DG_PERFORANT_STDP" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-perforant-stdp"
+[ -n "$DG_ASSOC_A" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-assoc-a $DG_ASSOC_A"
+[ -n "$DG_ASSOC_A_HETERO" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-assoc-a-hetero $DG_ASSOC_A_HETERO"
+[ -n "$DG_ASSOC_W_MAX" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-assoc-w-max $DG_ASSOC_W_MAX"
+[ -n "$DG_ASSOC_W_MIN" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-assoc-w-min $DG_ASSOC_W_MIN"
 [ "$NO_STC" != "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --stc --n-swr $N_SWR --epoch-ms $EPOCH_MS --prp-threshold $PRP_THRESHOLD"
 [ "$EC_LV"  = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-lv"
 [ "$MPFC"   = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --mpfc"
