@@ -202,31 +202,42 @@
 #   testing whether a REAL experience-dependent learning rule (not just
 #   age-indexed intrinsic properties, see JOB H6 above) lets young
 #   neurogenesis cohorts respond differently to a held-back novel pattern
-#   ("oddball" design, --novel-pattern-onset). ALL GCs get this plasticity
-#   (--dg-perforant-stdp), so the no-neurogenesis arm is not a "no learning"
-#   control -- it isolates whether the young-cohort learning-rate boost adds
-#   anything beyond baseline mature plasticity.
+#   ("oddball" design, --novel-pattern-onset).
 #
-#   Attempted locally first at 1% (matched pair, same seed/schedule as
-#   below) and it thrashed: two parallel runs pushed a 16GB laptop's swap to
-#   11.6/12GB used, ~17% CPU duty cycle, 15h41m wall time with zero forward
-#   progress past NEST kernel init. Killed both -- moving straight to MN5
-#   12% instead of fighting local memory contention. Wanted to pad the
-#   budget beyond the usual 20h given the one-time cohort -1 perforant-path
-#   cache is a new, untested cost at this scale (the analogous
-#   `mpfc_assoc_hook` cache, a much smaller target population, already took
-#   3.7-4.1h at 12% in past runs, and cache cost did not scale cleanly with
-#   target in-degree there) -- but this account's QOS hard-caps wall time at
-#   20h (QOSMaxWallDurationPerJobLimit rejected 36h outright), so that is
-#   the ceiling regardless. If the STDP cache pushes a run past 20h, it
-#   will be killed mid-flight same as the first neurogenesis attempt was --
-#   watch the first run of this pair closely as a timing probe, and if it's
-#   still building the network past ~4-6h in, consider canceling before it
-#   burns the full allocation on a doomed run.
+#   FIRST ATTEMPT (2026-09-02, jobs 45305940/45305945) gave ALL GCs this
+#   plasticity, including a synthetic "cohort -1" for the entire original
+#   population -- BOTH runs were killed at the 20h wall-time limit without
+#   completing a single epoch of simulation. Root cause: cohort -1's
+#   one-time GetConnections(target=GC) cache over 143,990 cells / ~28.65M
+#   synapses cost 50,130-56,536s (14-16h) BY ITSELF -- confirmed NOT a
+#   function of total kernel size (mpfc_assoc_hook's much cheaper cache,
+#   ~28,800 synapses / 3.5-4h, runs at essentially the same cumulative
+#   kernel size, ~5.2M conns/VP, per the slurmout conn-check log) but of
+#   the target population's own size. Re-touching 28.65M synapses via
+#   SetStatus every epoch would not have scaled either.
+#
+#   FIX: cohort -1 removed entirely (see build_dg_neurogenesis_hook /
+#   run_dg_perforant_plasticity_hook docstrings). Plasticity now applies
+#   ONLY to neurogenesis cohorts (hundreds of cells/epoch, cheap to cache
+#   and update) -- the original mature GC population keeps fixed baseline
+#   perforant-path weights, no learning. --dg-perforant-stdp now REQUIRES
+#   --dg-neurogenesis (validated in argument parsing). The A/B is
+#   therefore: no mechanism at all (control) vs. neurogenesis + Hebbian
+#   cohort plasticity (test) -- both with the same oddball schedule.
+#
+#   Attempted locally first at 1% before the first MN5 attempt (matched
+#   pair, same seed/schedule as below) and it thrashed: two parallel runs
+#   pushed a 16GB laptop's swap to 11.6/12GB used, ~17% CPU duty cycle,
+#   15h41m wall time with zero forward progress past NEST kernel init.
+#   Killed both -- moved straight to MN5 12% instead of fighting local
+#   memory contention, which is how the cohort -1 cost above went
+#   undetected until it hit MN5. This account's QOS hard-caps wall time at
+#   20h regardless (QOSMaxWallDurationPerJobLimit rejected a 36h request
+#   outright) -- with cohort -1 gone, both arms below should easily fit.
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=3,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
 #W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
 #PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
-#EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,DG_PERFORANT_STDP=1,SEED=202 run.sh
+#EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,SEED=202 run.sh
 #  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=3,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
 #W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
 #PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\

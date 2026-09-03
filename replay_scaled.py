@@ -1833,22 +1833,26 @@ def build_dg_neurogenesis_hook(
     pp_rate_mean=130.0, pp_rate_sigma=70.0, pp_weight=4.0,
     seed=42,
 ) -> DGNeurogenesisHook:
-    """Builds the hook AND, unconditionally, seeds "cohort -1": the
-    original (pre-neurogenesis) granule population, cached the same way
-    every later cohort will be, with birth_epoch set far enough in the past
-    that it is always at the mature baseline learning rate (Phase 10). This
-    means run_dg_perforant_plasticity_hook works identically for the
-    original population and for neurogenesis cohorts, and it means calling
-    this builder is enough to get DG perforant-path plasticity even when
-    --dg-neurogenesis itself is off (run_dg_neurogenesis_hook, which BIRTHS
-    new cohorts, is a separate, optional call).
+    """Builds the hook with an empty cohort list -- the original
+    (pre-neurogenesis) granule population is NOT tracked here and gets NO
+    plasticity; only cohorts born by run_dg_neurogenesis_hook are ever
+    added to hook.cohorts, so run_dg_perforant_plasticity_hook has nothing
+    to do until neurogenesis actually births a cohort.
 
-    WARNING -- this pays a real, one-time GetConnections(target=...) cost
-    over dg_module.GC's ENTIRE incoming connectivity. build_mpfc_assoc_hook's
-    comparable one-time cache (a MUCH smaller target, ~28,800 synapses at
-    12% scale) took 3.7-4.1 hours on MN5 in this session's own runs, so
-    target-only GetConnections cost evidently does not scale purely with
-    the target's own in-degree. Budget MN5 wall-time accordingly.
+    An earlier version of this also seeded a synthetic "cohort -1" for the
+    original population, giving it the same mature-baseline plasticity as
+    aged neurogenesis cohorts. Reverted: on MN5 at 12% scale, dg_module.GC
+    is 143,990 cells / ~28.65M incoming synapses, and the one-time
+    GetConnections(target=...) cache alone cost 50,130-56,536s (14-16
+    hours) -- confirmed by two killed MN5 runs (job 45305940, 45305945),
+    versus build_mpfc_assoc_hook's comparable cache (~28,800 synapses,
+    3.5-4h) at essentially the SAME total kernel size at call time (~5.2M
+    conns/VP both cases) -- so the cost tracks the target population's own
+    size, not overall kernel size, and does not scale down by reordering.
+    Re-touching that many synapses via SetStatus every epoch would not
+    scale either. --dg-perforant-stdp therefore now REQUIRES
+    --dg-neurogenesis (enforced in argument validation) since without any
+    cohorts it would be a silent no-op.
     """
     hook = DGNeurogenesisHook(
         ec_lii=ec_lii, ca3_sup=ca3_sup, ca3_deep=ca3_deep,
@@ -1860,18 +1864,6 @@ def build_dg_neurogenesis_hook(
         pp_rate_mean=pp_rate_mean, pp_rate_sigma=pp_rate_sigma, pp_weight=pp_weight,
         rng=np.random.default_rng(seed + 31), cohorts=[],
     )
-    print(f"  [DGNeurogenesis] caching original population's incoming "
-          f"synapses ({dg_module.N_gc:,} cells) as cohort -1 (mature "
-          f"baseline plasticity)...")
-    t0 = time.perf_counter()
-    in_conns, pp_mask, inhib_mask, base_weights, pre_idx, post_idx = \
-        _dg_cache_cohort_incoming(dg_module.GC, ec_lii, dg_module.BASKET)
-    print(f"  [DGNeurogenesis] cohort -1 cached in {time.perf_counter()-t0:.1f}s "
-          f"({len(in_conns):,} synapses)")
-    hook.cohorts.append(DGNeurogenesisCohort(
-        gc=dg_module.GC, birth_epoch=-10**9, in_conns=in_conns,
-        pp_mask=pp_mask, inhib_mask=inhib_mask, base_weights=base_weights,
-        pre_idx=pre_idx, post_idx=post_idx))
     return hook
 
 
@@ -2020,12 +2012,20 @@ def run_dg_neurogenesis_hook(hook, dg_module, epoch, rate):
 # cells are thought to use (enhanced LTP during a critical period), not an
 # arbitrary age-indexed scalar.
 #
-# Every tracked cohort -- INCLUDING cohort -1, the original population,
-# seeded in build_dg_neurogenesis_hook -- goes through the same update, at
-# the mature (age >= maturation_epochs) baseline rate. This means DG has
-# some plasticity even with --dg-neurogenesis off, so an observed
-# neurogenesis effect can be attributed to the young-cohort ENHANCEMENT
-# specifically, not to "DG has learning at all now".
+# Applies ONLY to neurogenesis cohorts (hook.cohorts, birthed by
+# run_dg_neurogenesis_hook) -- the original mature GC population is NOT
+# tracked and keeps fixed baseline perforant-path weights. An earlier
+# version also tracked a synthetic "cohort -1" for the original
+# population so every GC had some baseline plasticity; reverted after two
+# MN5 runs (12% scale) showed its one-time GetConnections cache alone
+# (143,990 cells / ~28.65M synapses) cost 14-16 hours -- most of the 20h
+# wall-time budget -- with no epoch of simulation completed either time.
+# See build_dg_neurogenesis_hook's docstring for the measurements. This
+# means --dg-perforant-stdp is a no-op without --dg-neurogenesis (enforced
+# in argument validation), and the effect under test is now simply
+# "do young, plastic cohorts show a different response to a novel pattern
+# than the static mature population does", not a within-population
+# young-vs-baseline comparison.
 
 def run_dg_perforant_plasticity_hook(hook, dg_module, ec_module,
                                      t_swr_start, t_swr_end, epoch,
@@ -4854,6 +4854,12 @@ Dentate gyrus (Phase 6.2):
         parser.error("--dg-perforant-stdp requires --dg")
     if args.dg_perforant_stdp and not args.ec_lii:
         parser.error("--dg-perforant-stdp requires --ec-lii (perforant-path source)")
+    if args.dg_perforant_stdp and not args.dg_neurogenesis:
+        parser.error("--dg-perforant-stdp requires --dg-neurogenesis: plasticity "
+                      "only applies to neurogenesis cohorts (the original GC "
+                      "population's cache is computationally infeasible at MN5 "
+                      "scale, see build_dg_neurogenesis_hook), so without "
+                      "--dg-neurogenesis there is nothing for it to update")
 
     cfg = build_scale_config(args.scale)
 
@@ -5080,8 +5086,11 @@ Dentate gyrus (Phase 6.2):
         )
 
     # ---- Optional Phase 8: DG neurogenesis -----------------------------------
+    # --dg-perforant-stdp requires --dg-neurogenesis (validated above): Phase
+    # 10 plasticity only ever applies to neurogenesis cohorts, so the hook is
+    # only needed when neurogenesis itself is on.
     neurogenesis_hook = None
-    if args.dg_neurogenesis or args.dg_perforant_stdp:
+    if args.dg_neurogenesis:
         print(">>> Initialising DG neurogenesis hook (Phase 8) / "
               "perforant-path plasticity (Phase 10)...")
         neurogenesis_hook = build_dg_neurogenesis_hook(
