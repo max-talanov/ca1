@@ -41,6 +41,17 @@ OR-gated refractory junctions (each level with
 its own 5–10 ms τ_rf), converging on a soma 
 that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](dendritic_convolution.png)
 
+Fig. 3 - The high-level architecture of the 
+neuron implementation taking into account: 
+synapses and dendritic spikes generation in 
+synaptic area, dendritic spikes propagation 
+along dendritic tree with timescales of 
+dendritic spikes processing.
+As well as the synaptic 
+weights increase/decrease mechanisms and their 
+identification linked to their position in the 
+tree.
+
 The companion hardware document frames dendritic processing as a three-stage information-reduction pipeline — a postsynaptic threshold, an OR-gated refractory junction, and a somatic summation — each stage a candidate site for replacing an expensive analog circuit with a cheap thresholding one.
 
 ### 3.1 Stage-by-stage feasibility table
