@@ -42,12 +42,12 @@ its own 5–10 ms τ_rf), converging on a soma
 that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](dendritic_convolution.png)
 
 Fig. 3 - **The high-level architecture** of the 
-neuron implementation taking into account: 
+neuron implementation taking into account: (**A**)
 synapses and dendritic spikes generation in 
 synaptic area, dendritic spikes propagation 
 along dendritic tree with timescales of 
 dendritic spikes processing.
-As well as the synaptic 
+(**B**) As well as the synaptic homeostasis  
 weights increase/decrease mechanisms and their 
 identification linked to their position in the 
 tree.
