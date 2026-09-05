@@ -1484,6 +1484,13 @@ class DGModule:
     K_mf_deep   : int      # mossy-fibre in-degree onto CA3 DEEP
     ec_driven   : bool = False   # True when the real EC LII perforant path is wired
                                  # (i.e. the EC->DG->CA3->CA1->EC loop is closed)
+    pp_gen       : object = None   # nest.NodeCollection -- original population's
+                                    # Poisson-residual generators (one per GC),
+                                    # re-randomized every epoch by
+                                    # run_dg_residual_refresh_hook
+    pp_rate_mean : float  = 0.0
+    pp_rate_sigma: float  = 0.0
+    pp_scale     : float  = 1.0    # pp_residual if ec_driven else 1.0
 
 
 def build_dg_module(
@@ -1601,6 +1608,22 @@ def build_dg_module(
     #     running. Scaled by pp_residual when the real projection is present so
     #     total granule drive (and hence the tuned 2-4% sparse code) is roughly
     #     preserved.
+    #
+    # pp_rates is drawn ONCE here and was never touched again -- confirmed
+    # (2026-09-05, MN5 12% jobs 45358807/45358815) to bake in a persistent,
+    # EC-content-independent per-cell "loudness" bias that dominates DG's
+    # winner-take-all: ~1,000+ granule cells were active in >=8/14 epochs
+    # regardless of which pattern played (chance predicts ~0), and 66% of
+    # that "always-on" set was IDENTICAL between two runs with different
+    # --seed, because seed_connect (below, and at the build_dg_module call
+    # site) was never threaded from --seed either -- see main()'s dg_module
+    # construction. This is why EC LII's real, measured pattern-identity
+    # signal (sep +0.18) never reached DG (sep ~0.00) across every mechanism
+    # tried: the perforant path's per-epoch kick (K=50 * w_ec_dg) is small
+    # next to this fixed per-cell bias, so the same cells win regardless of
+    # input. run_dg_residual_refresh_hook (below) re-draws these rates every
+    # epoch to fix this -- pp_gen/pp_rate_mean/pp_rate_sigma/pp_scale are
+    # kept on DGModule so it can do that.
     ec_driven = ec_lii is not None
     pp_scale  = pp_residual if ec_driven else 1.0
     pp_rates = _rng.normal(pp_rate_mean * pp_scale, pp_rate_sigma * pp_scale,
@@ -1696,6 +1719,8 @@ def build_dg_module(
         spk_basket=spk_basket,
         N_gc=N_gc, N_mc_low=N_mc_low, N_mc_high=N_mc_high, N_basket=N_basket,
         K_mf_sup=K_mf_sup, K_mf_deep=K_mf_deep, ec_driven=ec_driven,
+        pp_gen=pp, pp_rate_mean=pp_rate_mean, pp_rate_sigma=pp_rate_sigma,
+        pp_scale=pp_scale,
     )
 
 
@@ -1724,6 +1749,32 @@ def dg_pattern_separation_stats(dg_module, sim_ms, window=None):
     verdict = "PASS" if 0.005 <= frac <= 0.06 else "FLAG"
     return dict(active_fraction=frac, n_active=n_active, n_gc=dg_module.N_gc,
                 mean_rate_hz=mean_hz, verdict=verdict)
+
+
+def run_dg_residual_refresh_hook(dg_module, rng):
+    """Re-draw the original GC population's Poisson-residual firing rates.
+
+    build_dg_module drew dg_module.pp_gen's per-cell rates ONCE and never
+    touched them again -- confirmed (2026-09-05) to bake in a persistent,
+    pattern-independent "loudness" bias strong enough to dominate DG's
+    winner-take-all over the real, measurably pattern-locked EC LII
+    perforant-path input (see the comment at pp_rates' first draw in
+    build_dg_module). Redrawing every epoch, between nest.Simulate() calls
+    (same interleaving as every other per-epoch hook here), turns this
+    input back into pure trial-to-trial noise instead of a fixed per-cell
+    identity, so it can no longer determine which cells win regardless of
+    which pattern is active.
+
+    Call once per epoch whenever --dg is on, independent of neurogenesis
+    (this refreshes the ORIGINAL population; neurogenesis cohorts' own
+    residual generators are refreshed inside run_dg_neurogenesis_hook).
+    """
+    import nest
+    n = len(dg_module.pp_gen)
+    rates = rng.normal(dg_module.pp_rate_mean * dg_module.pp_scale,
+                        dg_module.pp_rate_sigma * dg_module.pp_scale,
+                        n).clip(5.0, None)
+    nest.SetStatus(dg_module.pp_gen, "rate", rates.tolist())
 
 
 # ---- Phase 8: DG neurogenesis (adult-born granule cell turnover) ----------
@@ -1767,6 +1818,11 @@ class DGNeurogenesisCohort:
                                  # only meaningful where pp_mask is True, else -1)
     post_idx     : np.ndarray   # index into THIS cohort's own gc (every entry has
                                  # a valid target here, since in_conns is target=gc)
+    pp_gen       : object = None   # nest.NodeCollection -- this cohort's own
+                                    # Poisson-residual generators, re-randomized
+                                    # every epoch for the same reason
+                                    # run_dg_residual_refresh_hook does for the
+                                    # original population (see that docstring)
 
 
 @dataclass
@@ -1975,15 +2031,24 @@ def run_dg_neurogenesis_hook(hook, dg_module, epoch, rate):
     hook.cohorts.append(DGNeurogenesisCohort(
         gc=new_gc, birth_epoch=epoch, in_conns=in_conns,
         pp_mask=pp_mask, inhib_mask=inhib_mask, base_weights=base_weights,
-        pre_idx=pre_idx, post_idx=post_idx))
+        pre_idx=pre_idx, post_idx=post_idx, pp_gen=pp))
 
     # ---- age every tracked cohort's INTRINSIC properties, including the
     # one just born (age 0). Perforant-path weights are NOT touched here --
     # see run_dg_perforant_plasticity_hook.
     for coh in hook.cohorts:
         age = epoch - coh.birth_epoch
+        # Poisson-residual refresh runs for EVERY cohort EVERY epoch,
+        # regardless of age -- same reason run_dg_residual_refresh_hook
+        # refreshes the original population: a fixed per-cell rate becomes
+        # a persistent, pattern-independent bias (confirmed 2026-09-05) that
+        # would otherwise dominate this cohort's contribution to DG's
+        # winner-take-all just as it did for the original population.
+        pp_rates = hook.rng.normal(hook.pp_rate_mean, hook.pp_rate_sigma,
+                                   len(coh.pp_gen)).clip(5.0, None)
+        nest.SetStatus(coh.pp_gen, "rate", pp_rates.tolist())
         if age > hook.maturation_epochs:
-            continue  # already relaxed to baseline, nothing left to update
+            continue  # intrinsic properties already relaxed to baseline
         inhib_scale, ie_val = _intrinsic_state(age)
         coh.base_weights[coh.inhib_mask] = hook.w_basket_gc * inhib_scale
         # SetStatus on the full collection -- non-aged entries (perforant
@@ -5083,6 +5148,14 @@ Dentate gyrus (Phase 6.2):
             pp_residual  = args.pp_residual,
             delay_jitter = args.dg_delay_jitter,
             w_cv         = args.w_cv,
+            # Was hardcoded to the default (42) regardless of --seed, so
+            # every run drew the IDENTICAL granule-cell V_m/Poisson-residual
+            # heterogeneity -- confirmed 2026-09-05 (jobs 45358807/45358815,
+            # different --seed) via 66% overlap in DG's "always-on" cells
+            # between the two runs, versus ~8 expected by chance. Threaded
+            # through now so at least this bias varies by --seed; see
+            # run_dg_residual_refresh_hook for the deeper per-epoch fix.
+            seed_connect = (args.seed if args.seed is not None else 42),
         )
 
     # ---- Optional Phase 8: DG neurogenesis -----------------------------------
@@ -5155,8 +5228,16 @@ Dentate gyrus (Phase 6.2):
           f"= {total_sim_ms:.0f} ms total...")
     t_sim = time.perf_counter()
 
+    dg_residual_rng = (np.random.default_rng((args.seed if args.seed is not None else 42) + 61)
+                        if dg_module is not None else None)
     for epoch in range(n_epochs):
         epoch_t0 = epoch * SIM_MS
+        if dg_module is not None:
+            # Re-randomize the original population's Poisson-residual rates
+            # every epoch -- see run_dg_residual_refresh_hook's docstring for
+            # why a fixed per-cell draw was silently defeating every DG
+            # pattern-separation mechanism tried so far.
+            run_dg_residual_refresh_hook(dg_module, dg_residual_rng)
         if neurogenesis_hook is not None and args.dg_neurogenesis:
             run_dg_neurogenesis_hook(neurogenesis_hook, dg_module, epoch,
                                      args.neurogenesis_rate)
@@ -5164,10 +5245,11 @@ Dentate gyrus (Phase 6.2):
 
         # Phase 10: DG perforant-path Hebbian learning, same two SWR windows
         # as every other plasticity hook. Runs whenever the hook exists (i.e.
-        # --dg-perforant-stdp was given) regardless of --dg-neurogenesis --
-        # the original population (cohort -1) always learns at the mature
-        # baseline rate; neurogenesis cohorts additionally get the young-
-        # cell learning-rate boost while still inside their maturation window.
+        # --dg-neurogenesis + --dg-perforant-stdp were given) -- plasticity
+        # applies only to neurogenesis cohorts, not the original population
+        # (see build_dg_neurogenesis_hook's docstring for why), with young
+        # cohorts getting a learning-rate boost while inside their
+        # maturation window.
         if neurogenesis_hook is not None and args.dg_perforant_stdp:
             for _ws, _we in ((swr_fwd[0], swr_fwd[1]), (swr_rev[0], swr_rev[1])):
                 run_dg_perforant_plasticity_hook(

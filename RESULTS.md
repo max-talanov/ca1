@@ -523,6 +523,140 @@ demonstrates that mPFC has recurrent dynamics, **not** that a specific memory
 became hippocampus-independent. Specificity has to be settled first; the
 `K_rec` work in §12 is downstream of it.
 
+## 14. Six more attempts at DG selectivity — all negative, one real bug found
+
+§13 named the residual Poisson drive as the reason DG cannot be pattern-specific
+and described it as "resampled independently every window." That is true of the
+generator's *spike output* — a Poisson process, of course, fires different
+timestamps each window — but not of its *rate parameter*: `build_dg_module`
+draws each granule cell's residual rate **once**, at build time, and never
+touches it again. A cell that happens to draw a high rate is the loudest cell
+in every window for the rest of the run, which looks like independent
+resampling in a raster plot but is not. This section documents finding and
+partially fixing that gap, and five follow-on interventions that did not
+restore selectivity.
+
+### Neurogenesis, twice, both negative
+
+Phase 8 (age-indexed intrinsic properties: young cells more excitable, less
+inhibited, no learning) and Phase 10 (real Hebbian EC LII→GC plasticity,
+restricted to neurogenesis cohorts after the full-population version proved
+computationally infeasible — its one-time synapse cache cost 14–16 h of a 20 h
+MN5 budget) were both tested as candidate DG selectivity mechanisms this
+session, on the theory that a cohort tuned by recent experience could respond
+differently to a held-back "oddball" pattern than to a familiar one. Neither
+moved DG off chance, at 12 % scale, MN5, matched seed:
+
+| condition | DG active | DG identity sep | DG timing sep |
+|---|---|---|---|
+| no neurogenesis (control) | 4.4 % | +0.001 | −0.002 |
+| age-indexed neurogenesis (Phase 8) | 4.4 % | −0.023 | +0.009 |
+| neurogenesis + cohort Hebbian learning (Phase 10) | 4.4 % | −0.023 | +0.003 |
+
+An epoch-resolved oddball comparison (novel pattern C's active set vs. every
+other pattern's, epoch by epoch) found no pattern-identity signature in either
+condition — only a same-cells-recur-nearby-in-time artifact under
+neurogenesis, consistent with §13's "no core assembly" finding, not with
+novelty detection.
+
+### The residual-rate bug, and what it actually costs
+
+Two MN5 runs with different `--seed` shared 66 % of DG's "always-on" cells
+(active in ≥8/14 epochs) — 632 cells in common against ~8 expected by chance.
+Two independent causes, both silent regardless of `--seed`:
+
+1. `build_dg_module`'s residual Poisson rate is drawn once, never refreshed
+   (this section's headline finding).
+2. `build_dg_module`'s own `seed_connect` defaulted to `42` unconditionally —
+   the call site never threaded `--seed` through, so every run drew the
+   *identical* granule V_m/rate heterogeneity regardless of seed.
+
+Fix: re-randomize the residual rate every epoch
+(`run_dg_residual_refresh_hook`, and the equivalent for each neurogenesis
+cohort's own residual generator), and thread `--seed` into `seed_connect`.
+Verified locally (1 % scale, matched seed, `--het 0.30`, 14 epochs):
+
+| | before fix | after fix |
+|---|---|---|
+| cells active ≥8/14 epochs | (not measured at 1 % pre-fix) | 565 (expected ~4 by chance) |
+| cells active in all 14 epochs | — | 10 (expected ~0) |
+
+565 vs. 4 says the fix did not fully work with heterogeneity on. Repeating
+with `--het 0` (no per-cell neuron-parameter draw) eliminated the excess
+completely — 0 cells at every threshold, exactly matching chance. So a
+**second**, independent source of persistent per-cell bias exists:
+`--het`'s one-time `a/b/c/d/I_e` draw (30 % CV) is itself enough to rank
+granule cells by fixed excitability for the whole run, and it was not touched
+by this fix. This is not a bug — the heterogeneity is deliberate, tuned
+elsewhere for realism and robustness (§8–9) — but it has the same practical
+effect on DG as the residual-rate bug did.
+
+Even with the stereotypy fully eliminated (`--het 0`), DG identity separation
+was **still 0.000**. Removing the bias was necessary but not sufficient: a
+fair, per-epoch-independent competition is still a competition decided by
+noise, not by which EC LII cells are currently active, unless the signal is
+actually strong enough to win it. That is the same 0.6 %-of-drive problem
+§13 already named — the residual-rate bug just added a second, deterministic
+distortion on top of it.
+
+### Two attempts to shift the SNR, both negative
+
+With the fix in place and `--het 0.30` restored (the tuned config, not
+touched), two follow-up interventions tried to give EC LII's signal more
+relative weight without disturbing §13's synchrony-ceiling constraint:
+
+| config | DG active | DG identity sep | EC LII discriminates? |
+|---|---|---|---|
+| baseline (`w_ec_dg=0.6`, `pp_residual=0.9`) | 15.1 %† | −0.009 | timing only |
+| `w_ec_dg=1.0` | **46.0 %** | −0.047 | none |
+| `pp_residual=0.5` | 16.1 % | −0.007 | none |
+
+† 1 % scale; not comparable to the 12 % 2–4 % target — see caveat below.
+
+`w_ec_dg=1.0` reproduces exactly the failure mode §13 predicted: `K x w` is
+close enough to the 20 mV granule gap that the closed EC→DG→CA3→CA1→EC loop
+detonates, active fraction runs to 46 %, and EC LII's own established timing
+signal is destroyed along with it — strengthening the signal broke the one
+thing that was working. Cutting `pp_residual` to shrink the noise floor
+instead left DG's active fraction essentially unchanged (15.1 % → 16.1 %),
+which suggests the basket-mediated feedback loop clamps the active fraction
+by *rate*, largely independent of the residual's amplitude — so shrinking the
+residual did not shift the competition toward EC LII the way a simple
+signal-vs-noise picture predicts, and it cost the one significant result
+(EC LII's timing separation dropped out of significance). Both directions
+tried; both failed; the second was actively regressive.
+
+### Analysis: why the system sits here
+
+- **The competition may not be input-selective at all.** Basket feedback
+  keeps the active *fraction* in a narrow band, but nothing in its design
+  targets which cells specifically fire — it looks like a rate clamp, not a
+  content-addressable winner-take-all. `pp_residual=0.5`'s null result (active
+  fraction barely moved) is consistent with this: the clamp defends a target
+  rate, not a target identity.
+- **Two competing, both-deliberate design goals are in tension.** `--het`
+  heterogeneity is tuned for realism and robustness elsewhere in the model;
+  DG pattern separation needs granule cells to be interchangeable enough that
+  input, not fixed identity, decides who wins. Nothing in this session
+  reconciles the two — they were tested as alternatives, not combined.
+  A DG-scoped heterogeneity toggle (leave CA3/CA1 untouched) is untried.
+- **The loop-gain ceiling caps how much signal-boosting is even safe to try.**
+  Because EC LII→DG→CA3→CA1→EC LII/EC LV is a closed loop, any static
+  increase to the DG-stage gain (`w_ec_dg`) risks amplifying around the whole
+  loop, not just at DG — as observed. Any future signal-boosting attempt
+  needs to raise EC LII's *effective* pattern-locked drive without raising
+  its *loop* gain, e.g. sharpening EC LII's own place-field tuning, or timing
+  the perforant-path kick more precisely into the SWR window, rather than
+  scaling `w_ec_dg` further.
+- **1 % scale is not a clean stand-in for 12 %.** `K_pp=50` is fixed
+  regardless of `--scale`, so a granule cell's 50 perforant-path samples cover
+  5 % of EC LII's pool at 1 % scale (1,000 cells) vs. 0.4 % at 12 % (12,005
+  cells) — a very different effective sampling regime. All four bracket runs
+  in this section ran at 1 % scale for turnaround speed; the residual-rate
+  fix itself is scale-independent (it is about *when* a rate is drawn, not
+  how many cells there are), but the two SNR-tuning results should be treated
+  as hypotheses to re-check at 12 %, not confirmed at the scale that matters.
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
@@ -540,7 +674,16 @@ became hippocampus-independent. Specificity has to be settled first; the
   `inhomogeneous_poisson_generator` (one node, scheduled rate profile).
 - **EC LII→DG loop gain** is set by synchrony, not mean rate: EC fires in
   SWR-locked bursts, so K·w must stay well under the 20 mV granule
-  rest→threshold gap or the loop saturates DG. Validated at 1 %; 12 % pending.
+  rest→threshold gap or the loop saturates DG. Confirmed again in §14
+  (`w_ec_dg=1.0` → 46 % active, detonation) — the ceiling is real at both
+  scales tried.
+- **DG selectivity remains unsolved after six independent attempts** (§13–14):
+  age-indexed neurogenesis, cohort Hebbian learning, the residual-rate fix,
+  heterogeneity off, and both SNR-tuning directions. Identity separation has
+  not moved off ~0.000 under any of them. Untried: a DG-scoped heterogeneity
+  toggle (leave CA3/CA1 untouched), sharpening EC LII's own pattern-locked
+  drive instead of scaling `w_ec_dg`, and re-running the two SNR brackets at
+  12 % rather than 1 % (see §14's scale caveat).
 
 ## Reproducing
 
