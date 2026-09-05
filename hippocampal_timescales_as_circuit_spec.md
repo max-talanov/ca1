@@ -41,7 +41,7 @@ OR-gated refractory junctions (each level with
 its own 5–10 ms τ_rf), converging on a soma 
 that also receives a direct, dendritic-bypass inhibitory input, followed by a fixed-delay axon stage.](dendritic_convolution.png)
 
-Fig. 3 - The high-level architecture of the 
+Fig. 3 - **The high-level architecture** of the 
 neuron implementation taking into account: 
 synapses and dendritic spikes generation in 
 synaptic area, dendritic spikes propagation 
@@ -51,6 +51,19 @@ As well as the synaptic
 weights increase/decrease mechanisms and their 
 identification linked to their position in the 
 tree.
+
+The diagram has two layers
+1) The temporal dynamics of the **dendritic 
+   spikes propagation** and through dendritic 
+   tree on the level of synaptic areas, 
+   dendroids junctions and soma and the 
+   timeframes of dendritic spikes processing: 
+   synaptic areas (1ms), junctions (5-10ms), 
+   generation of somatic spikes (5-10ms).
+2) The learning mechanisms described in 
+   sections: **Consolidation timescales** and 
+   **Synaptic tagging** mapped to the neuronal 
+   areas. 
 
 The companion hardware document frames dendritic 
 processing as a three-stage information-reduction 
