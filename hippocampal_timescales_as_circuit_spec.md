@@ -47,10 +47,11 @@ synapses and dendritic spikes generation in
 synaptic area, dendritic spikes propagation 
 along dendritic tree with timescales of 
 dendritic spikes processing.
-(**B**) As well as the synaptic homeostasis  
-weights increase/decrease mechanisms and their 
-identification linked to their position in the 
-tree.
+(**B**) As well as the synaptic homeostasis, 
+STP, neuromodulation → synaptic tagging; E-LTP,
+L-LTP, replay/repetitions as we ll as memory 
+consolidation and their  identification linked 
+to their position in the neuron architecture.
 
 The diagram has two layers
 1) The temporal dynamics of the **dendritic 
