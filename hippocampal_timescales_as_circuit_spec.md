@@ -52,7 +52,12 @@ weights increase/decrease mechanisms and their
 identification linked to their position in the 
 tree.
 
-The companion hardware document frames dendritic processing as a three-stage information-reduction pipeline — a postsynaptic threshold, an OR-gated refractory junction, and a somatic summation — each stage a candidate site for replacing an expensive analog circuit with a cheap thresholding one.
+The companion hardware document frames dendritic 
+processing as a three-stage information-reduction 
+pipeline — a postsynaptic threshold, an OR-gated 
+refractory junction, and a somatic summation each 
+stage a candidate site for replacing an expensive 
+analog circuit with a cheap thresholding one.
 
 ### 3.1 Stage-by-stage feasibility table
 
