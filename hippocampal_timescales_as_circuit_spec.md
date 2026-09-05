@@ -63,7 +63,11 @@ The diagram has two layers
 2) The learning mechanisms described in 
    sections: **Consolidation timescales** and 
    **Synaptic tagging** mapped to the neuronal 
-   areas. 
+   areas. **Synaptic areas**: synaptic homeostasis 
+   (weights decay due to time); neuromodulation 
+   → synaptic tagging; short term plasticity. 
+   **Soma**: E-LTP, L-LTP, replay and memory 
+   consolidation on the level of network.  
 
 The companion hardware document frames dendritic 
 processing as a three-stage information-reduction 
