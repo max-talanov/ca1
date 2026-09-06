@@ -657,6 +657,131 @@ tried; both failed; the second was actively regressive.
   how many cells there are), but the two SNR-tuning results should be treated
   as hypotheses to re-check at 12 %, not confirmed at the scale that matters.
 
+## 15. CA3's theta drive, DG's time-block instability, and a corrected EC LII → GC result
+
+§14 left DG's selectivity failure with an open, mostly-negative picture.
+Three more findings this session change that picture: one names a likely
+cause of the already-documented weak replay-sequence correlation, one is a
+new instability that neither §13 nor §14 accounted for, and the third
+*corrects* one of §14's own conclusions — the "no identity signal, even at
+the wiring level" reading of the granule-cell drive test does not survive
+a closer look.
+
+**Terminology note.** This codebase's "epoch" is not the ML sense (one pass
+over a training set). It is one fixed-duration (`--epoch-ms`, 1000 ms
+throughout this section) block of simulated time: a theta rhythm runs
+across the whole block, and it contains two SWR-like replay events (forward
+at +300–420 ms, reverse at +600–720 ms) plus one assigned pattern. This
+section identifies each block by its absolute simulation-time range
+(`t=9000–9999 ms`, ...) rather than a bare epoch index, to avoid trading on
+the overloaded term.
+
+### CA3 is not quiet between "replay events" — it never stops
+
+The model wires an explicit 8 Hz theta drive onto CA3 SUP/DEEP/INT_SUP/
+INT_DEEP and CA1 PYR/BASKET/OLM (`replay_scaled.py:1096–1106`,
+`theta_hz=8.0`), continuously, every block — not gated by the SWR windows.
+Single-block instantaneous rate (not the 14-block average, which smooths
+this out) confirms it: CA3 SUP and CA3 DEEP both show a regular ~9–10 Hz
+oscillation with peaks of 60–130+ Hz recurring roughly every 100 ms for the
+*entire* 1000 ms block — before, during, and after the two labeled SWR
+windows alike. This is a deliberate design feature (θ-rhythm modulation,
+biologically reasonable), not raw runaway. But the SWR windows are not
+distinguishable in amplitude from the surrounding background rhythm — a
+plausible, previously-unstated explanation for §7's already-weak,
+non-significant replay-sequence Spearman ρ: the sequence-locked signal the
+model is trying to produce rides on top of a comparably-large background
+rhythm, not standing out from it.
+
+### DG's activity is not stable across blocks — four blocks run 4–9× hot
+
+Restricting to the SWR-forward window specifically (the same window used
+for every separation metric in §13–14), DG granule-cell active fraction
+across 14 blocks (1 % scale, `replay_output_1pct/phase11_residual_fix_control.h5`):
+
+```
+t (ms)          active%   t (ms)          active%
+    0 -   999     15.4%    7000 -  7999      7.7%
+ 1000 -  1999      3.2%    8000 -  8999      6.6%
+ 2000 -  2999      4.4%    9000 -  9999     32.2%   <-
+ 3000 -  3999      4.0%   10000 - 10999      5.2%
+ 4000 -  4999      3.5%   11000 - 11999      5.3%
+ 5000 -  5999      7.2%   12000 - 12999     33.1%   <-
+ 6000 -  6999      6.6%   13000 - 13999     27.3%   <-
+```
+
+Ten blocks sit in a plausible 3–8 % band. Four (t=0–999, 9000–9999,
+12000–12999, 13000–13999 ms) run 4–9× hotter (15–33 %). DG basket cells
+track the exact same four blocks (46 %/94 %/99 %/94 % active vs. a 22–33 %
+baseline elsewhere) — the sparsifying feedback population is destabilized
+right alongside the cells it is supposed to be sparsifying, not correcting
+for it.
+
+The four anomalous blocks do not share one cause:
+- **t=0–999 ms** is a first-block-only phenomenon shared with CA3: CA3 SUP's
+  peak instantaneous rate here (128 Hz) is the highest of any block, mirroring
+  the extreme, isolated 239 Hz spike CA3 shows in the first few ms of the run
+  — an initialization transient, not a recurring failure mode.
+- **t=9000–9999, 12000–12999, 13000–13999 ms** show no corresponding
+  anomaly in CA3 SUP/DEEP's own peak rate (all within the normal 65–90 Hz
+  range at those same blocks) — whatever destabilizes DG here is not simply
+  inherited from an equally-destabilized CA3. EC LII's own active fraction
+  (same SWR-forward window) shows a slow upward drift across the run (10 %
+  at t=1000–1999 ms rising to 25–30 % by t=6000–8999 ms) consistent with
+  the STC hook's ongoing CA1→EC LII potentiation gradually raising EC LII's
+  baseline excitability — plausibly making DG's sparse-coding regime
+  increasingly prone to tipping into a denser state as the run progresses,
+  though not deterministically (t=10000–11999 ms sit between two anomalous
+  blocks and stay perfectly normal). Cause not fully isolated; flagged as
+  an open item below rather than guessed at further.
+
+### The EC LII → GC single-cell result, corrected
+
+A follow-up to §14, same session, reconstructed the model's actual fixed
+EC LII → GC wiring (600,000 synapses, exact GID match against real spike
+data — see `reconstruct_connectivity.py`, extracted from that analysis) and
+tested whether granule cells receiving more input from currently-pattern-
+tuned EC LII cells are more likely to fire. Pooled across all 14 blocks
+(168,000 cell-block observations), the result read as flat-to-negative — no
+signal. Splitting by the block-health finding above changes that reading:
+
+| grouping | n | active % | point-biserial r | p |
+|---|---|---|---|---|
+| all 14 blocks (pooled) | 168,000 | 11.56 % | −0.0173 | 1.5×10⁻¹² |
+| healthy 10 blocks only | 120,000 | 5.39 % | **+0.0086** | 2.8×10⁻³ |
+| anomalous 4 blocks only | 48,000 | 27.00 % | **+0.0165** | 3.1×10⁻⁴ |
+
+Both subsets, analyzed within their own regime, show a small but
+statistically real *positive* relationship between a granule cell's actual
+wired-in pattern-tuned input and its firing probability (decile 1 → decile
+10 of input drive: 5.0 % → 5.6–5.9 % active in healthy blocks; 25.8 % →
+27–29 % in anomalous blocks). The pooled analysis inverted this sign — a
+Simpson's-paradox artifact from mixing two regimes with very different
+baseline activity levels and mean input drive, not evidence the wiring is
+blind to identity.
+
+**Corrected conclusion:** the EC LII → GC synapse *does* carry a small,
+real, single-cell-level identity signal — it is just far too weak to
+survive the coarser population-level Jaccard-overlap separation metric
+(§13–14), and naive pooling across an unstable network can hide or even
+invert it entirely. This does not overturn §13–14's headline finding (DG's
+*aggregate* identity/timing separation is still ≈0.00, EC LII is still the
+only population that reliably discriminates) — it refines *why*: the
+signal is present but weak, not absent, and any future SNR-tuning attempt
+(§14 tried two, both negative) should be evaluated against this smaller,
+real effect rather than against a strawman of zero relationship.
+
+### New tool
+
+`reconstruct_connectivity.py` (repo root) extracts a projection's actual
+fixed connectivity from `replay_scaled.py`'s own network-builder functions
+without paying for a full simulation — drives the real build code up to
+(but not through) the first `nest.Simulate()` call, using the same CLI
+flags as a real run. Used here for EC LII → GC; documented to extend to
+other projections. See its module docstring for the mechanics (namespace
+`exec` split at `if __name__`, `nest.__dict__['Simulate']` patch — plain
+`nest.Simulate = ...` is blocked by NEST's module `__setattr__`).
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
@@ -679,11 +804,36 @@ tried; both failed; the second was actively regressive.
   scales tried.
 - **DG selectivity remains unsolved after six independent attempts** (§13–14):
   age-indexed neurogenesis, cohort Hebbian learning, the residual-rate fix,
-  heterogeneity off, and both SNR-tuning directions. Identity separation has
-  not moved off ~0.000 under any of them. Untried: a DG-scoped heterogeneity
-  toggle (leave CA3/CA1 untouched), sharpening EC LII's own pattern-locked
-  drive instead of scaling `w_ec_dg`, and re-running the two SNR brackets at
-  12 % rather than 1 % (see §14's scale caveat).
+  heterogeneity off, and both SNR-tuning directions. *Population-level*
+  identity separation has not moved off ~0.000 under any of them. §15
+  refines this: a small, real, statistically significant identity signal
+  *does* survive at the single-cell wired-connectivity level (r=+0.009 to
+  +0.017 depending on block health) — it is just too weak for the coarser
+  Jaccard-overlap separation metric to detect. Untried: a DG-scoped
+  heterogeneity toggle (leave CA3/CA1 untouched), sharpening EC LII's own
+  pattern-locked drive instead of scaling `w_ec_dg`, and re-running the two
+  SNR brackets at 12 % rather than 1 % (see §14's scale caveat) — now with
+  a real, non-zero effect size to try to amplify rather than a presumed-zero
+  one.
+- **DG's activity is unstable across time blocks, cause only partly
+  isolated** (§15): 4 of 14 blocks run 4–9× hotter than the rest, with DG
+  basket cells destabilized in lockstep. The first (t=0–999 ms) looks like
+  a shared network-wide initialization transient (CA3 SUP peaks 128 Hz
+  there too). The other three (t=9000–9999, 12000–12999, 13000–13999 ms)
+  show no corresponding CA3 anomaly and don't correlate cleanly with
+  distance from the novel-pattern block (t=8000–8999 ms) either — plausibly
+  related to the STC hook's slow upward drift in EC LII's own excitability
+  interacting with a marginally-stable DG sparse-coding regime, but not
+  confirmed. Any future DG-focused run should report block-by-block
+  activity, not just a whole-run average, until this is understood.
+- **CA3's SWR windows are not distinguishable from background theta**
+  (§15): the model's explicit 8 Hz theta drive onto CA3/CA1 produces
+  60–130+ Hz peaks continuously, every ~100 ms, all block long — not just
+  during the two labeled SWR windows. A plausible cause of the
+  already-documented weak/non-significant replay-sequence ρ (§7). Untried:
+  compare replay quality with theta on vs. off, or check whether the SWR
+  windows' own drive is strong enough to produce a distinguishably larger
+  event against this background.
 
 ## Reproducing
 
