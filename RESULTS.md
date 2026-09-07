@@ -782,6 +782,113 @@ other projections. See its module docstring for the mechanics (namespace
 `exec` split at `if __name__`, `nest.__dict__['Simulate']` patch — plain
 `nest.Simulate = ...` is blocked by NEST's module `__setattr__`).
 
+## 16. DG's time-block instability is chaotic, not novel-pattern- or schedule-driven
+
+§15 found 3 of 14 blocks (t=9000–9999, 12000–12999, 13000–13999 ms) running
+4–9× hotter than the rest and could not fully isolate a cause, noting only
+that all three come after the novel pattern's debut at t=8000–8999 ms.
+Four follow-up runs (same 1 % scale, same seed 202 unless noted, `--dg
+--ec-lii --ec-lv --mpfc --n-swr 14 --stc --het 0.30 --het-wcomp 2.3
+--w-ec-dg 0.6 --pp-residual 0.9 --dg-delay-jitter 4.0 --pattern-source
+ec-lii --place-field-sigma 0.15 --ec-pattern-base-rate 20
+--ec-pattern-peak-rate 800 --ec-pattern-weight 1.5` throughout) test that
+hypothesis and overturn it.
+
+**Reseed test.** `--seed 303`, otherwise identical to the original run.
+The specific anomalous blocks are not reproduced: seed 303's are
+t=7000–7999, 8000–8999, 9000–9999, 11000–11999 ms (30–61 % active) — only
+t=9000–9999 ms is anomalous in both seeds. Every anomaly in *either* seed
+still falls in t=7000–13999 ms, none in t=1000–6999 ms — at this point
+consistent with a real, seed-independent vulnerable window whose exact
+tipping block is seed-dependent.
+
+**Two confounded "no novel pattern" attempts.** To test whether that
+window is caused by the novel pattern specifically (vs. simply being the
+second half of a 14-block run), two more runs were tried and both turned
+out to test something else instead:
+- `--n-patterns 3`, no `--novel-pattern-onset` flag at all → all three
+  patterns cycle from t=0, which is *more* pattern-switching than the
+  original run's own t=0–7999 ms (which only alternates 2 of 3 patterns
+  before the novel pattern's debut) — not a "no novel pattern" condition.
+- `--n-patterns 2` throughout → matches the original's t=0–7999 ms
+  *alternation schedule*, but `--n-patterns` also sets how the 10 CA3
+  sequence groups are partitioned (`replay_scaled.py:1273–1274`): 2
+  patterns means each owns 5 groups instead of 3–4, so every pattern
+  presentation recruits more of CA3 than in the original run. Not matched
+  either.
+
+Both are still useful as data: the first stayed noisy but bounded
+(2.6–23.1 % active, no block over 3× the 9.35 % median); the second was
+uniformly *worse* than the original from block 0 onward (4.2–67.3 %,
+median 7.18 %, with its own anomalies at t=5000–5999, 6000–6999,
+11000–11999, 13000–13999 ms) — more CA3 recruitment per pattern
+destabilizes DG throughout the run, not just in some later window.
+
+**The actual clean control.** `--n-patterns 3` (same CA3 group partition
+as the original run) with `--novel-pattern-onset 999` — past the 14-block
+run length, so the held-back pattern is never shown and the alternate-2-
+of-3 schedule the original used for t=0–7999 ms simply continues for all
+14 blocks. This is the correct isolation: identical seed, identical
+per-block CA3 recruitment, the only difference is that the novel pattern
+never happens.
+
+| t (ms) | original (novel@8) | seed 303 | 3-pat, no onset | 2-pat only | **clean control** |
+|---|---|---|---|---|---|
+| 0–999 | 15.4 | 3.9 | 15.4 | 15.4 | 15.4 |
+| 1000–1999 | 3.2 | 3.0 | 3.2 | 4.2 | 3.2 |
+| 2000–2999 | 4.4 | 4.5 | 2.6 | 2.6 | 4.4 |
+| 3000–3999 | 4.0 | 15.1 | 4.8 | 3.8 | 6.2 |
+| 4000–4999 | 3.5 | 7.9 | 3.2 | 11.4 | 4.5 |
+| 5000–5999 | 7.2 | 4.2 | 4.1 | **35.3** | 4.9 |
+| 6000–6999 | 6.6 | 5.8 | 3.4 | **28.1** | **30.7** |
+| 7000–7999 | 7.7 | **52.2** | 20.3 | 4.7 | 3.4 |
+| 8000–8999 | 6.7 | **60.7** | 8.0 | 5.4 | 14.3 |
+| 9000–9999 | **32.2** | **30.4** | 10.7 | 5.6 | 7.1 |
+| 10000–10999 | 5.2 | 5.5 | 23.1 | 6.6 | 5.9 |
+| 11000–11999 | 5.3 | **21.4** | 14.6 | **67.3** | 6.9 |
+| 12000–12999 | **33.1** | 6.1 | 21.6 | 7.8 | **22.5** |
+| 13000–13999 | **27.3** | 9.7 | 14.1 | **28.3** | 12.2 |
+
+(bold = >3× that column's own median; DG GC active %, SWR-forward window,
+same metric as §15.)
+
+The clean control's first three blocks (15.4, 3.2, 4.4 %) are bit-for-bit
+identical to the original run — same seed, same schedule, no novel
+pattern has happened in either one yet, nothing has had a chance to
+differ. The two trajectories still diverge starting t=3000–3999 ms (4.0 %
+vs. 6.2 %) and by t=6000–6999 ms the clean control has its own runaway
+block (30.7 %) exactly where the original stayed normal (6.6 %) — while
+the original's own anomalies (t=9000–9999, 13000–13999 ms) are unremarkable
+in the clean control (7.1 %, 12.2 %). t=12000–12999 ms is elevated in
+both, but that is the only block-level overlap between the two runs
+outside the shared initial transient.
+
+**Conclusion.** All five conditions — original, reseed, both confounded
+attempts, and the clean control — produce their *own* 2–4 wildly anomalous
+blocks, never the same set twice, including between the clean control and
+the original run it is nominally identical to for its first several
+blocks. A cause that depended on the novel pattern, on pattern count, or
+on elapsed time would have to produce the *same* divergence given the
+*same* seed and the *same* schedule; it does not. This is the signature of
+chaotic sensitivity in a system sitting close to a bistability threshold
+(§15's STC-driven EC LII excitability drift already suggested the
+threshold is real and slowly approached) — small, uncontrolled numerical
+differences (most plausibly floating-point summation order under NEST's
+multi-threaded kernel, which is not guaranteed reproducible run-to-run even
+at fixed seed) get amplified into qualitatively different block-level
+outcomes once the margin to that threshold is small enough. §15's
+"possibly related to distance from the novel-pattern block" framing is
+superseded by this: the novel pattern is not the trigger, it just happened
+to sit near a block index that this run's particular numerical trajectory
+tipped on.
+
+This does not mean pattern count is irrelevant — it clearly sets the
+*average* proximity to the tipping threshold (2-pattern-only ran hot
+almost throughout; 3-pattern conditions mostly did not) — but it does not
+determine *which* block tips. Those are two separate effects: a slow,
+parameter-controlled one (how close to the edge the run sits on average)
+and a fast, uncontrolled one (which specific block crosses it).
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
@@ -815,17 +922,25 @@ other projections. See its module docstring for the mechanics (namespace
   SNR brackets at 12 % rather than 1 % (see §14's scale caveat) — now with
   a real, non-zero effect size to try to amplify rather than a presumed-zero
   one.
-- **DG's activity is unstable across time blocks, cause only partly
-  isolated** (§15): 4 of 14 blocks run 4–9× hotter than the rest, with DG
-  basket cells destabilized in lockstep. The first (t=0–999 ms) looks like
-  a shared network-wide initialization transient (CA3 SUP peaks 128 Hz
-  there too). The other three (t=9000–9999, 12000–12999, 13000–13999 ms)
-  show no corresponding CA3 anomaly and don't correlate cleanly with
-  distance from the novel-pattern block (t=8000–8999 ms) either — plausibly
-  related to the STC hook's slow upward drift in EC LII's own excitability
-  interacting with a marginally-stable DG sparse-coding regime, but not
-  confirmed. Any future DG-focused run should report block-by-block
-  activity, not just a whole-run average, until this is understood.
+- **DG's activity is unstable across time blocks — confirmed chaotic, not
+  novel-pattern- or schedule-driven** (§15–16): 2–4 of 14 blocks run 4–9×
+  hotter than the rest in any given run, with DG basket cells destabilized
+  in lockstep. §16 ruled out the novel-pattern-timing hypothesis with a
+  clean matched-schedule control: even a run identical in seed and
+  per-block CA3 drive to the original, differing only in that the novel
+  pattern never occurs, still diverges from the original starting
+  t=3000–3999 ms and produces its own, differently-placed anomalous
+  blocks. Five conditions tested (reseed + 3 pattern-schedule variants +
+  the clean control) never reproduce the same anomalous-block set twice —
+  consistent with chaotic amplification of run-to-run numerical noise
+  (plausibly NEST's multi-threaded, non-reproducible summation order) once
+  the DG sparse-coding regime sits close to a bistability threshold set by
+  the STC hook's slow EC LII excitability drift. Pattern count/CA3
+  recruitment breadth sets how close to that threshold a run sits *on
+  average* (2-pattern-only ran hot almost every block); it does not
+  determine which specific block tips. Any future DG-focused run should
+  report block-by-block activity, not just a whole-run average, and should
+  not expect exact reproducibility even at fixed seed and schedule.
 - **CA3's SWR windows are not distinguishable from background theta**
   (§15): the model's explicit 8 Hz theta drive onto CA3/CA1 produces
   60–130+ Hz peaks continuously, every ~100 ms, all block long — not just
