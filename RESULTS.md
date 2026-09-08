@@ -889,6 +889,149 @@ determine *which* block tips. Those are two separate effects: a slow,
 parameter-controlled one (how close to the edge the run sits on average)
 and a fast, uncontrolled one (which specific block crosses it).
 
+## 17. EC LII -> DG identity: found, explained, and restored by clustering the fan-in
+
+§15 found a real but tiny single-cell identity signal at the EC LII -> GC
+synapse (point-biserial r=+0.009 to +0.017) — real, but far too weak to
+show up by eye in a raster, and the wrong sign once wrongly pooled across
+health-heterogeneous blocks. This section explains *why* it is that weak,
+and shows a bio-plausible wiring change that substantially restores it.
+
+### Why one projection can lose identity: convergent random sampling, not a bug
+
+The EC LII -> GC perforant path is NEST's native `fixed_indegree`: each of
+the 12,000 granule cells independently draws K=50 sources, sampled
+**uniformly at random from all 1,000 EC LII cells**, with no relationship
+to place field (`replay_scaled.py`, `TARGET_INDEGREE["ec_dg_pp"]=50`, the
+`fixed_connect` call in `build_dg_module`). Combined with the pattern's
+tuning width (σ=0.15, so ~30-40% of the ring is "hot" for any active
+pattern), basic sampling statistics explain the result: any GC's 50 random
+sources are, in expectation, a representative cross-section of the *whole*
+ring regardless of which pattern is active, so by the law of large numbers
+nearly every GC ends up with nearly the same expected total drive no
+matter what is being replayed. Only the K=50 sampling noise across
+different GCs' specific draws carries any residual identity information —
+exactly the tiny effect §15 measured. Average fan-out per EC LII cell:
+K·N_post/N_pre = 50×12,000/1,000 = **600** — every EC LII cell talks to
+~600 of the 12,000 granule cells, scattered uniformly across the whole
+ring.
+
+### A direct visual test, and a real methodology bug caught along the way
+
+Pooling every SWR-forward-window spike across all 14 blocks and measuring
+each firing cell's ring-distance from whichever pattern was actually
+active at that moment gives a clean, model-free null: if place field had
+no bearing on firing, this distribution is uniform on [0, 0.5] (density
+2.0 flat) — a direct consequence of place fields being drawn uniformly on
+a ring. EC LII's distribution clearly departs from that null (dense near
+distance=0, thinning toward 0.5); DG's, pooled across all 14 blocks
+(mixing the §16 healthy/anomalous regimes), sits slightly on the *wrong*
+side of it (mean distance 0.273 vs. the null's 0.250) — DG cells farther
+from the active pattern were, if anything, slightly more likely to fire.
+
+Deriving each GC's own "effective place field" (needed to sort/analyze
+DG at all, since GCs don't have one of their own — only their K=50 wired
+EC LII inputs do) requires averaging those 50 inputs' place-field values.
+The first pass used a plain arithmetic mean, which is wrong on a ring:
+values near the 0/1 wraparound point average toward 0.5 instead of toward
+0. Caught by checking the derivation directly — the fix (a circular mean,
+`atan2(mean(sin θ), mean(cos θ))`) changed 64% of GCs' derived field
+values by more than 0.1 ring-units. Every figure and number in this
+section uses the corrected circular mean.
+
+### Two experiments, and which one actually explains it
+
+The averaging-washes-out-identity theory above makes a testable
+prediction: reduce K so there is less to average over, and DG should
+track EC LII's identity much more closely. `--dg-ec-cluster-sigma` is not
+that test — reducing indegree from K=50 to K=1 (one random EC LII source
+per GC, everything else unchanged, 1% scale, seed 202) is:
+
+| condition | DG mean ring-dist. from active pattern | vs. null (0.250) |
+|---|---|---|
+| original: random K=50 | 0.273 | worse than chance |
+| uniform K=1 (no averaging, still non-topographic) | 0.253 | ≈ chance |
+| **clustered K=50** (σ=0.05, biased toward each GC's local neighbourhood) | **0.236** | clearly better than chance |
+
+(EC LII itself: 0.217-0.223 in all three conditions — its own encoding
+never changes; only how DG samples it does.)
+
+K=1 mostly just removes the anti-correlation — consistent with "less
+averaging, less washing" — but does not produce a real positive signal:
+without any spatial bias, a single random sample is no more informative
+than 50 averaged ones, just noisier. **Clustering** the sampling —
+keeping K=50, but biasing each GC's 50 sources toward EC LII cells near
+its own topographic location (a Gaussian kernel, σ=0.05, tighter than the
+pattern's own σ=0.15) instead of sampling uniformly — is what actually
+restores a real signal, and by a wider margin than K=1 reached. This is
+the direct computational analogue of the user's proposed biological
+mechanism: axons closer on the ring are more likely to synapse onto the
+same dendritic-tree neighbourhood, i.e. real anatomical topography (e.g.
+the entorhinal-dentate medial-lateral gradient, Dolorfo & Amaral 1998)
+rather than the model's original all-of-EC-is-equally-reachable
+assumption. See `figures/dg_diagnostic/clustered_wiring_identity_test.png`
+for the full distribution comparison (not just the means above) and
+`zoomed_pattern_identity_test.png` / `identity_loss_histograms.png` for
+the single-window and pooled diagnostics that led here.
+
+### Now in the codebase: `--dg-ec-cluster-sigma`
+
+Landed as a real CLI option (not a throwaway script): `--dg-ec-cluster-sigma
+SIGMA` (default 0.0 = old uniform-random behaviour). Requires `--dg
+--ec-lii --pattern-source ec-lii` (needs the real place-field centres,
+already computed for the pattern drive — no re-derivation). Implementation:
+`clustered_fixed_connect()` (`replay_scaled.py`, next to `fixed_connect`) —
+each GC gets a topographic centre via even tiling by creation index, then
+draws its K sources with `np.random.choice(..., p=gaussian_kernel)`
+instead of NEST's uniform `fixed_indegree`; one `nest.Connect` call per GC
+(all_to_all, K sources -> 1 target). ~6-7s for 12,000 GCs at 1% scale;
+scales linearly with N_gc (~12,000 GCs/s), so ~80-90s expected at 12%
+scale (144,000 GCs) — negligible next to the run's own ~20min wall time,
+nothing like the cohort-(-1) cache bug fixed earlier this session.
+
+### The rest of the network has the same exposure — Schaffer collaterals worst of all
+
+The mechanism above (uniform random convergent sampling washing out
+identity by averaging) is not special to the perforant path. Every major
+projection in the model was checked against the same criterion — how many
+sources does a downstream cell sample, out of how many available, and is
+the sampling topographically biased at all:
+
+| projection | rule | K (indegree) | pre size (1%) | density | topographic? |
+|---|---|---|---|---|---|
+| EC LII -> DG GC | fixed_indegree | 50 | 1,000 | 5.0% | **yes, now** (`--dg-ec-cluster-sigma`) |
+| DG GC -> CA3 SUP (mossy) | fixed_indegree | 15 | 12,000 | 0.13% | no |
+| DG GC -> CA3 DEEP (mossy) | fixed_indegree | 8 | 12,000 | 0.07% | no |
+| **CA3 SUP -> CA1 PYR (Schaffer)** | fixed_indegree | 2,640 | 2,640 | **100%** | no |
+| **CA3 DEEP -> CA1 PYR (Schaffer)** | fixed_indegree | 660 | 660 | **100%** | no |
+| CA3 SUP -> CA1 BASKET | fixed_indegree | 500 | 2,640 | 18.9% | no |
+| CA1 PYR -> EC LII | fixed_indegree | 500 | 4,600 | 10.9% | no |
+| EC LII -> EC LV | fixed_indegree | 20/cell | 1,000 | 2.0% | no |
+| EC LV -> mPFC | fixed_indegree | 20/cell | 600 | 3.3% | no |
+
+Schaffer collaterals stand out: **density 100%** means every CA1 PYR cell
+receives from literally every CA3 SUP and CA3 DEEP cell — there is no
+sampling at all, so no downstream cell can be distinguished by *which*
+CA3 cells it hears from (they all hear from all of them). This is a more
+severe version of the same problem DG had, and lines up exactly with the
+already-documented collapse of CA3's real, measured spike-timing identity
+signal (separation 0.167 ± 0.022) to ~0.00 by CA1 (§9, §13-14): with an
+all-to-all projection, identity can *only* survive through timing/delay
+heterogeneity, never through connectivity structure — which is why §9's
+delay-heterogeneity and delay-aware-STDP attempts were the only kind of
+fix that could possibly have worked on this hop, and why they still
+weren't enough on their own.
+
+**Not fixed in this pass.** Schaffer's density can't be lowered casually —
+it is the dominant source of CA1's excitatory drive, tuned as part of the
+model's whole E/I balance, and turning 100% density into a genuinely
+sparse+topographic projection is a materially bigger change than DG's
+perforant path (which was already explicitly budgeted as a small,
+subthreshold contribution). Flagged as the highest-priority next
+candidate, not bundled into this session's fix or the MN5 run below —
+changing DG and Schaffer in the same run would make it impossible to
+attribute any result to either one.
+
 ## Open items
 
 - **Cortical selectivity is unsolved.** Pattern identity is robustly encoded in
@@ -909,19 +1052,33 @@ and a fast, uncontrolled one (which specific block crosses it).
   rest→threshold gap or the loop saturates DG. Confirmed again in §14
   (`w_ec_dg=1.0` → 46 % active, detonation) — the ceiling is real at both
   scales tried.
-- **DG selectivity remains unsolved after six independent attempts** (§13–14):
-  age-indexed neurogenesis, cohort Hebbian learning, the residual-rate fix,
-  heterogeneity off, and both SNR-tuning directions. *Population-level*
-  identity separation has not moved off ~0.000 under any of them. §15
-  refines this: a small, real, statistically significant identity signal
-  *does* survive at the single-cell wired-connectivity level (r=+0.009 to
-  +0.017 depending on block health) — it is just too weak for the coarser
-  Jaccard-overlap separation metric to detect. Untried: a DG-scoped
-  heterogeneity toggle (leave CA3/CA1 untouched), sharpening EC LII's own
-  pattern-locked drive instead of scaling `w_ec_dg`, and re-running the two
-  SNR brackets at 12 % rather than 1 % (see §14's scale caveat) — now with
-  a real, non-zero effect size to try to amplify rather than a presumed-zero
-  one.
+- **DG selectivity remains unsolved at the population level after six
+  independent attempts** (§13–14): age-indexed neurogenesis, cohort
+  Hebbian learning, the residual-rate fix, heterogeneity off, and both
+  SNR-tuning directions. *Population-level* identity separation has not
+  moved off ~0.000 under any of them. §15–17 refine this considerably: a
+  small, real single-cell identity signal exists (r=+0.009 to +0.017
+  depending on block health) and is explained by K=50-sample averaging
+  over uniform-random EC LII sources; §17's `--dg-ec-cluster-sigma`
+  (topographically clustered fan-in, same K=50) restores it substantially
+  at 1% scale (DG mean ring-distance from the active pattern 0.273 -> 0.236,
+  vs. EC LII's own ~0.22 and a chance null of 0.25) — not yet re-tested
+  against the *population-level* Jaccard metric, and not yet run at 12%
+  scale. That MN5 run is the natural next step (see Reproducing).
+- **Schaffer collaterals (CA3->CA1) are 100% dense — no sampling at all,
+  the most severe version of the identity-washing problem in the whole
+  network** (§17): every CA1 PYR cell receives from literally every CA3
+  SUP and DEEP cell, so no downstream cell can be distinguished by *which*
+  CA3 cells it hears from. This is the leading candidate explanation for
+  why CA3's own real, measured spike-timing identity signal (separation
+  0.167 ± 0.022) collapses to ~0.00 by CA1 (§9, §13–14) — an all-to-all
+  projection can only preserve identity through timing/delay
+  heterogeneity, never through connectivity structure, which is exactly
+  the (partially effective, not sufficient alone) kind of fix §9 already
+  tried. Not fixed this session — turning it into a genuinely sparse,
+  topographic projection is a bigger, E/I-balance-affecting change than
+  DG's perforant path and needs its own isolated test, not bundled with
+  the DG fix above.
 - **DG's activity is unstable across time blocks — confirmed chaotic, not
   novel-pattern- or schedule-driven** (§15–16): 2–4 of 14 blocks run 4–9×
   hotter than the rest in any given run, with DG basket cells destabilized

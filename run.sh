@@ -244,6 +244,32 @@
 #EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,DG_PERFORANT_STDP=1,\
 #DG_NEUROGENESIS=1,NEUROGENESIS_RATE=0.01,NEUROGENESIS_MATURATION_EPOCHS=4,\
 #SEED=202 run.sh
+#
+# JOB H8 — Phase 11: clustered (topographic) EC LII->GC perforant-path fan-in.
+#   RESULTS.md §17: at 1% scale, replacing the perforant path's uniform-random
+#   K=50 sampling (every GC draws 50 sources from anywhere in EC LII, no
+#   relation to place field) with LOCAL sampling (--dg-ec-cluster-sigma,
+#   Gaussian-weighted toward each GC's own topographic neighbourhood) restores
+#   a real single-cell identity signal that neither the original wiring nor a
+#   naive K=1 fan-in cut produced (DG mean ring-distance from the active
+#   pattern: 0.273 uniform K=50 -> 0.253 uniform K=1 -> 0.236 clustered K=50,
+#   vs EC LII's own ~0.22 and a chance null of 0.25).
+#
+#   Same base config as JOB H7's CONTROL arm (no neurogenesis/plasticity, so
+#   this isolates clustering as the only variable) -- A/B pair, same seed:
+#   arm 1 = today's baseline wiring (control), arm 2 = clustered (test).
+#   Wiring cost is small: ~7s/12,000 GCs locally -> ~85s expected for the
+#   144,000 GCs at 12% scale (linear in N_gc), negligible next to the run's
+#   own wall time -- nothing like the cohort-(-1) cache bug JOB H7 hit.
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=3,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
+#EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,SEED=202 run.sh
+#  sbatch --export=ALL,SCALE=12,DG=1,N_PATTERNS=3,N_SWR=14,HET=0.30,HET_WCOMP=2.3,\
+#W_EC_DG=0.6,PP_RESIDUAL=0.9,DG_DELAY_JITTER=4.0,PATTERN_SOURCE=ec-lii,\
+#PLACE_FIELD_SIGMA=0.15,EC_PATTERN_BASE_RATE=20,EC_PATTERN_PEAK_RATE=800,\
+#EC_PATTERN_WEIGHT=1.5,NOVEL_PATTERN_ONSET=8,DG_EC_CLUSTER_SIGMA=0.05,\
+#SEED=202 run.sh
 
 SCALE=${SCALE:-25}
 EC_LII=${EC_LII:-1}     # 1=add EC LII/III cortical target (default on)
@@ -274,6 +300,8 @@ PLACE_FIELD_SIGMA=${PLACE_FIELD_SIGMA:-}     # ec-lii only: ring-unit field widt
 EC_PATTERN_BASE_RATE=${EC_PATTERN_BASE_RATE:-}  # ec-lii only: Poisson floor Hz
 EC_PATTERN_PEAK_RATE=${EC_PATTERN_PEAK_RATE:-}  # ec-lii only: Poisson peak-gain Hz
 EC_PATTERN_WEIGHT=${EC_PATTERN_WEIGHT:-}     # ec-lii only: place-field synapse weight
+DG_EC_CLUSTER_SIGMA=${DG_EC_CLUSTER_SIGMA:-}   # Phase 11: >0 = topographically clustered
+                                               # EC LII->GC fan-in (see JOB H8, RESULTS.md SS17)
 # ---- Phase 8: DG neurogenesis ---------------------------------------------
 DG_NEUROGENESIS=${DG_NEUROGENESIS:-0}   # 1=new hyperexcitable GC cohort each epoch
 NEUROGENESIS_RATE=${NEUROGENESIS_RATE:-}   # fraction of original N_gc born/epoch
@@ -326,6 +354,7 @@ echo "[Slurm] pattern_source=${PATTERN_SOURCE:-ca3}  place_field_sigma=${PLACE_F
 echo "[Slurm] dg_neurogenesis=${DG_NEUROGENESIS}  neurogenesis_rate=${NEUROGENESIS_RATE:-<default>}  maturation_epochs=${NEUROGENESIS_MATURATION_EPOCHS:-<default>}  young_ie=${NEUROGENESIS_YOUNG_IE:-<default>}  young_inhib_scale=${NEUROGENESIS_YOUNG_INHIB_SCALE:-<default>}  young_pp_scale=${NEUROGENESIS_YOUNG_PP_SCALE:-<default>}"
 echo "[Slurm] dg_perforant_stdp=${DG_PERFORANT_STDP}  dg_assoc_a=${DG_ASSOC_A:-<default>}  dg_assoc_a_hetero=${DG_ASSOC_A_HETERO:-<default>}  dg_assoc_w_max=${DG_ASSOC_W_MAX:-<default>}  dg_assoc_w_min=${DG_ASSOC_W_MIN:-<default>}"
 echo "[Slurm] novel_pattern_onset=${NOVEL_PATTERN_ONSET:-<none>}"
+echo "[Slurm] dg_ec_cluster_sigma=${DG_EC_CLUSTER_SIGMA:-<none, uniform random>}"
 
 python3 - <<'PY'
 import nest
@@ -388,6 +417,7 @@ fi
 [ "$DG_NEUROGENESIS" = "1" ]     && PHASE_TAG="${PHASE_TAG}_neurogen"
 [ "$DG_PERFORANT_STDP" = "1" ]   && PHASE_TAG="${PHASE_TAG}_pstdp"
 [ -n "$NOVEL_PATTERN_ONSET" ]    && PHASE_TAG="${PHASE_TAG}_novel${NOVEL_PATTERN_ONSET}"
+[ -n "$DG_EC_CLUSTER_SIGMA" ]    && PHASE_TAG="${PHASE_TAG}_clu${DG_EC_CLUSTER_SIGMA}"
 [ -n "$SEED" ]               && PHASE_TAG="${PHASE_TAG}_s${SEED}"
 OUTFILE="${OUTDIR}/replay_${SCALE}pct_stc${PHASE_TAG}.h5"
 echo "[Slurm] output → $OUTFILE"
@@ -420,6 +450,7 @@ fi
 [ -n "$EC_PATTERN_BASE_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-base-rate $EC_PATTERN_BASE_RATE"
 [ -n "$EC_PATTERN_PEAK_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-peak-rate $EC_PATTERN_PEAK_RATE"
 [ -n "$EC_PATTERN_WEIGHT" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --ec-pattern-weight $EC_PATTERN_WEIGHT"
+[ -n "$DG_EC_CLUSTER_SIGMA" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-ec-cluster-sigma $DG_EC_CLUSTER_SIGMA"
 [ "$DG_NEUROGENESIS" = "1" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --dg-neurogenesis"
 [ -n "$NEUROGENESIS_RATE" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-rate $NEUROGENESIS_RATE"
 [ -n "$NEUROGENESIS_MATURATION_EPOCHS" ] && OPTIONAL_FLAGS="$OPTIONAL_FLAGS --neurogenesis-maturation-epochs $NEUROGENESIS_MATURATION_EPOCHS"

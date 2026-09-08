@@ -591,6 +591,62 @@ def fixed_connect(pre, post, indegree, weight, delay, w_cv=None,
     )
 
 
+def clustered_fixed_connect(pre, post, indegree, weight, delay, field_centers,
+                             cluster_sigma, w_cv=None, compensate=True, seed=42):
+    """Like fixed_connect, but each post neuron's `indegree` sources are drawn
+    from a LOCAL neighbourhood of `pre` (ring distance, sigma=cluster_sigma)
+    around that post neuron's own topographic location, instead of uniformly
+    at random across all of `pre`.
+
+    Post neurons are assigned a topographic centre by an even tiling of the
+    ring by creation index (post[0] -> 0.0, post[-1] -> just under 1.0) -- an
+    arbitrary but well-defined stand-in for a medial-lateral anatomical
+    gradient, since `post` (e.g. DG granule cells) has no spatial coordinate
+    of its own. `field_centers` gives each `pre` cell's own ring location
+    (e.g. EC LII's assigned place-field centre) and must be in the same
+    creation-index order as `pre`.
+
+    Modelling assumption: axons that are close on this ring are more likely
+    to synapse onto the same dendritic-tree neighbourhood -- the biological
+    motivation for clustering, vs. today's uniform-random sampling. Verified
+    to restore a real pattern-identity signal at the single-cell level (see
+    RESULTS.md SS17): DG's mean ring-distance from the active pattern's
+    centre drops from 0.273 (uniform K=50, worse than the 0.25 chance null)
+    to 0.236 (clustered K=50, sigma=0.05) -- closer to EC LII's own 0.22 than
+    either the uniform baseline or a naive K=1 fan-in cut (0.253) reached.
+
+    One nest.Connect call per post neuron (all_to_all, indegree pre cells to
+    1 post cell) -- ~7s for 12,000 post neurons at 1% scale; not vectorized
+    further since indegree differs in identity (not just count) per neuron.
+    """
+    if w_cv is None:
+        w_cv = _HET["w_cv"]
+    if compensate and isinstance(weight, (int, float)) and weight > 0:
+        weight = wcomp_w(weight)
+    weight_param = (jittered_weight(weight, w_cv)
+                    if isinstance(weight, (int, float)) else weight)
+
+    pre_nc = _to_nc(pre)
+    post_nc = _to_nc(post)
+    pre_ids = np.array(pre_nc.tolist())
+    post_ids = np.array(post_nc.tolist())
+    n_pre, n_post = len(pre_ids), len(post_ids)
+    field_centers = np.asarray(field_centers)
+    post_center = (np.arange(n_post) / n_post) % 1.0
+    rng = np.random.default_rng(seed + 97)
+
+    for i in range(n_post):
+        d = np.abs(field_centers - post_center[i])
+        d = np.minimum(d, 1.0 - d)
+        w = np.exp(-(d ** 2) / (2 * cluster_sigma ** 2))
+        w = w / w.sum()
+        chosen = rng.choice(n_pre, size=int(indegree), replace=False, p=w)
+        src_nc = nest.NodeCollection(sorted(pre_ids[chosen].tolist()))
+        tgt_nc = nest.NodeCollection([int(post_ids[i])])
+        nest.Connect(src_nc, tgt_nc, conn_spec="all_to_all",
+                     syn_spec={"weight": weight_param, "delay": delay})
+
+
 def bernoulli_connect(pre, post, prob, weight, delay):
     """
     NEST native pairwise_bernoulli — C++, fully MPI-parallel.
@@ -1517,6 +1573,12 @@ def build_dg_module(
     # Mean-rate budget at the current setting: Poisson 0.95 * 520 = 494 mV/s
     # plus EC 50 * ~3 Hz * 0.15 = 23, total ~517 vs the tuned 520.
     ec_lii=None, w_ec_dg=0.15, pp_residual=0.95,
+    # Perforant-path sampling. field_centers/cluster_sigma together turn on
+    # LOCAL (topographic) sampling of the perforant path instead of uniform-
+    # random -- see clustered_fixed_connect's docstring and RESULTS.md SS17.
+    # field_centers must be in ec_lii's own creation-index order (i.e. the
+    # array assign_place_fields(N_ec_lii, ...) returned in main()).
+    ec_field_centers=None, dg_ec_cluster_sigma=0.0,
     # Heterogeneity for the DG pathway. The whole module used scalar weights and
     # delays, so a granule cell's K perforant inputs arrived at one instant with
     # one amplitude -- the synchrony ceiling that forces w_ec_dg down to 0.15
@@ -1635,10 +1697,20 @@ def build_dg_module(
     if ec_driven:
         K_pp = K("ec_dg_pp", len(ec_lii))
         # 3 ms: entorhinal->dentate conduction, same as the other cortical hops
-        fixed_connect(ec_lii, GC, K_pp, w_ec_dg,
-                      jittered_delay(3.0, delay_jitter), w_cv=w_cv)
+        if dg_ec_cluster_sigma > 0:
+            if ec_field_centers is None:
+                raise ValueError("dg_ec_cluster_sigma > 0 needs ec_field_centers "
+                                  "(the real EC LII place-field centres)")
+            clustered_fixed_connect(ec_lii, GC, K_pp, w_ec_dg,
+                                    jittered_delay(3.0, delay_jitter),
+                                    ec_field_centers, dg_ec_cluster_sigma,
+                                    w_cv=w_cv, seed=seed_connect)
+        else:
+            fixed_connect(ec_lii, GC, K_pp, w_ec_dg,
+                          jittered_delay(3.0, delay_jitter), w_cv=w_cv)
         print(f"  [DGModule] perforant path EC LII->GC: K={K_pp} w={w_ec_dg} "
-              f"(cv={w_cv}, delay 3.0+/-{delay_jitter} ms) "
+              f"(cv={w_cv}, delay 3.0+/-{delay_jitter} ms"
+              f"{f', CLUSTERED sigma={dg_ec_cluster_sigma}' if dg_ec_cluster_sigma > 0 else ''}) "
               f"({len(ec_lii):,} EC -> {N_gc:,} GC)  ** loop CLOSED **")
     else:
         print("  [DGModule] perforant path: Poisson stand-in only "
@@ -4692,6 +4764,24 @@ Dentate gyrus (Phase 6.2):
         help="Scale on the Poisson stand-in for unmodelled cortical drive to "
              "DG. Lowering it raises the pattern-carrying signal share.")
     parser.add_argument(
+        "--dg-ec-cluster-sigma", type=float, default=0.0, metavar="SIGMA",
+        help="Ring-distance width (same units as --place-field-sigma) of "
+             "each granule cell's LOCAL EC LII input pool for the "
+             "perforant path. 0 (default) keeps the original K=50 "
+             "uniform-random sampling across all of EC LII, which measurably "
+             "destroys pattern identity by K=50-sample averaging (RESULTS.md "
+             "SS17). >0 biases each GC's 50 sources toward EC LII cells near "
+             "its own topographic location (an even tiling by GC creation "
+             "index stands in for a medial-lateral anatomical gradient) -- "
+             "the bio-plausible assumption that closer axons make closer "
+             "dendritic-tree synapses. Verified at 1%% scale, sigma=0.05: "
+             "restores a real identity signal (DG mean ring-distance from "
+             "the active pattern 0.273 -> 0.236, vs. EC LII's own 0.22 and "
+             "a pure-chance null of 0.25) where reducing fan-in alone "
+             "(K=1, no clustering) only reached 0.253. Requires --dg "
+             "--ec-lii --pattern-source ec-lii (needs the real place-field "
+             "centers, not a re-derived copy).")
+    parser.add_argument(
         "--mpfc-k-rec", type=int, default=20, metavar="K",
         help="Recurrent mPFC->mPFC in-degree. The default 20 is a hard gate on "
              "Test 3: with N=1440 an uncued assembly cell then receives only "
@@ -4904,6 +4994,14 @@ Dentate gyrus (Phase 6.2):
         parser.error("--homeostasis requires --stc (Phase 2 must be active)")
     if args.pattern_source == "ec-lii" and not args.ec_lii:
         parser.error("--pattern-source ec-lii requires --ec-lii")
+    if args.dg_ec_cluster_sigma > 0:
+        if not args.dg:
+            parser.error("--dg-ec-cluster-sigma requires --dg")
+        if not args.ec_lii:
+            parser.error("--dg-ec-cluster-sigma requires --ec-lii")
+        if args.pattern_source != "ec-lii":
+            parser.error("--dg-ec-cluster-sigma requires --pattern-source "
+                          "ec-lii (needs the real place-field centers)")
     if args.dg_neurogenesis and not args.dg:
         parser.error("--dg-neurogenesis requires --dg")
     if args.dg_neurogenesis and not args.ec_lii:
@@ -5096,6 +5194,7 @@ Dentate gyrus (Phase 6.2):
     # because EC LII does not exist until build_ec_lii() has run. CA3 never
     # receives any direct pattern-specific injection in this mode -- see
     # build_replay_network's trigger_on/scaffold_on gating.
+    ec_field_centers = None   # only set below; --dg-ec-cluster-sigma needs it
     if args.pattern_source == "ec-lii":
         print(">>> Wiring encoding-direction place-field drive onto EC LII...")
         _pf_rng = np.random.default_rng(
@@ -5148,6 +5247,8 @@ Dentate gyrus (Phase 6.2):
             pp_residual  = args.pp_residual,
             delay_jitter = args.dg_delay_jitter,
             w_cv         = args.w_cv,
+            ec_field_centers    = ec_field_centers,
+            dg_ec_cluster_sigma = args.dg_ec_cluster_sigma,
             # Was hardcoded to the default (42) regardless of --seed, so
             # every run drew the IDENTICAL granule-cell V_m/Poisson-residual
             # heterogeneity -- confirmed 2026-09-05 (jobs 45358807/45358815,
